@@ -1,0 +1,89 @@
+﻿# Kong declarative (DB-less) configuration.
+#
+# Kong and the services all run in the same compose network, so each upstream is
+# addressed by its compose service name. Those names come from docker-compose.yml:
+# rename a service there and the matching host below must change too.
+#
+# Every route strips its prefix: a client request to /api/event/events reaches
+# the event service as /events.
+_format_version: "3.0"
+
+services:
+  - name: event
+    url: http://event:3001
+    routes:
+      - name: event-route
+        paths:
+          - /api/event
+        strip_path: true
+
+  - name: inventory
+    url: http://inventory:3002
+    routes:
+      - name: inventory-route
+        paths:
+          - /api/inventory
+        strip_path: true
+
+  - name: queue
+    url: http://queue:3003
+    routes:
+      - name: queue-route
+        paths:
+          - /api/queue
+        strip_path: true
+
+  - name: order
+    url: http://order:3004
+    routes:
+      - name: order-route
+        paths:
+          - /api/order
+        strip_path: true
+
+  - name: ticket
+    url: http://ticket:3005
+    routes:
+      - name: ticket-route
+        paths:
+          - /api/ticket
+        strip_path: true
+
+  - name: notification
+    url: http://notification:3006
+    routes:
+      - name: notification-route
+        paths:
+          - /api/notification
+        strip_path: true
+
+plugins:
+  # In development the Angular dev server proxies /api to Kong, so requests are
+  # same-origin and CORS never triggers. This is here for the deployed setup,
+  # where the frontend is served from its own origin. Add that origin here.
+  - name: cors
+    config:
+      origins:
+        - http://localhost:4200
+        - http://localhost:4300
+      methods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      headers:
+        - Accept
+        - Content-Type
+        - Authorization
+      credentials: true
+      max_age: 3600
+
+  # Uniform request ids across services, echoed back so the browser can quote
+  # one when reporting a problem.
+  - name: correlation-id
+    config:
+      header_name: X-Request-Id
+      generator: uuid
+      echo_downstream: true

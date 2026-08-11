@@ -1,0 +1,116 @@
+# The whole backend: six services behind the Kong gateway.
+#
+#   npm run dev            (from the repo root)
+#   docker compose -f infrastructure/docker-compose.yml up --build
+#
+# Paths below are relative to this file, so `..` is the repo root — that is the
+# build context, since the image installs the npm workspace from the root.
+#
+# Only Kong is published to the host (port 8000). The services talk to each
+# other, and Kong talks to them, over the internal `backend` network using the
+# container name as hostname — so nothing but the gateway is reachable from
+# outside. To debug one service directly, add a `ports:` entry to it.
+#
+# ../services is bind-mounted into every container so edits on the host reload
+# the running service (see the Dockerfile CMD for why that needs polling).
+
+# Without this the project would be named after this file's folder
+# ("infrastructure"), which says nothing about what is running.
+name: backend-repo
+
+x-service: &service
+  build:
+    context: ..
+    dockerfile: infrastructure/Dockerfile
+  image: backend-repo-service
+  restart: unless-stopped
+  volumes:
+    - ../services:/app/services
+  networks:
+    - backend
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT}/health || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 15s
+
+services:
+  event:
+    <<: *service
+    container_name: event-service
+    environment:
+      SERVICE: event
+      PORT: 3001
+
+  inventory:
+    <<: *service
+    container_name: inventory-service
+    environment:
+      SERVICE: inventory
+      PORT: 3002
+
+  queue:
+    <<: *service
+    container_name: queue-service
+    environment:
+      SERVICE: queue
+      PORT: 3003
+
+  order:
+    <<: *service
+    container_name: order-service
+    environment:
+      SERVICE: order
+      PORT: 3004
+
+  ticket:
+    <<: *service
+    container_name: ticket-service
+    environment:
+      SERVICE: ticket
+      PORT: 3005
+
+  notification:
+    <<: *service
+    container_name: notification-service
+    environment:
+      SERVICE: notification
+      PORT: 3006
+
+  kong:
+    image: kong:3.9
+    container_name: kong-gateway
+    restart: unless-stopped
+    depends_on:
+      event: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      queue: { condition: service_healthy }
+      order: { condition: service_healthy }
+      ticket: { condition: service_healthy }
+      notification: { condition: service_healthy }
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+    ports:
+      - "8000:8000" # proxy — the only way in, and what the frontend talks to
+      - "127.0.0.1:8001:8001" # admin API, loopback only
+    volumes:
+      - ./kong/kong.yml:/kong/declarative/kong.yml:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  backend:
+    driver: bridge

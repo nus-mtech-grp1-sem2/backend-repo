@@ -1,0 +1,42 @@
+{
+  "name": "backend-repo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "docker compose -f infrastructure/docker-compose.yml up --build",
+    "down": "docker compose -f infrastructure/docker-compose.yml down",
+    "logs": "docker compose -f infrastructure/docker-compose.yml logs -f",
+    "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif -c cyan,magenta,yellow,green,blue,red \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nus-mtech-grp1-sem2/backend-repo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/nus-mtech-grp1-sem2/backend-repo/issues"
+  },
+  "homepage": "https://github.com/nus-mtech-grp1-sem2/backend-repo#readme",
+  "description": "",
+  "workspaces": [
+    "services/event",
+    "services/inventory",
+    "services/queue",
+    "services/order",
+    "services/ticket",
+    "services/notification"
+  ],
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "concurrently": "^10.0.4",
+    "cross-env": "^10.1.0",
+    "nodemon": "^3.1.14",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
