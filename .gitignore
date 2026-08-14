@@ -11,6 +11,11 @@ build/
 .env.*
 !.env.example
 
+# Terraform artifacts must never be committed
+*.tfstate
+*.tfstate.*
+*.tfplan
+
 # Local Docker overrides (docker-compose.yml itself IS committed)
 docker-compose.override.yml
 

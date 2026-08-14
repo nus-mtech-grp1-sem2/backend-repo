@@ -1,0 +1,4 @@
+interface:
+  display_name: "adr-authoring"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the adr-authoring workflow to this change."

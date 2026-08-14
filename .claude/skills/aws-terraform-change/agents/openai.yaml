@@ -1,0 +1,4 @@
+interface:
+  display_name: "aws-terraform-change"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the aws-terraform-change workflow to this change."

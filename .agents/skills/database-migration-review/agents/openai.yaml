@@ -1,0 +1,4 @@
+interface:
+  display_name: "database-migration-review"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the database-migration-review workflow to this change."

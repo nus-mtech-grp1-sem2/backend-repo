@@ -1,0 +1,4 @@
+interface:
+  display_name: "ecs-capacity-review"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the ecs-capacity-review workflow to this change."
