@@ -1,0 +1,4 @@
+interface:
+  display_name: "api-contract-change"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the api-contract-change workflow to this change."

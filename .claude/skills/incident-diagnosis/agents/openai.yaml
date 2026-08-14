@@ -1,0 +1,4 @@
+interface:
+  display_name: "incident-diagnosis"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the incident-diagnosis workflow to this change."

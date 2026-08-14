@@ -1,0 +1,16 @@
+name: OneStage Node quality
+on: [pull_request]
+permissions: {contents: read}
+jobs:
+  quality:
+    uses: nus-mtech-grp1-sem2/onestage-ai-engineering/.github/workflows/node-quality.yml@REPLACE_WITH_FULL_COMMIT_SHA
+    with:
+      node-version: UNRESOLVED_NODE_VERSION
+      install-command: UNRESOLVED_FROZEN_INSTALL_COMMAND
+      lint-command: UNRESOLVED_ESLINT_COMMAND
+      format-command: UNRESOLVED_FORMAT_COMMAND
+      typecheck-command: UNRESOLVED_TYPECHECK_COMMAND
+      unit-command: UNRESOLVED_UNIT_TEST_COMMAND
+      integration-command: UNRESOLVED_INTEGRATION_TEST_COMMAND
+      build-command: UNRESOLVED_BUILD_COMMAND
+      audit-command: UNRESOLVED_DEPENDENCY_AUDIT_COMMAND

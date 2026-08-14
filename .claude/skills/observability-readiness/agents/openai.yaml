@@ -1,0 +1,4 @@
+interface:
+  display_name: "observability-readiness"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the observability-readiness workflow to this change."

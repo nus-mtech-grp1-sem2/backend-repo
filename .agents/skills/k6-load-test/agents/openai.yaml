@@ -1,0 +1,4 @@
+interface:
+  display_name: "k6-load-test"
+  short_description: "OneStage engineering governance workflow"
+  default_prompt: "Apply the k6-load-test workflow to this change."
