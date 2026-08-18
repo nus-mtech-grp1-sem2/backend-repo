@@ -78,6 +78,29 @@ services:
       SERVICE: notification
       PORT: 3006
 
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: myonestagedb
+      MYSQL_USER: onestage
+      MYSQL_PASSWORD: onestage123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   kong:
     image: kong:3.9
     container_name: kong-gateway
@@ -114,3 +137,7 @@ services:
 networks:
   backend:
     driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local

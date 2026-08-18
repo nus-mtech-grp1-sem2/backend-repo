@@ -5,16 +5,17 @@ This document outlines the recommended database schema for the OneStage ticketin
 
 ---
 
-## 1. USERS & AUTHENTICATION
+## 1. CUSTOMERS & AUTHENTICATION
 
-### Table: `users`
-Core user information table.
+### Table: `customers`
+Core customer information table.
 
 ```sql
-CREATE TABLE users (
-    user_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(50) NOT NULL UNIQUE,
+CREATE TABLE customers (
+    customer_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    customer_name VARCHAR(50) NOT NULL UNIQUE,
     admin_ind VARCHAR(1) NOT NULL DEFAULT 'N',
+    operator_ind VARCHAR(1) NOT NULL DEFAULT 'N',
     email VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     first_name VARCHAR(100) NOT NULL,
@@ -29,19 +30,19 @@ CREATE TABLE users (
     last_login_at TIMESTAMP NULL,
     
     INDEX idx_email (email),
-    INDEX idx_username (username),
+    INDEX idx_customer_name (customer_name),
     INDEX idx_status (status),
     INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
-### Table: `user_login_history`
+### Table: `customer_login_history`
 Tracks all login attempts and sessions.
 
 ```sql
-CREATE TABLE user_login_history (
+CREATE TABLE customer_login_history (
     login_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     login_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ip_address VARCHAR(45),
     user_agent TEXT,
@@ -51,32 +52,32 @@ CREATE TABLE user_login_history (
     session_id VARCHAR(255),
     logout_time TIMESTAMP NULL,
     
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_login_time (login_time),
     INDEX idx_login_status (login_status),
     INDEX idx_session_id (session_id),
     
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
-### Table: `user_password_history`
+### Table: `customer_password_history`
 Tracks password change history for security.
 
 ```sql
-CREATE TABLE user_password_history (
+CREATE TABLE customer_password_history (
     history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     old_password_hash VARCHAR(255) NOT NULL,
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    changed_by_user_id BIGINT UNSIGNED,
+    changed_by_customer_id BIGINT UNSIGNED,
     ip_address VARCHAR(45),
     reason VARCHAR(255),
     
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_changed_at (changed_at),
     
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
  
@@ -124,7 +125,7 @@ CREATE TABLE events (
     event_description TEXT,
     event_type ENUM('concert', 'sports', 'theater', 'conference', 'festival', 'other') NOT NULL,
     venue_id BIGINT UNSIGNED,
-    organizer_id BIGINT UNSIGNED NOT NULL,
+    organizer_id BIGINT UNSIGNED NOT NULL COMMENT 'References customers(customer_id)',
     event_start_datetime TIMESTAMP NOT NULL,
     event_end_datetime TIMESTAMP NOT NULL,
     doors_open_time TIMESTAMP,
@@ -150,7 +151,7 @@ CREATE TABLE events (
     INDEX idx_featured (featured),
     
     FOREIGN KEY (venue_id) REFERENCES venues(venue_id) ON DELETE SET NULL,
-    FOREIGN KEY (organizer_id) REFERENCES users(user_id) ON DELETE RESTRICT
+    FOREIGN KEY (organizer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -161,7 +162,7 @@ Audit trail for event modifications.
 CREATE TABLE event_history (
     history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     event_id BIGINT UNSIGNED NOT NULL,
-    changed_by_user_id BIGINT UNSIGNED NOT NULL,
+    changed_by_customer_id BIGINT UNSIGNED NOT NULL,
     change_type ENUM('created', 'updated', 'published', 'cancelled', 'postponed') NOT NULL,
     field_changed VARCHAR(100),
     old_value TEXT,
@@ -171,12 +172,12 @@ CREATE TABLE event_history (
     notes TEXT,
     
     INDEX idx_event_id (event_id),
-    INDEX idx_changed_by (changed_by_user_id),
+    INDEX idx_changed_by (changed_by_customer_id),
     INDEX idx_changed_at (changed_at),
     INDEX idx_change_type (change_type),
     
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (changed_by_user_id) REFERENCES users(user_id) ON DELETE RESTRICT
+    FOREIGN KEY (changed_by_customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -226,7 +227,7 @@ CREATE TABLE tickets (
     event_id BIGINT UNSIGNED NOT NULL,
     ticket_type_id BIGINT UNSIGNED NOT NULL,
     order_id BIGINT UNSIGNED,
-    user_id BIGINT UNSIGNED,
+    customer_id BIGINT UNSIGNED,
     ticket_code VARCHAR(100) UNIQUE NOT NULL,
     qr_code_url VARCHAR(500),
     seat_number VARCHAR(50),
@@ -235,7 +236,7 @@ CREATE TABLE tickets (
     issued_at TIMESTAMP NULL,
     used_at TIMESTAMP NULL,
     checked_in_at TIMESTAMP NULL,
-    checked_in_by_user_id BIGINT UNSIGNED,
+    checked_in_by_customer_id BIGINT UNSIGNED,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     
@@ -244,12 +245,12 @@ CREATE TABLE tickets (
     INDEX idx_event_id (event_id),
     INDEX idx_ticket_type_id (ticket_type_id),
     INDEX idx_order_id (order_id),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_status (status),
     
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
     FOREIGN KEY (ticket_type_id) REFERENCES ticket_types(ticket_type_id) ON DELETE RESTRICT,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE SET NULL
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -261,8 +262,8 @@ CREATE TABLE ticket_check_in_history (
     check_in_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     ticket_id BIGINT UNSIGNED NOT NULL,
     event_id BIGINT UNSIGNED NOT NULL,
-    user_id BIGINT UNSIGNED,
-    checked_in_by_user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED,
+    checked_in_by_customer_id BIGINT UNSIGNED NOT NULL,
     check_in_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     check_in_method ENUM('qr_scan', 'manual', 'nfc', 'barcode') NOT NULL,
     device_info TEXT,
@@ -273,14 +274,14 @@ CREATE TABLE ticket_check_in_history (
     
     INDEX idx_ticket_id (ticket_id),
     INDEX idx_event_id (event_id),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_check_in_time (check_in_time),
     INDEX idx_status (status),
     
     FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id) ON DELETE CASCADE,
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE SET NULL,
-    FOREIGN KEY (checked_in_by_user_id) REFERENCES users(user_id) ON DELETE RESTRICT
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
+    FOREIGN KEY (checked_in_by_customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -297,7 +298,7 @@ CREATE TABLE inventory_logs (
     quantity_after INT UNSIGNED NOT NULL,
     reference_id BIGINT UNSIGNED,
     reference_type VARCHAR(50),
-    changed_by_user_id BIGINT UNSIGNED,
+    changed_by_customer_id BIGINT UNSIGNED,
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     notes TEXT,
     
@@ -321,7 +322,7 @@ Customer orders/purchases.
 CREATE TABLE orders (
     order_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     order_number VARCHAR(50) UNIQUE NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     event_id BIGINT UNSIGNED NOT NULL,
     order_status ENUM('pending', 'confirmed', 'processing', 'completed', 'cancelled', 'refunded') DEFAULT 'pending',
     payment_status ENUM('pending', 'paid', 'failed', 'refunded', 'partial_refund') DEFAULT 'pending',
@@ -342,13 +343,13 @@ CREATE TABLE orders (
     completed_at TIMESTAMP NULL,
     
     INDEX idx_order_number (order_number),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_event_id (event_id),
     INDEX idx_order_status (order_status),
     INDEX idx_payment_status (payment_status),
     INDEX idx_created_at (created_at),
     
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT,
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
@@ -386,7 +387,7 @@ CREATE TABLE order_history (
     order_id BIGINT UNSIGNED NOT NULL,
     status_from VARCHAR(50),
     status_to VARCHAR(50) NOT NULL,
-    changed_by_user_id BIGINT UNSIGNED,
+    changed_by_customer_id BIGINT UNSIGNED,
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     reason TEXT,
     notes TEXT,
@@ -441,7 +442,7 @@ Virtual waiting queue for high-demand events.
 CREATE TABLE waiting_queues (
     queue_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     event_id BIGINT UNSIGNED NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     queue_token VARCHAR(255) UNIQUE NOT NULL,
     position INT UNSIGNED,
     joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -453,7 +454,7 @@ CREATE TABLE waiting_queues (
     user_agent TEXT,
     
     INDEX idx_event_id (event_id),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_queue_token (queue_token),
     INDEX idx_status (status),
     INDEX idx_position (position),
@@ -461,7 +462,7 @@ CREATE TABLE waiting_queues (
     INDEX idx_expires_at (expires_at),
     
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -473,7 +474,7 @@ CREATE TABLE queue_history (
     history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     queue_id BIGINT UNSIGNED NOT NULL,
     event_id BIGINT UNSIGNED NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     action_type ENUM('joined', 'position_changed', 'activated', 'expired', 'cancelled', 'completed') NOT NULL,
     old_position INT UNSIGNED,
     new_position INT UNSIGNED,
@@ -482,13 +483,13 @@ CREATE TABLE queue_history (
     
     INDEX idx_queue_id (queue_id),
     INDEX idx_event_id (event_id),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_action_time (action_time),
     INDEX idx_action_type (action_type),
     
     FOREIGN KEY (queue_id) REFERENCES waiting_queues(queue_id) ON DELETE CASCADE,
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -502,7 +503,7 @@ System notifications to users.
 ```sql
 CREATE TABLE notifications (
     notification_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     notification_type ENUM('order', 'event', 'queue', 'payment', 'reminder', 'system', 'marketing') NOT NULL,
     title VARCHAR(255) NOT NULL,
     message TEXT NOT NULL,
@@ -518,36 +519,14 @@ CREATE TABLE notifications (
     metadata JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_notification_type (notification_type),
     INDEX idx_status (status),
     INDEX idx_channel (channel),
     INDEX idx_created_at (created_at),
     INDEX idx_related_entity (related_entity_type, related_entity_id),
     
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
-
-### Table: `notification_preferences`
-User notification settings.
-
-```sql
-CREATE TABLE notification_preferences (
-    preference_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    notification_type VARCHAR(50) NOT NULL,
-    email_enabled BOOLEAN DEFAULT TRUE,
-    sms_enabled BOOLEAN DEFAULT FALSE,
-    push_enabled BOOLEAN DEFAULT TRUE,
-    in_app_enabled BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    UNIQUE KEY unique_user_type (user_id, notification_type),
-    INDEX idx_user_id (user_id),
-    
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -556,13 +535,13 @@ CREATE TABLE notification_preferences (
 ## 7. REVIEWS & RATINGS
 
 ### Table: `event_reviews`
-User reviews and ratings for events.
+Customer reviews and ratings for events.
 
 ```sql
 CREATE TABLE event_reviews (
     review_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     event_id BIGINT UNSIGNED NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
+    customer_id BIGINT UNSIGNED NOT NULL,
     order_id BIGINT UNSIGNED,
     rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
     review_title VARCHAR(255),
@@ -574,46 +553,20 @@ CREATE TABLE event_reviews (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     
     INDEX idx_event_id (event_id),
-    INDEX idx_user_id (user_id),
+    INDEX idx_customer_id (customer_id),
     INDEX idx_rating (rating),
     INDEX idx_status (status),
     INDEX idx_created_at (created_at),
     
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE,
     FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
 ---
 
-## 8. SYSTEM & AUDIT
-
-### Table: `system_logs`
-General system activity logs.
-
-```sql
-CREATE TABLE system_logs (
-    log_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    log_level ENUM('debug', 'info', 'warning', 'error', 'critical') NOT NULL,
-    service_name VARCHAR(100),
-    action VARCHAR(100) NOT NULL,
-    user_id BIGINT UNSIGNED,
-    entity_type VARCHAR(50),
-    entity_id BIGINT UNSIGNED,
-    message TEXT,
-    metadata JSON,
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_log_level (log_level),
-    INDEX idx_service_name (service_name),
-    INDEX idx_user_id (user_id),
-    INDEX idx_created_at (created_at),
-    INDEX idx_entity (entity_type, entity_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
+## 8. AUDIT
 
 ### Table: `audit_trail`
 Comprehensive audit trail for compliance.
@@ -626,14 +579,14 @@ CREATE TABLE audit_trail (
     action_type ENUM('INSERT', 'UPDATE', 'DELETE') NOT NULL,
     old_values JSON,
     new_values JSON,
-    changed_by_user_id BIGINT UNSIGNED,
+    changed_by_customer_id BIGINT UNSIGNED,
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ip_address VARCHAR(45),
     user_agent TEXT,
     
     INDEX idx_table_record (table_name, record_id),
     INDEX idx_action_type (action_type),
-    INDEX idx_changed_by (changed_by_user_id),
+    INDEX idx_changed_by (changed_by_customer_id),
     INDEX idx_changed_at (changed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
@@ -642,27 +595,27 @@ CREATE TABLE audit_trail (
 
 ## Summary Statistics
 
-### Total Tables: 25
+### Total Tables: 19
 
 **Core Tables:**
-- Users & Auth: 4 tables
-- Events & Venues: 2 tables
-- Tickets & Inventory: 3 tables
-- Orders & Payments: 4 tables
-- Queue Management: 1 table
-- Notifications: 2 tables
-- Reviews: 1 table
-- System: 2 tables
+- Customers & Auth: 3 tables (customers, customer_login_history, customer_password_history)
+- Events & Venues: 3 tables (venues, events, event_history)
+- Tickets & Inventory: 4 tables (ticket_types, tickets, ticket_check_in_history, inventory_logs)
+- Orders & Payments: 4 tables (orders, order_items, order_history, payments)
+- Queue Management: 2 tables (waiting_queues, queue_history)
+- Notifications: 1 table (notifications)
+- Reviews: 1 table (event_reviews)
+- Audit: 1 table (audit_trail)
 
-**History/Audit Tables:** 6 tables
-- user_login_history
-- user_password_history
+**History/Audit Tables:** 8 tables
+- customer_login_history
+- customer_password_history
 - event_history
 - ticket_check_in_history
 - inventory_logs
 - order_history
 - queue_history
-- audit_trail (generic)
+- audit_trail
 
 ---
 
