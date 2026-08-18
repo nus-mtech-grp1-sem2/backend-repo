@@ -78,6 +78,22 @@ services:
       SERVICE: notification
       PORT: 3006
 
+  auth:
+    <<: *service
+    container_name: auth-service
+    environment:
+      SERVICE: auth
+      PORT: 3007
+      # Which pool to verify tokens against. Not secrets.
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      # Credentials for the admin call that grants group membership. In AWS
+      # these come from the ECS task role and none of these are set.
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+
   mysql:
     image: mysql:8.0
     container_name: mysql-db
@@ -88,7 +104,10 @@ services:
       MYSQL_USER: onestage
       MYSQL_PASSWORD: onestage123
     ports:
-      - "3306:3306"
+      # Host 3307 because a locally installed MySQL usually owns 3306 and the
+      # bind would fail. Inside the compose network the port is still 3306, so
+      # only host tools (Workbench, migrate-database.ps1) use 3307.
+      - "3307:3306"
     volumes:
       - mysql-data:/var/lib/mysql
       - ./sql:/docker-entrypoint-initdb.d
@@ -112,6 +131,7 @@ services:
       order: { condition: service_healthy }
       ticket: { condition: service_healthy }
       notification: { condition: service_healthy }
+      auth: { condition: service_healthy }
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml

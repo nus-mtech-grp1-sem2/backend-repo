@@ -7,7 +7,7 @@
     "dev": "docker compose -f infrastructure/docker-compose.yml up --build",
     "down": "docker compose -f infrastructure/docker-compose.yml down",
     "logs": "docker compose -f infrastructure/docker-compose.yml logs -f",
-    "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif -c cyan,magenta,yellow,green,blue,red \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\""
+    "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif,auth -c cyan,magenta,yellow,green,blue,red,white \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\" \"npm run dev -w services/auth\""
   },
   "repository": {
     "type": "git",
@@ -28,7 +28,8 @@
     "services/queue",
     "services/order",
     "services/ticket",
-    "services/notification"
+    "services/notification",
+    "services/auth"
   ],
   "devDependencies": {
     "@types/express": "^5.0.6",

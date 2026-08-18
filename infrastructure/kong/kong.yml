@@ -57,6 +57,14 @@ services:
           - /api/notification
         strip_path: true
 
+  - name: auth
+    url: http://auth:3007
+    routes:
+      - name: auth-route
+        paths:
+          - /api/auth
+        strip_path: true
+
 plugins:
   # In development the Angular dev server proxies /api to Kong, so requests are
   # same-origin and CORS never triggers. This is here for the deployed setup,
