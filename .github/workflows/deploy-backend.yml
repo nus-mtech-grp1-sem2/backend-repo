@@ -1,0 +1,87 @@
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "package.json"
+      - "package-lock.json"
+      - "infrastructure/Dockerfile.prod"
+      - "infrastructure/docker-entrypoint.sh"
+      - "infrastructure/kong/**"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECS_CLUSTER: onestage-cluster
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Task definitions reference the `:latest` tag directly (see
+      # infrastructure/terraform/locals.tf) — pushing a fresh `:latest` plus
+      # a `force-new-deployment` in the deploy job below is enough to roll
+      # it out. Also tag with the commit SHA for traceability in ECR.
+      - name: Build and push backend image
+        env:
+          REPO: ${{ steps.ecr-login.outputs.registry }}/onestage-backend
+        run: |
+          docker build -f infrastructure/Dockerfile.prod -t "$REPO:latest" -t "$REPO:${{ github.sha }}" .
+          docker push "$REPO:latest"
+          docker push "$REPO:${{ github.sha }}"
+
+      - name: Build and push kong image
+        env:
+          REPO: ${{ steps.ecr-login.outputs.registry }}/onestage-kong
+        run: |
+          docker build -t "$REPO:latest" -t "$REPO:${{ github.sha }}" infrastructure/kong
+          docker push "$REPO:latest"
+          docker push "$REPO:${{ github.sha }}"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      matrix:
+        service: [kong, event, inventory, queue, order, ticket, notification, auth]
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new deployment for onestage-${{ matrix.service }}
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "onestage-${{ matrix.service }}" \
+            --force-new-deployment \
+            --no-cli-pager
+
+      - name: Wait for onestage-${{ matrix.service }} to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "onestage-${{ matrix.service }}"
