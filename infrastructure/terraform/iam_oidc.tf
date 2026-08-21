@@ -25,10 +25,15 @@ data "aws_iam_policy_document" "github_backend_trust" {
       values   = ["sts.amazonaws.com"]
     }
 
+    # This org has GitHub's immutable-ID subject claims enabled, so the
+    # actual sub is "repo:org@<org-id>/repo@<repo-id>:ref:refs/heads/main",
+    # not the plain "repo:org/repo:..." format most examples assume.
+    # StringLike + wildcard on the id suffix avoids hardcoding IDs that
+    # would break if this repo were ever transferred.
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.backend_repo_name}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_org}@*/${var.backend_repo_name}@*:ref:refs/heads/main"]
     }
   }
 }
@@ -118,9 +123,9 @@ data "aws_iam_policy_document" "github_frontend_trust" {
     }
 
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.frontend_repo_name}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_org}@*/${var.frontend_repo_name}@*:ref:refs/heads/main"]
     }
   }
 }
