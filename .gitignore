@@ -15,6 +15,8 @@ build/
 *.tfstate
 *.tfstate.*
 *.tfplan
+.terraform/
+# .terraform.lock.hcl IS committed (pins provider versions)
 
 # Local Docker overrides (docker-compose.yml itself IS committed)
 docker-compose.override.yml

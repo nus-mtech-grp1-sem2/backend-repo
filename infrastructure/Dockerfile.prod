@@ -1,0 +1,26 @@
+# Production image for ECS. A separate file from infrastructure/Dockerfile
+# (the local dev image) rather than a modification of it, deliberately —
+# that file's nodemon/watch CMD + docker-compose bind mount is the local
+# hot-reload workflow used throughout local development; this file must not
+# touch it. Same base image and dependency install, only the runtime command
+# differs: no watcher, no bind-mount reliance (code is COPY'd in).
+FROM node:22-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY services ./services
+# Plain `npm ci`, not --omit=dev: tsx (the runtime interpreter used below)
+# is a devDependency at the workspace root, same as in the local dev image.
+RUN npm ci
+
+ENV HOST=0.0.0.0
+ENV NODE_ENV=production
+ENV SERVICE=event
+
+# `exec` matters: it replaces the `sh` process image with tsx, so tsx
+# becomes PID 1 and receives SIGTERM directly, letting ECS drain the task
+# cleanly on deploy/scale-in instead of killing an orphaned child process
+# after the stop timeout. No separate entrypoint script — infrastructure/ is
+# excluded from the build context entirely by .dockerignore.
+CMD ["sh", "-c", "exec ./node_modules/.bin/tsx services/$SERVICE/src/index.ts"]

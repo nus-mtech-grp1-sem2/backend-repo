@@ -66,27 +66,13 @@ services:
         strip_path: true
 
 plugins:
-  # In development the Angular dev server proxies /api to Kong, so requests are
-  # same-origin and CORS never triggers. This is here for the deployed setup,
-  # where the frontend is served from its own origin. Add that origin here.
-  - name: cors
-    config:
-      origins:
-        - http://localhost:4200
-        - http://localhost:4300
-      methods:
-        - GET
-        - POST
-        - PUT
-        - PATCH
-        - DELETE
-        - OPTIONS
-      headers:
-        - Accept
-        - Content-Type
-        - Authorization
-      credentials: true
-      max_age: 3600
+  # No cors plugin: in local dev the Angular dev server proxies /api to Kong
+  # (same-origin), and in the deployed setup CloudFront fronts both the SPA
+  # and /api/* on one domain (see infrastructure/terraform/cloudfront.tf) —
+  # every real request is same-origin, so there's no cross-origin call to
+  # allow. Direct-to-ALB access bypassing CloudFront has no CORS support as
+  # a result; acceptable for this MVP since the ALB security group only
+  # accepts traffic from CloudFront's edge network anyway.
 
   # Uniform request ids across services, echoed back so the browser can quote
   # one when reporting a problem.
