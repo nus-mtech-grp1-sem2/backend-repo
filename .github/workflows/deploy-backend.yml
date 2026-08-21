@@ -8,7 +8,6 @@ on:
       - "package.json"
       - "package-lock.json"
       - "infrastructure/Dockerfile.prod"
-      - "infrastructure/docker-entrypoint.sh"
       - "infrastructure/kong/**"
   workflow_dispatch: {}
 
@@ -61,7 +60,13 @@ jobs:
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
-    environment: production
+    # No `environment: production` — that key changes the OIDC subject
+    # claim from the ref-based form to "repo:org/repo:environment:<name>",
+    # which the trust policy doesn't grant (and this repo has no actual
+    # environment protection rules configured anyway). Re-add both — this
+    # key and a matching StringLike value in
+    # infrastructure/terraform/iam_oidc.tf — together if a real reviewer
+    # gate is ever set up.
     strategy:
       matrix:
         service: [kong, event, inventory, queue, order, ticket, notification, auth]

@@ -15,6 +15,7 @@ build/
 *.tfstate
 *.tfstate.*
 *.tfplan
+tfplan*
 .terraform/
 # .terraform.lock.hcl IS committed (pins provider versions)
 
