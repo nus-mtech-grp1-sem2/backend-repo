@@ -66,16 +66,18 @@ resource "aws_ecs_task_definition" "mysql" {
 }
 
 resource "aws_ecs_service" "mysql" {
-  count           = var.create_services ? 1 : 0
-  name            = "${local.name_prefix}-mysql"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.mysql[0].arn
-  desired_count   = 1
+  count                = var.create_services ? 1 : 0
+  name                 = "${local.name_prefix}-mysql"
+  cluster              = aws_ecs_cluster.main.id
+  task_definition      = aws_ecs_task_definition.mysql[0].arn
+  desired_count        = 1
+  force_new_deployment = true
 
   network_configuration {
-    subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = true
+    subnets         = aws_subnet.private[*].id
+    security_groups = [aws_security_group.ecs_tasks.id]
+    # No assign_public_ip: Fargate-only. Reaches the internet via the NAT
+    # instance (nat.tf).
   }
 
   service_connect_configuration {

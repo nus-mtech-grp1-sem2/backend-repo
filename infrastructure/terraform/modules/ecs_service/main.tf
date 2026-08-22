@@ -48,15 +48,18 @@ resource "aws_ecs_task_definition" "this" {
 }
 
 resource "aws_ecs_service" "this" {
-  name            = "${var.name_prefix}-${var.name}"
-  cluster         = var.cluster_id
-  task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = var.min_count
+  name                 = "${var.name_prefix}-${var.name}"
+  cluster              = var.cluster_id
+  task_definition      = aws_ecs_task_definition.this.arn
+  desired_count        = var.min_count
+  force_new_deployment = true # required by AWS when capacity_provider_strategy changes; also handy for CI-triggered redeploys
 
   network_configuration {
-    subnets          = var.subnet_ids
-    security_groups  = var.security_group_ids
-    assign_public_ip = true # public subnets, no NAT
+    subnets         = var.subnet_ids
+    security_groups = var.security_group_ids
+    # No assign_public_ip: it's Fargate-only, not valid for EC2 launch
+    # type. Tasks live in private subnets and reach the internet via the
+    # NAT instance (nat.tf) instead.
   }
 
   service_connect_configuration {

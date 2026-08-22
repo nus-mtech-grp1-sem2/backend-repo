@@ -22,8 +22,21 @@ variable "vpc_cidr" {
 }
 
 variable "public_subnet_cidrs" {
-  type    = list(string)
-  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  description = "Public subnets: ALB and the NAT instance live here."
+  type        = list(string)
+  default     = ["10.0.0.0/24", "10.0.1.0/24"]
+}
+
+variable "private_subnet_cidrs" {
+  description = "Private subnets: ECS instances/tasks live here, routed to the internet via the NAT instance (ECS-on-EC2 task ENIs can't get public IPs the way Fargate can, so they need an actual NAT path to reach ECR/Docker Hub)."
+  type        = list(string)
+  default     = ["10.0.2.0/24", "10.0.3.0/24"]
+}
+
+variable "nat_instance_type" {
+  description = "Cheapest viable instance for the DIY NAT instance (t4g.nano, ARM/Graviton)."
+  type        = string
+  default     = "t4g.nano"
 }
 
 variable "github_org" {

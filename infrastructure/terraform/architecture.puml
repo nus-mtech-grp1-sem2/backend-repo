@@ -1,0 +1,152 @@
+@startuml cicd-pipeline
+title OneStage — CI/CD Pipeline (GitHub Actions -> AWS via OIDC)
+
+skinparam backgroundColor white
+skinparam componentStyle rectangle
+skinparam wrapWidth 220
+
+actor Developer
+
+package "GitHub" {
+  node "backend-repo" as repoBackend
+  node "core-frontend" as repoFrontend
+
+  package "GitHub Actions" {
+    rectangle "terraform-ci.yml\n(PR only: fmt, validate,\ntflint, tfsec — never applies)" as tfci
+    rectangle "deploy-backend.yml" as deployBackend {
+      rectangle "build-and-push\n(build 2 images, push :latest + :sha)" as buildJob
+      rectangle "deploy\n(matrix x8: kong, event, inventory,\nqueue, order, ticket, notification, auth)" as deployJob
+    }
+    rectangle "deploy-frontend.yml\n(ng build -> s3 sync -> invalidate)" as deployFrontend
+  }
+}
+
+cloud "token.actions.githubusercontent.com\n(GitHub OIDC provider)" as oidc
+
+package "AWS IAM (account 195663985359, ap-southeast-1)" {
+  rectangle "aws_iam_openid_connect_provider.github" as oidcProvider
+  rectangle "role: onestage-github-deploy-backend\ntrust: sub StringLike\nrepo:org@*/backend-repo@*:ref:refs/heads/main" as roleBackend
+  rectangle "role: onestage-github-deploy-frontend\ntrust: sub StringLike\nrepo:org@*/core-frontend@*:ref:refs/heads/main" as roleFrontend
+}
+
+database "ECR: onestage-backend" as ecrBackend
+database "ECR: onestage-kong" as ecrKong
+rectangle "ECS Cluster: onestage-cluster\n(9 services)" as ecsCluster
+database "S3: onestage-frontend-<acct>" as s3Bucket
+cloud "CloudFront distribution" as cfDist
+
+Developer --> repoBackend : git push / PR
+Developer --> repoFrontend : git push / PR
+
+repoBackend --> tfci : PR touches infrastructure/terraform/**
+repoBackend --> deployBackend : push to main\n(services/**, Dockerfile.prod, kong/**)
+repoFrontend --> deployFrontend : push to main
+
+buildJob --> oidc : request JWT (aud=sts.amazonaws.com)
+oidc --> oidcProvider : verify token signature/issuer
+oidcProvider --> roleBackend : AssumeRoleWithWebIdentity\n(sub condition matched)
+buildJob --> ecrBackend : docker push
+buildJob --> ecrKong : docker push
+
+deployJob --> oidc : request JWT (per matrix job)
+oidc --> roleBackend : AssumeRoleWithWebIdentity
+deployJob --> ecsCluster : ecs update-service --force-new-deployment\necs wait services-stable
+
+deployFrontend --> oidc : request JWT
+oidc --> roleFrontend : AssumeRoleWithWebIdentity
+deployFrontend --> s3Bucket : aws s3 sync dist/ (--delete,\nlong-cache except index.html)
+deployFrontend --> cfDist : cloudfront create-invalidation\n(/index.html, /)
+
+note right of tfci
+  Every terraform apply/destroy is manual
+  and local, run by a human against the
+  S3 remote state backend (backend.hcl) —
+  no CI auto-apply, per the
+  aws-terraform-change governance skill.
+end note
+
+note bottom of roleBackend
+  Two separate least-privilege roles, not one:
+  backend role can only push to its 2 ECR repos
+  and update its own 8 ECS services; frontend
+  role can only write to the frontend S3 bucket
+  and invalidate its own CloudFront distribution.
+  No long-lived AWS credentials stored in GitHub.
+end note
+
+@enduml
+
+@startuml runtime-architecture
+title OneStage — Runtime AWS Architecture
+
+skinparam backgroundColor white
+skinparam componentStyle rectangle
+skinparam wrapWidth 220
+
+actor "Browser / k6 load test" as user
+
+cloud "CloudFront distribution\n(dual-origin, PriceClass_200)" as cf
+database "S3: onestage-frontend\n(SPA static assets, OAC-only access)" as s3
+
+package "VPC 10.0.0.0/16 — ap-southeast-1 (onestage-vpc)" {
+
+  package "Public subnets (2 AZ)" {
+    node "ALB: onestage-alb\nlistener :80 -> target group :8000" as alb
+    node "NAT instance\nt4g.nano + EIP\n(IP forward + iptables MASQUERADE)" as nat
+  }
+
+  package "Private subnets (2 AZ)" {
+    node "EC2 fleet: onestage-ecs-asg\n(ASG-backed ECS capacity provider,\nmixed_instances, On-Demand only,\nmanaged scaling target 100%)" as asgNote
+
+    rectangle "ECS service: kong\nmin=1 max=4\nscale on ALB requests/target (75)" as kong
+    rectangle "ECS services: event, inventory,\norder, queue, ticket,\nnotification, auth\nmin=1 max=3 each\nscale on CPU 60%" as nodesvcs
+    rectangle "ECS service: mysql\ndesired=1, fixed (no autoscaling)" as mysqlsvc
+  }
+}
+
+rectangle "ECS Service Connect\nnamespace: onestage.local\n(aliases: kong, event, inventory,\norder, queue, ticket, notification,\nauth, mysql)" as sc
+
+database "EFS: onestage-mysql\n(access point, TLS + IAM auth)" as efs
+rectangle "Secrets Manager\nonestage/mysql\n(root/app creds, random_password)" as secrets
+rectangle "EventBridge Scheduler\n9 schedules, cron 0 23 * * *\n(Asia/Singapore) -> ecs:UpdateService\ndesired=0 per service" as sched
+rectangle "AWS Budgets: onestage-monthly\n$50 target (50/80/100%) + $100\nceiling -> SNS -> email" as budget
+cloud "Internet\n(ECR, Docker Hub, package repos)" as internet
+
+user --> cf : HTTPS
+cf --> s3 : default behavior\n(GET/HEAD, CachingOptimized)
+cf --> alb : "/api/*" behavior\n(all methods, CachingDisabled,\nHTTP origin, TLS terminates at CF)
+alb --> kong : HTTP :8000\n(health check GET :8100/status)
+kong ..> sc : internal calls via Service Connect\nDNS aliases (matches kong.yml hosts)
+sc --> nodesvcs
+nodesvcs --> mysqlsvc : TCP 3306 via alias "mysql"
+mysqlsvc --> efs : mount /var/lib/mysql
+nodesvcs ..> secrets : DB creds injected as\ncontainer secrets (execution role)
+mysqlsvc ..> secrets : MYSQL_ROOT_PASSWORD, MYSQL_DATABASE,\nMYSQL_USER, MYSQL_PASSWORD
+
+kong -[hidden]-> asgNote
+asgNote --> nat : outbound traffic\n(no public IP; EC2-launch-type\ntasks can't get one)
+nat --> internet
+
+sched --> kong : force desired_count=0 nightly
+sched --> nodesvcs : force desired_count=0 nightly
+sched --> mysqlsvc : force desired_count=0 nightly
+
+note right of asgNote
+  When every ECS service scales to 0,
+  the capacity provider's own managed
+  scaling naturally drains the ASG to 0
+  too — no separate ASG-zeroing schedule
+  needed. Same mechanism scripts/start-env.sh
+  and stop-env.sh use for manual sessions.
+end note
+
+note bottom of budget
+  Cost guardrail for the $50/mo target,
+  $100/mo hard ceiling: always-on fixed
+  cost is ALB + NAT instance + EFS + ECR
+  + S3/CloudFront (~low double digits/mo);
+  ECS compute is the only thing that scales
+  with active use.
+end note
+
+@enduml
