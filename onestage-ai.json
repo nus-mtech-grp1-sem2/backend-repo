@@ -1,5 +1,5 @@
 {
-  "policyVersion": "0.1.0",
+  "policyVersion": "0.3.0",
   "sourceCommit": "REPLACE_WITH_CENTRAL_COMMIT_SHA",
   "skillsIndexSha256": "6cbb6f30a31a858bb2943c8363dcb9c906cab97890c4a26d147317efde0fd5fe"
 }
