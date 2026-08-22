@@ -3,10 +3,10 @@ locals {
 
   # Every service the module.ecs_service for_each drives: Kong (the only
   # ALB-attached, internet-facing one) plus the 7 Node services. CPU/memory
-  # are deliberately minimal (see variables.tf instance_types comment) so a
-  # single t3.small-class instance only fits a handful of tasks before the
-  # capacity provider must launch another — makes horizontal scale-out easy
-  # to trigger during a k6 demo.
+  # are deliberately minimal Fargate-valid sizes (256 CPU/512MiB is the
+  # smallest Fargate allows) — cheap per-task, and small enough that a
+  # modest k6 load pushes service-level autoscaling to add task count
+  # quickly, making horizontal scale-out easy to trigger during a demo.
   services = merge(
     {
       kong = {
@@ -19,7 +19,14 @@ locals {
         service_connect_alias = "kong"
         attach_to_alb         = true
         extra_env             = {}
-        health_check_command  = ["CMD-SHELL", "wget -qO- http://localhost:8100/status || exit 1"]
+        # The kong:3.9 image is minimal Ubuntu with no wget/curl — `kong
+        # health` is Kong's own built-in CLI healthcheck (checks the nginx
+        # workers directly, no HTTP call needed). wget here always failed
+        # with "not found", so Kong's container was continuously judged
+        # unhealthy and cycled by ECS roughly every minute — never caught
+        # earlier because tasks never previously ran long enough to reach
+        # a real healthcheck.
+        health_check_command = ["CMD", "kong", "health"]
         # ALB requests-per-target, per the ecs-capacity-review skill's
         # preferred signal for synchronous HTTP demand. Starting guess,
         # tune after a real k6 run.

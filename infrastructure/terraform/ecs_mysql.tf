@@ -10,7 +10,7 @@ resource "aws_cloudwatch_log_group" "mysql" {
 resource "aws_ecs_task_definition" "mysql" {
   count                    = var.create_services ? 1 : 0
   family                   = "${local.name_prefix}-mysql"
-  requires_compatibilities = ["EC2"]
+  requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = "512"
   memory                   = "1024"
@@ -71,13 +71,13 @@ resource "aws_ecs_service" "mysql" {
   cluster              = aws_ecs_cluster.main.id
   task_definition      = aws_ecs_task_definition.mysql[0].arn
   desired_count        = 1
+  launch_type          = "FARGATE"
   force_new_deployment = true
 
   network_configuration {
-    subnets         = aws_subnet.private[*].id
-    security_groups = [aws_security_group.ecs_tasks.id]
-    # No assign_public_ip: Fargate-only. Reaches the internet via the NAT
-    # instance (nat.tf).
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = true
   }
 
   service_connect_configuration {
@@ -98,6 +98,4 @@ resource "aws_ecs_service" "mysql" {
   lifecycle {
     ignore_changes = [desired_count]
   }
-
-  depends_on = [aws_ecs_cluster_capacity_providers.main]
 }

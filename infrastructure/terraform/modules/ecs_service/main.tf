@@ -5,7 +5,7 @@ resource "aws_cloudwatch_log_group" "this" {
 
 resource "aws_ecs_task_definition" "this" {
   family                   = "${var.name_prefix}-${var.name}"
-  requires_compatibilities = ["EC2"]
+  requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = tostring(var.cpu)
   memory                   = tostring(var.memory)
@@ -52,14 +52,13 @@ resource "aws_ecs_service" "this" {
   cluster              = var.cluster_id
   task_definition      = aws_ecs_task_definition.this.arn
   desired_count        = var.min_count
-  force_new_deployment = true # required by AWS when capacity_provider_strategy changes; also handy for CI-triggered redeploys
+  launch_type          = "FARGATE"
+  force_new_deployment = true # handy for CI-triggered redeploys
 
   network_configuration {
-    subnets         = var.subnet_ids
-    security_groups = var.security_group_ids
-    # No assign_public_ip: it's Fargate-only, not valid for EC2 launch
-    # type. Tasks live in private subnets and reach the internet via the
-    # NAT instance (nat.tf) instead.
+    subnets          = var.subnet_ids
+    security_groups  = var.security_group_ids
+    assign_public_ip = true
   }
 
   service_connect_configuration {

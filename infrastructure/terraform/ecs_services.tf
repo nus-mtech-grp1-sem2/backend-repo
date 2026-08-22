@@ -24,12 +24,10 @@ module "services" {
   namespace_arn      = aws_service_discovery_http_namespace.main.arn
   execution_role_arn = aws_iam_role.ecs_task_execution.arn
   task_role_arn      = aws_iam_role.ecs_task.arn
-  subnet_ids         = aws_subnet.private[*].id
+  subnet_ids         = aws_subnet.public[*].id
   security_group_ids = [aws_security_group.ecs_tasks.id]
 
   alb_target_group_arn = each.value.attach_to_alb ? aws_lb_target_group.kong.arn : null
   alb_listener_arn     = each.value.attach_to_alb ? aws_lb_listener.http.arn : null
   alb_resource_label   = each.value.attach_to_alb ? "${aws_lb.main.arn_suffix}/${aws_lb_target_group.kong.arn_suffix}" : null
-
-  depends_on = [aws_ecs_cluster_capacity_providers.main]
 }

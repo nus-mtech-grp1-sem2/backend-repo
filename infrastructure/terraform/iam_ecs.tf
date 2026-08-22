@@ -20,6 +20,25 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# The managed policy above covers ECR pull + CloudWatch Logs only — it does
+# NOT include Secrets Manager access. The mysql task definition injects
+# secrets via `secrets` (ecs_mysql.tf), which the execution role fetches on
+# the task's behalf, so it needs explicit read access to that one secret.
+data "aws_iam_policy_document" "ecs_task_execution_secrets" {
+  statement {
+    sid       = "ReadMysqlSecret"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.mysql.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
+  name   = "read-mysql-secret"
+  role   = aws_iam_role.ecs_task_execution.id
+  policy = data.aws_iam_policy_document.ecs_task_execution_secrets.json
+}
+
 # Application-level task role, assumed by the running containers themselves.
 # Only the auth service currently calls AWS APIs at runtime (Cognito, via
 # @aws-sdk/client-cognito-identity-provider) — everything else gets no AWS
@@ -52,37 +71,4 @@ resource "aws_iam_role_policy" "ecs_task" {
   name   = "cognito"
   role   = aws_iam_role.ecs_task.id
   policy = data.aws_iam_policy_document.ecs_task_permissions.json
-}
-
-# Instance role/profile for the ASG-backed capacity provider's EC2 hosts.
-data "aws_iam_policy_document" "ec2_trust" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "ecs_instance" {
-  name               = "${local.name_prefix}-ecs-instance"
-  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_instance" {
-  role       = aws_iam_role.ecs_instance.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
-}
-
-# SSM Session Manager instead of SSH key pairs — no launch-template key path.
-resource "aws_iam_role_policy_attachment" "ecs_instance_ssm" {
-  role       = aws_iam_role.ecs_instance.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-
-resource "aws_iam_instance_profile" "ecs_instance" {
-  name = "${local.name_prefix}-ecs-instance"
-  role = aws_iam_role.ecs_instance.name
 }

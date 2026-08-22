@@ -27,18 +27,6 @@ variable "public_subnet_cidrs" {
   default     = ["10.0.0.0/24", "10.0.1.0/24"]
 }
 
-variable "private_subnet_cidrs" {
-  description = "Private subnets: ECS instances/tasks live here, routed to the internet via the NAT instance (ECS-on-EC2 task ENIs can't get public IPs the way Fargate can, so they need an actual NAT path to reach ECR/Docker Hub)."
-  type        = list(string)
-  default     = ["10.0.2.0/24", "10.0.3.0/24"]
-}
-
-variable "nat_instance_type" {
-  description = "Cheapest viable instance for the DIY NAT instance (t4g.nano, ARM/Graviton)."
-  type        = string
-  default     = "t4g.nano"
-}
-
 variable "github_org" {
   description = "GitHub org the two repos live under."
   type        = string
@@ -71,24 +59,6 @@ variable "budget_ceiling_usd" {
   description = "Hard monthly budget ceiling."
   type        = number
   default     = 100
-}
-
-variable "instance_types" {
-  description = "Cheapest-viable EC2 instance types for the ECS capacity provider's ASG. Deliberately small so a modest load forces a scale-out event."
-  type        = list(string)
-  default     = ["t3.micro", "t3.small"]
-}
-
-variable "asg_min_size" {
-  description = "Minimum EC2 instances in the capacity-provider ASG. 0 lets the whole environment scale to zero when stopped."
-  type        = number
-  default     = 0
-}
-
-variable "asg_max_size" {
-  description = "Maximum EC2 instances the capacity provider may scale out to during a load test."
-  type        = number
-  default     = 4
 }
 
 variable "create_services" {
