@@ -4,9 +4,10 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "docker compose -f infrastructure/docker-compose.yml up --build",
-    "down": "docker compose -f infrastructure/docker-compose.yml down",
-    "logs": "docker compose -f infrastructure/docker-compose.yml logs -f",
+    "dev": "docker compose -f infrastructure/docker-compose.yml --env-file .env up --build",
+    "down": "docker compose -f infrastructure/docker-compose.yml --env-file .env down",
+    "logs": "docker compose -f infrastructure/docker-compose.yml --env-file .env logs -f",
+    "db:aws-ip": "powershell -ExecutionPolicy Bypass -File scripts/mysql-public-ip.ps1",
     "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif,auth -c cyan,magenta,yellow,green,blue,red,white \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\" \"npm run dev -w services/auth\""
   },
   "repository": {

@@ -12,6 +12,7 @@ module "services" {
   min_count             = each.value.min_count
   max_count             = each.value.max_count
   extra_env             = each.value.extra_env
+  secret_env            = each.value.secret_env
   service_connect_alias = each.value.service_connect_alias
   attach_to_alb         = each.value.attach_to_alb
   health_check_command  = each.value.health_check_command

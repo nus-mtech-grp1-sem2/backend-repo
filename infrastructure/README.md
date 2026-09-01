@@ -26,6 +26,22 @@ Or directly:
 docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
+## Testing against the shared AWS database
+
+By default `.env`'s `DB_HOST=mysql` points the `auth` service at the local
+docker-compose container, isolated per developer. To test against the same
+data every developer/production sees, point it at the AWS MySQL task instead:
+
+```bash
+npm run db:aws-ip     # prints the mysql Fargate task's current public IP
+```
+
+Set `DB_HOST` in `.env` to that IP, and `DB_USER`/`DB_PASSWORD` to the real
+AWS Secrets Manager values (ask a teammate — never commit real AWS
+credentials). This is a local `.env` change only; nothing in Terraform or
+production changes. Fargate assigns a new IP on every task restart, so
+re-run `db:aws-ip` if the connection starts failing.
+
 ## What the frontend talks to
 
 Only Kong is published to the host, on **http://localhost:8000**. Requests are

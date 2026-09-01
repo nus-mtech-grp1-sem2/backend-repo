@@ -32,6 +32,7 @@ locals {
         # tune after a real k6 run.
         scaling_metric = "alb_request_count"
         scaling_target = 75
+        secret_env     = {}
       }
     },
     {
@@ -58,8 +59,16 @@ locals {
           name == "auth" ? {
             COGNITO_USER_POOL_ID = "ap-southeast-1_cgmx4fpO2"
             COGNITO_CLIENT_ID    = "gh94lqsterju3qoffje1grep8"
+            DB_HOST              = "mysql.onestage.internal"
+            DB_NAME              = "onestage"
+            DB_PORT              = "3306"
+            DB_SSL               = "false"
           } : {}
         )
+        secret_env = name == "auth" ? {
+          DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
+          DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
+        } : {}
       }
     }
   )

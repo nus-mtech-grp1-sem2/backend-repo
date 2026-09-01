@@ -1,0 +1,7 @@
+
+start docker desktop
+
+docker ps
+cd backend-repo
+npm run down
+npm run dev

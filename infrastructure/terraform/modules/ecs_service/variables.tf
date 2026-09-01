@@ -31,6 +31,12 @@ variable "extra_env" {
   default = {}
 }
 
+variable "secret_env" {
+  description = "Environment variable names mapped to Secrets Manager JSON keys."
+  type        = map(string)
+  default     = {}
+}
+
 variable "service_connect_alias" {
   type = string
 }

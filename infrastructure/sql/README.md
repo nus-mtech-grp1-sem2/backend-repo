@@ -1,12 +1,44 @@
-# Database Migration Scripts
+# Database Management Scripts
 
-This folder contains SQL scripts and tools to manage the OneStage database schema on AWS RDS MySQL.
+This folder contains SQL scripts and tools to manage the OneStage database schema and initialization on AWS RDS MySQL.
 
-## Files
+## 📁 Files Overview
 
-- **`01-drop-all-tables.sql`** - Drops all existing tables (handles foreign keys correctly)
+### Schema Management
 - **`02-create-all-tables.sql`** - Creates all 19 tables from the schema
 - **`../migrate-database.ps1`** - PowerShell script to run the migration
+
+**📌 Note:** The init scripts now use **UUID for all primary keys** per the [UUID schema](../../database/TABLES-UUID.md).
+
+### Admin Initialization (New!)
+- **`01-init-admin-user.sql.example`** - Template for admin initialization (commit this!)
+- **`01-init-admin-user.sql`** - Actual credentials (gitignored, do NOT commit!)
+- **`generate-admin-password.js`** - Generate bcrypt hash for admin password
+- **`test-password-verification.js`** - Verify password hash works correctly
+- **`package.json`** - NPM dependencies for password utilities
+- **`QUICK-START.md`** - Quick reference guide (⚡ START HERE!)
+- **`INIT-ADMIN-README.md`** - Detailed admin initialization documentation
+
+## 🔒 Security Notice
+**IMPORTANT:** Files with actual credentials (`*-init-*.sql`) are automatically excluded from git!  
+Always use the `.example` templates and copy them locally with your real credentials.
+
+## 🚀 Quick Start
+
+### First Time Setup
+```bash
+# 1. Create database schema
+mysql -u root -p onestage < infrastructure/sql/02-create-all-tables.sql
+
+# 2. Initialize admin user (see QUICK-START.md for details)
+cd infrastructure/sql
+npm install
+npm run generate-password  # Copy the hash
+# Update 01-init-admin-user.sql with the hash
+mysql -u root -p onestage < 01-init-admin-user.sql
+```
+
+📖 **Need help?** See [QUICK-START.md](QUICK-START.md) for step-by-step instructions.
 
 ## Prerequisites
 
@@ -26,10 +58,6 @@ This folder contains SQL scripts and tools to manage the OneStage database schem
    ```env
    DB_HOST=your-rds-instance.region.rds.amazonaws.com
    DB_PORT=3306
-   DB_NAME=myonestagedb
-   DB_USER=your_username
-   DB_PASSWORD=your_password
-   DB_SSL=true
    ```
 
 ## Usage
@@ -59,7 +87,7 @@ If you prefer to run the SQL scripts directly:
 $DB_HOST = "your-rds-instance.region.rds.amazonaws.com"
 $DB_USER = "your_username"
 $DB_PASSWORD = "your_password"
-$DB_NAME = "myonestagedb"
+$DB_NAME = "onestage"
 
 # Drop all tables
 Get-Content infrastructure\sql\01-drop-all-tables.sql | mysql -h $DB_HOST -u $DB_USER -p$DB_PASSWORD $DB_NAME --ssl-mode=REQUIRED
@@ -76,27 +104,26 @@ Get-Content infrastructure\sql\02-create-all-tables.sql | mysql -h $DB_HOST -u $
 
 ## Database Schema Summary
 
-The schema creates **19 tables**:
+The schema creates **18 tables**:
 
 ### Core Tables (11)
-- `customers` - Customer accounts
+- `users` - User accounts
 - `venues` - Event venues
 - `events` - Event information
 - `ticket_types` - Ticket categories
 - `tickets` - Individual tickets
-- `orders` - Customer orders
+- `orders` - User orders
 - `order_items` - Order line items
 - `payments` - Payment transactions
 - `waiting_queues` - Virtual queue system
 - `notifications` - User notifications
 - `event_reviews` - Event ratings and reviews
 
-### History/Audit Tables (8)
-- `customer_login_history` - Login tracking
-- `customer_password_history` - Password changes
+### History/Audit Tables (7)
+- `user_login_history` - Login tracking
 - `event_history` - Event modifications
+- `users_events` - Per-event admin/helper role assignments
 - `ticket_check_in_history` - Check-in audit
-- `inventory_logs` - Inventory changes
 - `order_history` - Order status changes
 - `queue_history` - Queue movements
 - `audit_trail` - General audit log
@@ -107,13 +134,13 @@ After running the migration, verify your tables:
 
 ```sql
 -- Connect to your database
-mysql -h your-rds-instance.region.rds.amazonaws.com -u your_username -p myonestagedb --ssl-mode=REQUIRED
+mysql -h your-rds-instance.region.rds.amazonaws.com -u your_username -p onestage --ssl-mode=REQUIRED
 
 -- List all tables
 SHOW TABLES;
 
 -- Verify table structure
-DESCRIBE customers;
+DESCRIBE users;
 DESCRIBE events;
 DESCRIBE orders;
 ```
@@ -142,7 +169,7 @@ choco install mysql
 
 ### Permission denied
 - Ensure your database user has CREATE and DROP privileges
-- For RDS master user: `GRANT ALL PRIVILEGES ON myonestagedb.* TO 'your_user'@'%';`
+- For RDS master user: `GRANT ALL PRIVILEGES ON onestage.* TO 'your_user'@'%';`
 
 ### SSL connection issues
 - Use `--ssl-mode=REQUIRED` for RDS connections

@@ -42,6 +42,14 @@ services:
     environment:
       SERVICE: event
       PORT: 3001
+      # Same local-dev DB wiring as auth (see its block below for the full
+      # explanation) — needed now that /events and /helper/shifts read from MySQL.
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-onestage}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   inventory:
     <<: *service
@@ -87,6 +95,17 @@ services:
       # Which pool to verify tokens against. Not secrets.
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      # Local-only: read from the repo-root .env (docker compose's default env
+      # file, since local_start.bat runs `docker compose` from the repo root).
+      # Production never reads this file — ECS sets these directly from
+      # Terraform (locals.tf) and Secrets Manager, pointing at the in-cluster
+      # "mysql" service instead of this dynamic-IP DB.
+      DB_HOST: ${DB_HOST:-54.255.133.80}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-onestage}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
       # Credentials for the admin call that grants group membership. In AWS
       # these come from the ECS task role and none of these are set.
       AWS_REGION: ${AWS_REGION:-ap-southeast-1}
@@ -99,22 +118,28 @@ services:
     container_name: mysql-db
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: myonestagedb
-      MYSQL_USER: onestage
-      MYSQL_PASSWORD: onestage123
+      # Sourced from .env, same as the auth service's DB_* vars below, so both
+      # sides of the connection always agree — no credentials hardcoded here.
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD not set in .env}
+      MYSQL_DATABASE: ${DB_NAME:-onestage}
+      MYSQL_USER: ${DB_USER:-onestage}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
     ports:
       # Host 3307 because a locally installed MySQL usually owns 3306 and the
-      # bind would fail. Inside the compose network the port is still 3306, so
+      # bind would fail. Loopback-only: no reason for this to be reachable
+      # from the LAN. Inside the compose network the port is still 3306, so
       # only host tools (Workbench, migrate-database.ps1) use 3307.
-      - "3307:3306"
+      - "127.0.0.1:3307:3306"
     volumes:
       - mysql-data:/var/lib/mysql
+      # Named 00- so it runs before ./sql's 01-init-admin-user.sql, which
+      # inserts into tables this script creates.
+      - ../database/02-init-create-tables-index.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
       - ./sql:/docker-entrypoint-initdb.d
     networks:
       - backend
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -28,6 +28,10 @@ resource "aws_ecs_task_definition" "this" {
         for k, v in merge({ HOST = "0.0.0.0", PORT = tostring(var.port) }, var.extra_env) :
         { name = k, value = v }
       ]
+      secrets = [
+        for k, v in var.secret_env :
+        { name = k, valueFrom = v }
+      ]
       healthCheck = {
         command     = var.health_check_command
         interval    = 15

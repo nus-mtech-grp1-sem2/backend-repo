@@ -21,9 +21,6 @@ import {
 
 const client = new CognitoIdentityProviderClient({});
 
-/** Roles a user is allowed to grant themselves at sign-up. */
-const SELF_SERVICE_ROLES = new Set(['customer', 'organiser', 'event-helper']);
-
 export const handler = async (event) => {
   // Only the sign-up confirmation matters; the same trigger also fires for
   // forgot-password confirmations, where there is nothing to do.
@@ -31,8 +28,7 @@ export const handler = async (event) => {
     return event;
   }
 
-  const requested = event.request.userAttributes['custom:role'];
-  const role = SELF_SERVICE_ROLES.has(requested) ? requested : 'customer';
+  const role = 'customer';
 
   try {
     await client.send(
