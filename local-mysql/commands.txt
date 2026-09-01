@@ -1,0 +1,79 @@
+DOCKER MYSQL COMMANDS (POWERSHELL)
+==================================
+
+Run every command from the backend repository:
+
+cd C:\Users\fcyon\OneDrive\Desktop\nus-mtech-project-sem2\backend-repo
+
+
+START OR INITIALISE
+-------------------
+Start MySQL and all backend services:
+
+docker compose -f infrastructure\docker-compose.yml up -d --build
+
+On a new Docker volume, the schema and sample data are initialized
+automatically. Check container status with:
+
+docker compose -f infrastructure\docker-compose.yml ps
+
+
+CONNECT TO MYSQL IN THE TERMINAL
+--------------------------------
+docker compose -f infrastructure\docker-compose.yml exec mysql mysql -uonestage -p myonestagedb
+
+Enter password: onestage123
+
+The prompt changes to mysql>. Example commands:
+
+SHOW TABLES;
+SELECT * FROM events;
+exit
+
+
+FILL WITH SAMPLE DATA
+---------------------
+WARNING: This clears current application data before inserting samples.
+
+Get-Content local-mysql\clear.sql,infrastructure\sql\03-event-roles-and-seed.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+
+Verify that eight events were inserted:
+
+Write-Output "SELECT COUNT(*) AS events FROM events;" | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+
+
+CLEAR DATA BUT KEEP TABLES
+--------------------------
+This keeps the schema and Admin/Customer/Helper role definitions.
+
+Get-Content local-mysql\clear.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+
+
+FULL DATABASE RESET
+-------------------
+WARNING: This permanently deletes the Docker MySQL volume, then creates and
+initializes a new one with sample data.
+
+docker compose -f infrastructure\docker-compose.yml down -v
+docker compose -f infrastructure\docker-compose.yml up -d --build
+
+
+CONNECT WITH MYSQL WORKBENCH
+----------------------------
+Connection method: Standard TCP/IP
+Host: 127.0.0.1
+Port: 3307
+Username: onestage
+Password: onestage123
+Default schema: myonestagedb
+
+
+STOP WITHOUT DELETING DATA
+--------------------------
+docker compose -f infrastructure\docker-compose.yml down
+
+Restart later with:
+
+docker compose -f infrastructure\docker-compose.yml up -d
+
+Do not add -v unless you intend to delete the database volume.
