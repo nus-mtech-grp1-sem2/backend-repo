@@ -13,11 +13,9 @@
  * this handler confirms them against the SQL row, Cognito creates the user in
  * the pool and never calls this trigger for that user again.
  *
- * `admin_ind` / `operator_ind` on the row decide the role Cognito starts the
- * user with, via the `custom:role` attribute — the same attribute the
- * existing PostConfirmation flow and the auth service's `/roles/sync`
- * endpoint already know how to turn into group membership. No changes are
- * needed to that flow for a migrated user to end up in the right group.
+ * `admin_ind` / `operator_ind` on the row decide the initial `custom:role`
+ * attribute. Event-specific Organizer and Helper access is later assigned in
+ * the Event service's event_team_memberships table, not Cognito groups.
  *
  * Runtime: nodejs20.x or later, deployed with its own `node_modules`
  * (mysql2 + bcryptjs are not part of the Lambda base image).

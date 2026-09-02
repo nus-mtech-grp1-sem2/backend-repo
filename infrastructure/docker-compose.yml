@@ -42,14 +42,19 @@ services:
     environment:
       SERVICE: event
       PORT: 3001
-      # Same local-dev DB wiring as auth (see its block below for the full
-      # explanation) — needed now that /events and /helper/shifts read from MySQL.
-      DB_HOST: ${DB_HOST:-mysql}
+      # The event service owns the event_inventory schema.
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
       DB_PORT: ${DB_PORT:-3306}
-      DB_NAME: ${DB_NAME:-onestage}
+      DB_NAME: ${DB_NAME_EVENT_INVENTORY:-event_inventory}
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
 
   inventory:
     <<: *service
@@ -57,6 +62,12 @@ services:
     environment:
       SERVICE: inventory
       PORT: 3002
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_EVENT_INVENTORY:-event_inventory}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   queue:
     <<: *service
@@ -64,6 +75,12 @@ services:
     environment:
       SERVICE: queue
       PORT: 3003
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_QUEUE:-queue}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   order:
     <<: *service
@@ -71,6 +88,12 @@ services:
     environment:
       SERVICE: order
       PORT: 3004
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_CHECKOUT:-checkout}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   ticket:
     <<: *service
@@ -78,6 +101,12 @@ services:
     environment:
       SERVICE: ticket
       PORT: 3005
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_TICKETING:-ticketing}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   notification:
     <<: *service
@@ -95,55 +124,12 @@ services:
       # Which pool to verify tokens against. Not secrets.
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
-      # Local-only: read from the repo-root .env (docker compose's default env
-      # file, since local_start.bat runs `docker compose` from the repo root).
-      # Production never reads this file — ECS sets these directly from
-      # Terraform (locals.tf) and Secrets Manager, pointing at the in-cluster
-      # "mysql" service instead of this dynamic-IP DB.
-      DB_HOST: ${DB_HOST:-54.255.133.80}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_NAME: ${DB_NAME:-onestage}
-      DB_USER: ${DB_USER:-root}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
-      DB_SSL: ${DB_SSL:-false}
       # Credentials for the admin call that grants group membership. In AWS
       # these come from the ECS task role and none of these are set.
       AWS_REGION: ${AWS_REGION:-ap-southeast-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
-
-  mysql:
-    image: mysql:8.0
-    container_name: mysql-db
-    restart: unless-stopped
-    environment:
-      # Sourced from .env, same as the auth service's DB_* vars below, so both
-      # sides of the connection always agree — no credentials hardcoded here.
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD not set in .env}
-      MYSQL_DATABASE: ${DB_NAME:-onestage}
-      MYSQL_USER: ${DB_USER:-onestage}
-      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
-    ports:
-      # Host 3307 because a locally installed MySQL usually owns 3306 and the
-      # bind would fail. Loopback-only: no reason for this to be reachable
-      # from the LAN. Inside the compose network the port is still 3306, so
-      # only host tools (Workbench, migrate-database.ps1) use 3307.
-      - "127.0.0.1:3307:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-      # Named 00- so it runs before ./sql's 01-init-admin-user.sql, which
-      # inserts into tables this script creates.
-      - ../database/02-init-create-tables-index.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
-      - ./sql:/docker-entrypoint-initdb.d
-    networks:
-      - backend
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
 
   kong:
     image: kong:3.9
@@ -182,7 +168,3 @@ services:
 networks:
   backend:
     driver: bridge
-
-volumes:
-  mysql-data:
-    driver: local

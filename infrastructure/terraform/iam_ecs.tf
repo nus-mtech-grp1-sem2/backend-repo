@@ -59,8 +59,6 @@ data "aws_iam_policy_document" "ecs_task_permissions" {
     actions = [
       "cognito-idp:AdminGetUser",
       "cognito-idp:AdminCreateUser",
-      "cognito-idp:AdminAddUserToGroup",
-      "cognito-idp:AdminListGroupsForUser",
       "cognito-idp:ListUsers",
     ]
     resources = ["arn:aws:cognito-idp:${var.region}:${var.account_id}:userpool/ap-southeast-1_cgmx4fpO2"]
