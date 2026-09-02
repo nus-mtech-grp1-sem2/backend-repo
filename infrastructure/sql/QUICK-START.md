@@ -1,95 +1,43 @@
-# Quick Start Guide - Admin User Initialization
+# OneStage Database Quick Start
 
-## � Security Notice
-**The actual credential file `01-init-admin-user.sql` is gitignored for security!**  
-Use the template: `01-init-admin-user.sql.example`
+The authoritative MySQL schema is in [`../../database/02-init-create-tables-index.sql`](../../database/02-init-create-tables-index.sql). It creates the four service-owned schemas:
 
----
+- `event_inventory`
+- `queue`
+- `checkout`
+- `ticketing`
 
-## 🚀 Fast Setup (4 Steps)
+## New database
 
-### 0️⃣ Create Your Credential File
-```bash
-cd infrastructure/sql
-cp 01-init-admin-user.sql.example 01-init-admin-user.sql
-# Edit 01-init-admin-user.sql with your actual email and admin details
+Run the base schema once against an empty MySQL instance:
+
+```powershell
+Get-Content ..\..\database\02-init-create-tables-index.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 ```
 
-### 1️⃣ Install Dependencies
-```bash
-npm install
+The script creates the databases itself, so `DB_NAME_EVENT_INVENTORY` is only the initial connection schema.
+
+## Existing database upgrades
+
+Run these once, in order, only when upgrading a schema created before the fields existed:
+
+```powershell
+Get-Content ..\..\database\03-add-event-team-invitations.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\04-add-event-total-seats.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 ```
 
-### 2️⃣ Generate Password Hash
-```bash
-npm run generate-password
-```
-Copy the generated hash and update `01-init-admin-user.sql` line 36:
-```sql
-password_hash = '[PASTE-YOUR-HASH-HERE]'
-```
+- `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
+- `04-add-event-total-seats.sql` adds the event capacity column with a default of `1` for existing events.
 
-### 3️⃣ Run SQL Script
-```bash
-mysql -u root -p onestage < 01-init-admin-user.sql
-```
+Do not rerun an upgrade after it has been applied: MySQL will reject a duplicate column or index.
 
- 
-
-**⚠️ CHANGE PASSWORD AFTER FIRST LOGIN!**
-
----
-
-## ✅ Verify Installation
+## Verify
 
 ```sql
-SELECT customer_name, email, admin_ind, status 
-FROM customers 
-WHERE customer_name = 'ADMIN';
+USE event_inventory;
+SHOW TABLES;
+DESCRIBE events;
+DESCRIBE event_team_memberships;
 ```
 
-Expected output:
-```
-customer_name | email                     | admin_ind | status
-ADMIN         | rubyferdianto@u.nus.edu   | Y         | active
-```
-
----
-
-## 🧪 Test Password (Optional)
-
-```bash
-npm run test-password
-```
-
----
-
-## 📁 Files Created
-
-- ✅ `01-init-admin-user.sql` - Main initialization script
-- ✅ `generate-admin-password.js` - Password hash generator
-- ✅ `test-password-verification.js` - Verification test
-- ✅ `package.json` - NPM dependencies
-- ✅ `INIT-ADMIN-README.md` - Detailed documentation
-- ✅ `QUICK-START.md` - This file
-
----
-
-## 🛠️ Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| bcrypt not found | Run `npm install` in `infrastructure/sql/` |
-| Database not found | Create database: `CREATE DATABASE onestage;` |
-| Table doesn't exist | Run `02-create-all-tables.sql` first |
-| Duplicate email | User already exists, use different email |
-
----
-
-## 📞 Need Help?
-
-See detailed documentation: [INIT-ADMIN-README.md](INIT-ADMIN-README.md)
-
----
-
-**Last Updated:** 2026-08-25
+See [`database/onestage-system-design.md`](../../database/onestage-system-design.md) for schema ownership across the four services, and [`infrastructure/docker-compose.yml`](../docker-compose.yml) for the local MySQL container.
