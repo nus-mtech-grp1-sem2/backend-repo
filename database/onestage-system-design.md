@@ -313,6 +313,8 @@ For an existing schema created before these fields were introduced, run the migr
 
 `total_seats` is configured capacity on `events`; `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
 
+On AWS, `05-grant-onestage-app-schema-access.sql` is also required once per MySQL instance — the ECS-hosted MySQL container only grants the app user access to its own `onestage` database on creation, not to any of the four schemas above. See `infrastructure/sql/QUICK-START.md`.
+
 ---
 
 ## Waiting Room / Queue Service — `queue` schema
