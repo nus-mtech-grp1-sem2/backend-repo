@@ -12,20 +12,25 @@ Start MySQL and all backend services:
 
 docker compose -f infrastructure\docker-compose.yml up -d --build
 
-On a new Docker volume, the schema and sample data are initialized
-automatically. Check container status with:
+On a new Docker volume, all four schemas (onestagedb, queue, checkout,
+ticketing) and a complete development dataset are initialized automatically.
+The dataset includes events, team memberships, inventory, seats, holds, queue
+activity, paid orders, order items, payments, tickets, and check-in logs.
+Event artwork is binary and is loaded separately; see FILL WITH SAMPLE DATA.
+Check container status with:
 
 docker compose -f infrastructure\docker-compose.yml ps
 
 
 CONNECT TO MYSQL IN THE TERMINAL
 --------------------------------
-docker compose -f infrastructure\docker-compose.yml exec mysql mysql -uonestage -p myonestagedb
+docker compose -f infrastructure\docker-compose.yml exec mysql mysql -uonestage -p
 
 Enter password: onestage123
 
 The prompt changes to mysql>. Example commands:
 
+USE onestagedb;
 SHOW TABLES;
 SELECT * FROM events;
 exit
@@ -33,29 +38,49 @@ exit
 
 FILL WITH SAMPLE DATA
 ---------------------
-WARNING: This clears current application data before inserting samples.
+WARNING: This clears all current application data before inserting samples.
 
-Get-Content local-mysql\clear.sql,infrastructure\sql\03-event-roles-and-seed.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+Rows first:
 
-Verify that eight events were inserted:
+Get-Content local-mysql\clear.sql,infrastructure\sql\04-seed-sample-data.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER'
 
-Write-Output "SELECT COUNT(*) AS events FROM events;" | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+Then event artwork (real JPEG bytes, read from core-frontend and loaded via a
+script — not through the mysql CLI, since binary data doesn't belong in a
+piped .sql file). Run from repo root, on the host, not inside the container:
+
+npx tsx local-mysql\seed-images.mts
+
+Verify the seeded row counts across every schema (eight events and three event
+images are expected; the other counts confirm sales, attendees, tickets,
+queue, and check-in data were loaded):
+
+Write-Output "SELECT 'events' AS table_name, COUNT(*) AS rows_seeded FROM onestagedb.events UNION ALL SELECT 'memberships', COUNT(*) FROM onestagedb.event_team_memberships UNION ALL SELECT 'inventory_items', COUNT(*) FROM onestagedb.inventory_items UNION ALL SELECT 'holds', COUNT(*) FROM onestagedb.inventory_holds UNION ALL SELECT 'seats', COUNT(*) FROM onestagedb.seats UNION ALL SELECT 'images', COUNT(*) FROM onestagedb.event_images UNION ALL SELECT 'queue_sessions', COUNT(*) FROM queue.queue_sessions UNION ALL SELECT 'queue_entries', COUNT(*) FROM queue.queue_entries UNION ALL SELECT 'orders', COUNT(*) FROM checkout.orders UNION ALL SELECT 'order_items', COUNT(*) FROM checkout.order_items UNION ALL SELECT 'payments', COUNT(*) FROM checkout.payments UNION ALL SELECT 'tickets', COUNT(*) FROM ticketing.tickets UNION ALL SELECT 'check_in_logs', COUNT(*) FROM ticketing.check_in_logs;" | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER'
+
+Expected counts after running both seed steps:
+events 8, memberships 11, inventory_items 8, holds 4, seats 70,
+images 3, queue_sessions 5, queue_entries 6, orders 12,
+order_items 42, payments 12, tickets 178, check_in_logs 3.
 
 
 CLEAR DATA BUT KEEP TABLES
 --------------------------
-This keeps the schema and Admin/Customer/Helper role definitions.
+This keeps the schemas and tables themselves — only rows are removed.
 
-Get-Content local-mysql\clear.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER myonestagedb'
+Get-Content local-mysql\clear.sql | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER'
 
 
 FULL DATABASE RESET
 -------------------
 WARNING: This permanently deletes the Docker MySQL volume, then creates and
-initializes a new one with sample data.
+initializes a new one with sample data (rows only — event artwork is binary
+and isn't part of the automatic init scripts).
 
 docker compose -f infrastructure\docker-compose.yml down -v
 docker compose -f infrastructure\docker-compose.yml up -d --build
+
+Then seed the images (see FILL WITH SAMPLE DATA above):
+
+npx tsx local-mysql\seed-images.mts
 
 
 CONNECT WITH MYSQL WORKBENCH
@@ -65,7 +90,8 @@ Host: 127.0.0.1
 Port: 3307
 Username: onestage
 Password: onestage123
-Default schema: myonestagedb
+Default schema: onestagedb (or queue / checkout / ticketing — all four
+are visible once connected regardless of which one is "default")
 
 
 STOP WITHOUT DELETING DATA
@@ -77,3 +103,23 @@ Restart later with:
 docker compose -f infrastructure\docker-compose.yml up -d
 
 Do not add -v unless you intend to delete the database volume.
+
+
+SEEDED EVENT OWNER
+------------------
+All seeded events and organiser memberships belong to:
+
+Email: foochuanyong@gmail.com
+Cognito sub: f91a054c-a051-7081-9518-09e2e1ebed25
+
+Checkout orders and seeded tickets deliberately keep varied sample buyers so
+Sales and Attendees show realistic data without filling this account's My
+events page. Resetting and reseeding preserves the event ownership above.
+
+
+MAKE THE SEEDED HELPER YOURS
+----------------------------
+To use the helper/check-in views for events 1 and 2, replace the accepted
+sample helper sub with your signed-in Cognito `sub`:
+
+Write-Output "UPDATE onestagedb.event_team_memberships SET user_sub = '<your-sub>' WHERE user_sub = '00000000-0000-0000-0000-000000000101' AND role = 'HELPER';" | docker compose -f infrastructure\docker-compose.yml exec -T mysql sh -c 'MYSQL_PWD=$MYSQL_PASSWORD mysql -u$MYSQL_USER'

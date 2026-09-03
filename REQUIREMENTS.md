@@ -50,7 +50,7 @@ Edit the `.env` file with your RDS MySQL connection details:
 ```env
 DB_HOST=your-rds-instance.region.rds.amazonaws.com
 DB_PORT=3306
-DB_NAME=myonestagedb
+DB_NAME=onestagedb
 DB_USER=your_username
 DB_PASSWORD=your_password
 DB_SSL=true
@@ -71,7 +71,7 @@ DB_SSL=true
 - `DB_CHARSET`: Character set (default: utf8mb4)
 
 ### 3. Database Creation
-The database `myonestagedb` should already be created on your RDS instance.
+The database `onestagedb` should already be created on your RDS instance.
 
 ## Security Checklist
 

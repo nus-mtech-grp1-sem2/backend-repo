@@ -1,12 +1,33 @@
 import express from 'express';
 import type { ResultSetHeader, RowDataPacket } from 'mysql2';
 import { randomUUID } from 'node:crypto';
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
 
 import { pool } from './db.js';
+
+/**
+ * Checkout & Payment Service (mounted as `order` — see
+ * infrastructure/docker-compose.yml / core-frontend's `BackendService` type).
+ *
+ * Owns the `checkout` schema. There is no separate inventory-hold step yet
+ * (see the comment on `inventory_holds` in
+ * infrastructure/sql/02-create-all-tables.sql) — `POST /orders` reserves
+ * stock and creates the order in one transaction, and `POST
+ * /orders/:id/payment` immediately captures a simulated payment and issues
+ * tickets. A real payment provider or a two-phase hold can replace either
+ * step later without changing the order/ticket shape callers see.
+ */
 
 const SERVICE = 'order';
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 3004);
+
+const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
+const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
+const configured = USER_POOL_ID.length > 0 && CLIENT_ID.length > 0;
+const verifier = configured
+  ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
+  : null;
 
 const app = express();
 app.use(express.json());
@@ -15,250 +36,296 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: SERVICE });
 });
 
-interface PurchasableTicketRow extends RowDataPacket {
-  ticket_type_id: number;
-  event_id: number;
-  price: number;
-  quantity_available: number;
-  max_per_order: number;
+interface Caller {
+  readonly sub: string;
+}
+
+async function authenticate(req: express.Request): Promise<Caller | null> {
+  const header = req.header('authorization') ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token || !verifier) return null;
+  try {
+    const claims = await verifier.verify(token);
+    return { sub: String(claims.sub) };
+  } catch {
+    return null;
+  }
+}
+
+async function requireAuthenticated(req: express.Request, res: express.Response): Promise<Caller | null> {
+  const caller = await authenticate(req);
+  if (!caller) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return null;
+  }
+  return caller;
+}
+
+interface EventRow extends RowDataPacket {
   status: string;
+  tier: 'TIER1_GA' | 'TIER2_SEATED';
+}
+
+interface InventoryItemRow extends RowDataPacket {
+  inventory_item_id: number;
+  name: string;
+  total_qty: number;
+  reserved_qty: number;
+  sold_qty: number;
+  price_cents: number;
+}
+
+interface SeatRow extends RowDataPacket {
+  seat_id: number;
+  status: 'AVAILABLE' | 'HELD' | 'SOLD';
 }
 
 /**
- * Local checkout: atomically creates a paid order and issued ticket records.
- * A payment provider can replace the immediate paid status later without
- * changing the customer-facing order/ticket model.
+ * Buy tickets for a published event. Not a two-phase hold: this reserves
+ * stock (and, for seated events, the requested seats) and creates the order
+ * as `PENDING` in one transaction, so the check for "enough left" and the
+ * decrement can never race.
  */
 app.post('/orders', async (req, res) => {
-  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-  const ticketTypeId = Number(req.body?.ticketTypeId);
-  const quantity = Number(req.body?.quantity ?? 1);
-  if (!email || !Number.isInteger(ticketTypeId) || !Number.isInteger(quantity) || quantity < 1) {
-    res.status(400).json({ error: 'invalid_purchase' });
+  const caller = await requireAuthenticated(req, res);
+  if (!caller) return;
+
+  const eventId = Number(req.body?.eventId);
+  const quantity = Number(req.body?.quantity);
+  const seatIds = Array.isArray(req.body?.seatIds) ? (req.body.seatIds as unknown[]).map(Number) : null;
+  const customerEmail = typeof req.body?.customerEmail === 'string' ? req.body.customerEmail.trim() : '';
+  if (!Number.isSafeInteger(eventId) || eventId < 1 || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 20 || !customerEmail) {
+    res.status(400).json({ error: 'invalid_order' });
     return;
   }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const [types] = await connection.query<PurchasableTicketRow[]>(
-      `SELECT ticket_type_id, event_id, price, quantity_available, max_per_order, status
-       FROM ticket_types WHERE ticket_type_id = ? FOR UPDATE`,
-      [ticketTypeId],
+
+    const [events] = await connection.query<EventRow[]>(
+      'SELECT status, tier FROM onestagedb.events WHERE event_id = ? LIMIT 1',
+      [eventId],
     );
-    const ticketType = types[0];
-    if (!ticketType || ticketType.status !== 'active') {
-      await connection.rollback(); res.status(404).json({ error: 'ticket_not_on_sale' }); return;
-    }
-    if (quantity > ticketType.quantity_available || quantity > ticketType.max_per_order) {
-      await connection.rollback(); res.status(409).json({ error: 'insufficient_tickets' }); return;
+    const event = events[0];
+    if (!event || event.status !== 'PUBLISHED') {
+      await connection.rollback();
+      res.status(404).json({ error: 'event_not_on_sale' });
+      return;
     }
 
-    const [customers] = await connection.query<RowDataPacket[]>('SELECT customer_id FROM customers WHERE email = ?', [email]);
-    let customerId = customers[0]?.customer_id as number | undefined;
-    if (!customerId) {
-      const namePart = email.split('@')[0] || 'customer';
-      const displayName = namePart.replace(/[._-]/g, ' ').replace(/\b\w/g, (letter: string) => letter.toUpperCase());
-      const [created] = await connection.query<ResultSetHeader>(
-        `INSERT INTO customers (customer_name, email, password_hash, first_name, last_name, status, email_verified)
-         VALUES (?, ?, 'cognito-managed', ?, '', 'active', TRUE)`,
-        [`${namePart}-${Date.now()}`, email, displayName],
+    const [items] = await connection.query<InventoryItemRow[]>(
+      'SELECT inventory_item_id, name, total_qty, reserved_qty, sold_qty, price_cents FROM onestagedb.inventory_items WHERE event_id = ? LIMIT 1 FOR UPDATE',
+      [eventId],
+    );
+    const item = items[0];
+    if (!item) {
+      await connection.rollback();
+      res.status(409).json({ error: 'nothing_for_sale' });
+      return;
+    }
+    const remaining = item.total_qty - item.reserved_qty - item.sold_qty;
+    if (remaining < quantity) {
+      await connection.rollback();
+      res.status(409).json({ error: 'insufficient_inventory' });
+      return;
+    }
+
+    let seats: SeatRow[] = [];
+    if (event.tier === 'TIER2_SEATED') {
+      if (!seatIds || seatIds.length !== quantity || seatIds.some((id) => !Number.isSafeInteger(id))) {
+        await connection.rollback();
+        res.status(400).json({ error: 'seat_selection_required' });
+        return;
+      }
+      const [rows] = await connection.query<SeatRow[]>(
+        `SELECT seat_id, status FROM onestagedb.seats WHERE event_id = ? AND seat_id IN (${seatIds.map(() => '?').join(',')}) FOR UPDATE`,
+        [eventId, ...seatIds],
       );
-      customerId = created.insertId;
+      seats = rows;
+      if (seats.length !== quantity || seats.some((seat) => seat.status !== 'AVAILABLE')) {
+        await connection.rollback();
+        res.status(409).json({ error: 'seats_unavailable' });
+        return;
+      }
+      await connection.query(
+        `UPDATE onestagedb.seats SET status = 'SOLD' WHERE seat_id IN (${seatIds.map(() => '?').join(',')})`,
+        seatIds,
+      );
     }
 
-    const total = Number(ticketType.price) * quantity;
-    const orderNumber = `ONE-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+    await connection.query('UPDATE onestagedb.inventory_items SET sold_qty = sold_qty + ? WHERE inventory_item_id = ?', [
+      quantity,
+      item.inventory_item_id,
+    ]);
+
+    const totalAmountCents = item.price_cents * quantity;
     const [order] = await connection.query<ResultSetHeader>(
-      `INSERT INTO orders
-       (order_number, customer_id, event_id, order_status, payment_status, total_amount,
-        final_amount, currency, billing_email, payment_method, confirmed_at, completed_at)
-       VALUES (?, ?, ?, 'completed', 'paid', ?, ?, 'SGD', ?, 'local-demo', NOW(), NOW())`,
-      [orderNumber, customerId, ticketType.event_id, total, total, email],
+      "INSERT INTO orders (event_id, customer_sub, customer_email, status, total_amount_cents, currency) VALUES (?, ?, ?, 'PENDING', ?, 'SGD')",
+      [eventId, caller.sub, customerEmail, totalAmountCents],
     );
 
-    const ticketIds: number[] = [];
-    for (let index = 0; index < quantity; index += 1) {
-      const publicId = randomUUID();
-      const [ticket] = await connection.query<ResultSetHeader>(
-        `INSERT INTO tickets
-         (ticket_uuid, event_id, ticket_type_id, order_id, customer_id, ticket_code, status, price_paid, issued_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'sold', ?, NOW())`,
-        [publicId, ticketType.event_id, ticketTypeId, order.insertId, customerId,
-         `TKT-${publicId.slice(0, 8).toUpperCase()}`, ticketType.price],
+    if (event.tier === 'TIER2_SEATED') {
+      for (const seat of seats) {
+        await connection.query(
+          'INSERT INTO order_items (order_id, inventory_item_id, seat_id, description, quantity, unit_price_cents) VALUES (?, ?, ?, ?, 1, ?)',
+          [order.insertId, item.inventory_item_id, seat.seat_id, item.name, item.price_cents],
+        );
+      }
+    } else {
+      await connection.query(
+        'INSERT INTO order_items (order_id, inventory_item_id, seat_id, description, quantity, unit_price_cents) VALUES (?, ?, NULL, ?, ?, ?)',
+        [order.insertId, item.inventory_item_id, item.name, quantity, item.price_cents],
       );
-      ticketIds.push(ticket.insertId);
     }
-    await connection.query(
-      `INSERT INTO order_items (order_id, ticket_type_id, ticket_id, quantity, unit_price, subtotal)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [order.insertId, ticketTypeId, ticketIds[0], quantity, ticketType.price, total],
-    );
-    await connection.query(
-      `UPDATE ticket_types SET status = IF(quantity_available = ?, 'sold_out', status),
-       quantity_available = quantity_available - ?, quantity_sold = quantity_sold + ? WHERE ticket_type_id = ?`,
-      [quantity, quantity, quantity, ticketTypeId],
-    );
-    await connection.query(
-      `INSERT IGNORE INTO customer_event_roles (customer_id, event_id, role_id) VALUES (?, ?, 2)`,
-      [customerId, ticketType.event_id],
-    );
+
     await connection.commit();
-    res.status(201).json({ orderId: order.insertId, reference: orderNumber, eventId: ticketType.event_id, quantity });
+    res.status(201).json({ order: { order_id: order.insertId, status: 'PENDING', total_amount_cents: totalAmountCents } });
   } catch (error) {
     await connection.rollback();
     console.error('POST /orders failed', error);
-    res.status(500).json({ error: 'purchase_failed' });
+    res.status(500).json({ error: 'order_create_failed' });
   } finally {
     connection.release();
   }
 });
 
-interface CancellationItemRow extends RowDataPacket {
-  ticket_type_id: number;
-  quantity: number;
+interface OrderRow extends RowDataPacket {
+  order_id: number;
+  event_id: number;
+  customer_sub: string;
+  customer_email: string;
+  status: string;
+  total_amount_cents: number;
 }
 
-/** Cancel one customer's paid order and return its tickets to inventory. */
-app.delete('/orders/:reference', async (req, res) => {
-  const reference = req.params.reference;
-  const email = typeof req.query.email === 'string' ? req.query.email.trim().toLowerCase() : '';
-  if (!reference || !email) { res.status(400).json({ error: 'reference_and_email_required' }); return; }
+interface OrderItemRow extends RowDataPacket {
+  order_item_id: number;
+  inventory_item_id: number;
+  seat_id: number | null;
+  description: string;
+  quantity: number;
+  unit_price_cents: number;
+}
+
+/**
+ * Captures a simulated, tokenized payment and issues one ticket per unit
+ * bought. No real card data ever reaches this service — `paymentToken` is
+ * whatever the client sends and is stored as-is, matching the design doc's
+ * "simulated, tokenized payment" checkout model.
+ */
+app.post('/orders/:orderId/payment', async (req, res) => {
+  const caller = await requireAuthenticated(req, res);
+  if (!caller) return;
+
+  const orderId = Number(req.params.orderId);
+  const paymentToken = typeof req.body?.paymentToken === 'string' ? req.body.paymentToken.trim() : '';
+  if (!Number.isSafeInteger(orderId) || orderId < 1 || !paymentToken) {
+    res.status(400).json({ error: 'invalid_payment' });
+    return;
+  }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const [orders] = await connection.query<RowDataPacket[]>(
-      `SELECT o.order_id, o.customer_id, o.event_id, o.payment_status
-       FROM orders o JOIN customers c ON c.customer_id = o.customer_id
-       WHERE o.order_number = ? AND c.email = ? FOR UPDATE`,
-      [reference, email],
+
+    const [orders] = await connection.query<OrderRow[]>(
+      'SELECT order_id, event_id, customer_sub, customer_email, status, total_amount_cents FROM orders WHERE order_id = ? AND customer_sub = ? LIMIT 1 FOR UPDATE',
+      [orderId, caller.sub],
     );
     const order = orders[0];
-    if (!order) { await connection.rollback(); res.status(404).json({ error: 'order_not_found' }); return; }
-    if (order.payment_status !== 'paid') { await connection.rollback(); res.status(409).json({ error: 'order_not_cancellable' }); return; }
+    if (!order) {
+      await connection.rollback();
+      res.status(404).json({ error: 'order_not_found' });
+      return;
+    }
+    if (order.status !== 'PENDING') {
+      await connection.rollback();
+      res.status(409).json({ error: 'order_not_payable' });
+      return;
+    }
 
-    const [items] = await connection.query<CancellationItemRow[]>(
-      `SELECT ticket_type_id, SUM(quantity) AS quantity FROM order_items WHERE order_id = ? GROUP BY ticket_type_id`,
-      [order.order_id],
+    await connection.query(
+      "INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'CAPTURED', ?)",
+      [orderId, paymentToken, order.total_amount_cents],
+    );
+    await connection.query("UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE order_id = ?", [orderId]);
+
+    const [items] = await connection.query<OrderItemRow[]>(
+      'SELECT order_item_id, inventory_item_id, seat_id, description, quantity, unit_price_cents FROM order_items WHERE order_id = ?',
+      [orderId],
     );
     for (const item of items) {
-      await connection.query(
-        `UPDATE ticket_types SET quantity_available = LEAST(quantity_total, quantity_available + ?),
-         quantity_sold = GREATEST(0, quantity_sold - ?), status = 'active' WHERE ticket_type_id = ?`,
-        [item.quantity, item.quantity, item.ticket_type_id],
-      );
+      for (let index = 0; index < item.quantity; index += 1) {
+        await connection.query(
+          "INSERT INTO ticketing.tickets (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ISSUED')",
+          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, item.seat_id, randomUUID()],
+        );
+      }
     }
-    await connection.query(`UPDATE tickets SET status = 'cancelled' WHERE order_id = ? AND status IN ('sold', 'used')`, [order.order_id]);
-    await connection.query(
-      `UPDATE orders SET order_status = 'cancelled', payment_status = 'refunded' WHERE order_id = ?`, [order.order_id],
-    );
-    await connection.query(
-      `INSERT INTO order_history (order_id, status_from, status_to, changed_by_customer_id, reason)
-       VALUES (?, 'completed', 'cancelled', ?, 'Customer cancellation')`,
-      [order.order_id, order.customer_id],
-    );
-    const [remaining] = await connection.query<RowDataPacket[]>(
-      `SELECT 1 FROM orders WHERE customer_id = ? AND event_id = ? AND payment_status = 'paid' LIMIT 1`,
-      [order.customer_id, order.event_id],
-    );
-    if (!remaining[0]) {
-      await connection.query(
-        `UPDATE customer_event_roles SET status = 'REVOKED'
-         WHERE customer_id = ? AND event_id = ? AND role_id = 2 AND status = 'ACTIVE'`,
-        [order.customer_id, order.event_id],
-      );
-    }
+
     await connection.commit();
-    res.status(204).send();
+    res.status(200).json({ status: 'PAID' });
   } catch (error) {
     await connection.rollback();
-    console.error('DELETE /orders/:reference failed', error);
-    res.status(500).json({ error: 'order_cancel_failed' });
-  } finally { connection.release(); }
+    console.error('POST /orders/:orderId/payment failed', error);
+    res.status(500).json({ error: 'payment_failed' });
+  } finally {
+    connection.release();
+  }
 });
+
+// -----------------------------------------------------------------------
+// GET /sales — revenue and tickets sold, per event (organiser dashboard)
+// -----------------------------------------------------------------------
 
 type EventStatus = 'On sale' | 'Few left' | 'Sold out';
 
 function toStatus(available: number, total: number): EventStatus {
-  if (total <= 0 || available <= 0) {
-    return 'Sold out';
-  }
-  if (available / total < 0.15) {
-    return 'Few left';
-  }
+  if (total <= 0 || available <= 0) return 'Sold out';
+  if (available / total < 0.15) return 'Few left';
   return 'On sale';
 }
-
-const MONTHS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-];
-
-/** See the event service's `formatDate` for why this is hand-rolled rather than locale-based. */
-function formatDate(value: Date): string {
-  const day = String(value.getDate()).padStart(2, '0');
-  const month = MONTHS[value.getMonth()];
-  return `${day} ${month} ${value.getFullYear()}`;
-}
-
-function formatTime(value: Date): string {
-  const hours24 = value.getHours();
-  const minutes = String(value.getMinutes()).padStart(2, '0');
-  const period = hours24 >= 12 ? 'PM' : 'AM';
-  const hours12 = hours24 % 12 || 12;
-  return `${hours12}:${minutes} ${period}`;
-}
-
-const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
-/** Full weekday-qualified date, for a customer's own order history. */
-function formatEventDate(value: Date): string {
-  const weekday = WEEKDAYS[value.getDay()];
-  const day = String(value.getDate()).padStart(2, '0');
-  const month = MONTHS[value.getMonth()];
-  return `${weekday} ${day} ${month} ${value.getFullYear()}`;
-}
-
-// -----------------------------------------------------------------------
-// GET /sales — revenue and tickets sold, per event
-// -----------------------------------------------------------------------
 
 interface SalesRow extends RowDataPacket {
   event_id: number;
   event_name: string;
-  venue_name: string;
+  venue: string;
   sold: number;
-  revenue: number;
-  available: number | null;
+  revenue_cents: number;
   total: number | null;
+  available: number | null;
 }
 
 app.get('/sales', async (_req, res) => {
   try {
     const [rows] = await pool.query<SalesRow[]>(
       `SELECT
-         e.event_id, e.event_name, v.venue_name,
+         e.event_id, e.title AS event_name, e.venue,
          COALESCE(SUM(oi.quantity), 0) AS sold,
-         COALESCE(SUM(oi.subtotal), 0) AS revenue,
-         (SELECT COALESCE(SUM(quantity_available), 0) FROM ticket_types WHERE event_id = e.event_id) AS available,
-         (SELECT COALESCE(SUM(quantity_total), 0) FROM ticket_types WHERE event_id = e.event_id) AS total
-       FROM events e
-       JOIN venues v ON v.venue_id = e.venue_id
-       LEFT JOIN orders o ON o.event_id = e.event_id AND o.payment_status = 'paid'
+         COALESCE(SUM(oi.quantity * oi.unit_price_cents), 0) AS revenue_cents,
+         inv.total_qty AS total,
+         inv.total_qty - inv.reserved_qty - inv.sold_qty AS available
+       FROM onestagedb.events e
+       LEFT JOIN (
+         SELECT event_id, SUM(total_qty) AS total_qty, SUM(reserved_qty) AS reserved_qty, SUM(sold_qty) AS sold_qty
+         FROM onestagedb.inventory_items GROUP BY event_id
+       ) inv ON inv.event_id = e.event_id
+       LEFT JOIN orders o ON o.event_id = e.event_id AND o.status = 'PAID'
        LEFT JOIN order_items oi ON oi.order_id = o.order_id
-       WHERE e.status != 'cancelled'
+       WHERE e.status != 'CANCELLED'
        GROUP BY e.event_id
-       ORDER BY e.event_start_datetime`,
+       ORDER BY e.starts_at`,
     );
 
     res.json(
       rows.map((row) => ({
         eventId: row.event_id,
         event: row.event_name,
-        venue: row.venue_name,
+        venue: row.venue,
         sold: Number(row.sold),
         capacity: Number(row.total ?? 0),
-        revenue: Number(row.revenue),
+        revenue: Number(row.revenue_cents) / 100,
         status: toStatus(Number(row.available ?? 0), Number(row.total ?? 0)),
       })),
     );
@@ -273,13 +340,20 @@ app.get('/sales', async (_req, res) => {
 // -----------------------------------------------------------------------
 
 interface AttendeeRow extends RowDataPacket {
-  first_name: string;
-  last_name: string;
-  email: string;
-  type_name: string;
-  seating_section: string | null;
+  customer_email: string;
+  description: string;
   quantity: number;
   created_at: Date;
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function formatDate(value: Date): string {
+  const weekday = WEEKDAYS[value.getDay()];
+  const day = String(value.getDate()).padStart(2, '0');
+  const month = MONTHS[value.getMonth()];
+  return `${weekday} ${day} ${month} ${value.getFullYear()}`;
 }
 
 app.get('/attendees', async (req, res) => {
@@ -291,87 +365,29 @@ app.get('/attendees', async (req, res) => {
 
   try {
     const [rows] = await pool.query<AttendeeRow[]>(
-      `SELECT
-         c.first_name, c.last_name, c.email,
-         tt.type_name, tt.seating_section, oi.quantity, o.created_at
-       FROM order_items oi
-       JOIN orders o ON o.order_id = oi.order_id
-       JOIN customers c ON c.customer_id = o.customer_id
-       JOIN ticket_types tt ON tt.ticket_type_id = oi.ticket_type_id
-       WHERE o.event_id = ? AND o.payment_status = 'paid'
+      `SELECT o.customer_email, oi.description, SUM(oi.quantity) AS quantity, o.created_at
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.order_id
+       WHERE o.event_id = ? AND o.status = 'PAID'
+       GROUP BY o.order_id, o.customer_email, oi.description, o.created_at
        ORDER BY o.created_at`,
       [eventId],
     );
 
     res.json(
+      // No local customer profile exists in this schema (identity is the
+      // Cognito sub) — the mailbox part of the email stands in for a name.
       rows.map((row) => ({
-        buyer: `${row.first_name} ${row.last_name}`.trim(),
-        email: row.email,
-        ticketType: row.seating_section ?? row.type_name,
-        quantity: row.quantity,
+        buyer: row.customer_email.split('@')[0] ?? row.customer_email,
+        email: row.customer_email,
+        ticketType: row.description,
+        quantity: Number(row.quantity),
         orderedAt: formatDate(row.created_at),
       })),
     );
   } catch (error) {
     console.error('GET /attendees failed', error);
     res.status(500).json({ error: 'attendees_query_failed' });
-  }
-});
-
-// -----------------------------------------------------------------------
-// GET /orders?email= — a signed-in customer's own paid orders
-// -----------------------------------------------------------------------
-
-interface CustomerOrderRow extends RowDataPacket {
-  event_id: number;
-  order_number: string;
-  event_name: string;
-  venue_name: string;
-  event_start_datetime: Date;
-  seats: string | null;
-  quantity: number;
-}
-
-app.get('/orders', async (req, res) => {
-  const email = typeof req.query.email === 'string' ? req.query.email.trim() : '';
-  if (!email) {
-    res.status(400).json({ error: 'email_required' });
-    return;
-  }
-
-  try {
-    const [rows] = await pool.query<CustomerOrderRow[]>(
-      `SELECT
-         o.order_number, e.event_id, e.event_name, v.venue_name, e.event_start_datetime,
-         GROUP_CONCAT(DISTINCT COALESCE(tt.seating_section, tt.type_name) SEPARATOR ', ') AS seats,
-         SUM(oi.quantity) AS quantity
-       FROM orders o
-       JOIN customers c ON c.customer_id = o.customer_id
-       JOIN events e ON e.event_id = o.event_id
-       JOIN venues v ON v.venue_id = e.venue_id
-       JOIN order_items oi ON oi.order_id = o.order_id
-       JOIN ticket_types tt ON tt.ticket_type_id = oi.ticket_type_id
-       WHERE c.email = ? AND o.payment_status = 'paid'
-       GROUP BY o.order_id
-       ORDER BY e.event_start_datetime DESC`,
-      [email],
-    );
-
-    res.json(
-      rows.map((row) => ({
-        eventId: row.event_id,
-        reference: row.order_number,
-        event: row.event_name,
-        venue: row.venue_name,
-        date: formatEventDate(row.event_start_datetime),
-        time: formatTime(row.event_start_datetime),
-        seats: row.seats ?? '',
-        quantity: Number(row.quantity),
-      })),
-    );
-  } catch (error) {
-    console.error('GET /orders failed', error);
-    res.status(500).json({ error: 'orders_query_failed' });
   }
 });
 

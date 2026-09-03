@@ -1,25 +1,27 @@
--- Removes all Docker MySQL application records and resets AUTO_INCREMENT counters.
--- The schema and Admin/Customer/Helper role lookup rows are retained.
+-- Removes all Docker MySQL application records across all four schemas and
+-- resets AUTO_INCREMENT counters. The schemas and tables themselves are
+-- retained — only the rows are cleared.
 SET FOREIGN_KEY_CHECKS=0;
-TRUNCATE TABLE audit_trail;
-TRUNCATE TABLE event_reviews;
-TRUNCATE TABLE notifications;
-TRUNCATE TABLE queue_history;
-TRUNCATE TABLE waiting_queues;
+
+USE onestagedb;
+TRUNCATE TABLE seats;
+TRUNCATE TABLE inventory_holds;
+TRUNCATE TABLE inventory_items;
+TRUNCATE TABLE event_team_memberships;
+TRUNCATE TABLE event_images;
+TRUNCATE TABLE events;
+
+USE `queue`;
+TRUNCATE TABLE queue_entries;
+TRUNCATE TABLE queue_sessions;
+
+USE checkout;
 TRUNCATE TABLE payments;
-TRUNCATE TABLE order_history;
 TRUNCATE TABLE order_items;
 TRUNCATE TABLE orders;
-TRUNCATE TABLE inventory_logs;
-TRUNCATE TABLE ticket_check_in_history;
+
+USE ticketing;
+TRUNCATE TABLE check_in_logs;
 TRUNCATE TABLE tickets;
-TRUNCATE TABLE ticket_types;
-TRUNCATE TABLE event_history;
-TRUNCATE TABLE event_images;
-TRUNCATE TABLE customer_event_roles;
-TRUNCATE TABLE events;
-TRUNCATE TABLE venues;
-TRUNCATE TABLE customer_password_history;
-TRUNCATE TABLE customer_login_history;
-TRUNCATE TABLE customers;
+
 SET FOREIGN_KEY_CHECKS=1;

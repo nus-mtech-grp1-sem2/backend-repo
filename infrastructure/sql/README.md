@@ -26,7 +26,7 @@ This folder contains SQL scripts and tools to manage the OneStage database schem
    ```env
    DB_HOST=your-rds-instance.region.rds.amazonaws.com
    DB_PORT=3306
-   DB_NAME=myonestagedb
+   DB_NAME=onestagedb
    DB_USER=your_username
    DB_PASSWORD=your_password
    DB_SSL=true
@@ -59,7 +59,7 @@ If you prefer to run the SQL scripts directly:
 $DB_HOST = "your-rds-instance.region.rds.amazonaws.com"
 $DB_USER = "your_username"
 $DB_PASSWORD = "your_password"
-$DB_NAME = "myonestagedb"
+$DB_NAME = "onestagedb"
 
 # Drop all tables
 Get-Content infrastructure\sql\01-drop-all-tables.sql | mysql -h $DB_HOST -u $DB_USER -p$DB_PASSWORD $DB_NAME --ssl-mode=REQUIRED
@@ -107,7 +107,7 @@ After running the migration, verify your tables:
 
 ```sql
 -- Connect to your database
-mysql -h your-rds-instance.region.rds.amazonaws.com -u your_username -p myonestagedb --ssl-mode=REQUIRED
+mysql -h your-rds-instance.region.rds.amazonaws.com -u your_username -p onestagedb --ssl-mode=REQUIRED
 
 -- List all tables
 SHOW TABLES;
@@ -142,7 +142,7 @@ choco install mysql
 
 ### Permission denied
 - Ensure your database user has CREATE and DROP privileges
-- For RDS master user: `GRANT ALL PRIVILEGES ON myonestagedb.* TO 'your_user'@'%';`
+- For RDS master user: `GRANT ALL PRIVILEGES ON onestagedb.* TO 'your_user'@'%';`
 
 ### SSL connection issues
 - Use `--ssl-mode=REQUIRED` for RDS connections

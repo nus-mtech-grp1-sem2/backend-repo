@@ -42,6 +42,26 @@ services:
     environment:
       SERVICE: event
       PORT: 3001
+      # Uses the OneStage application database.
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: onestagedb
+      DB_USER: onestage
+      DB_PASSWORD: onestage123
+      # Local mysql has no TLS set up; unset (or non-"false") means TLS, which
+      # is what a real RDS endpoint needs.
+      DB_SSL: 'false'
+      # Which pool to verify tokens against. Not secrets.
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      # Only needed for the "invite by searching Cognito users" endpoints
+      # (/events/:id/users, /events/:id/invitations) — everything else on
+      # this service works without them. In AWS these come from the ECS task
+      # role and none of these are set.
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
 
   inventory:
     <<: *service
@@ -63,6 +83,11 @@ services:
     environment:
       SERVICE: order
       PORT: 3004
+      # Which pool to verify tokens against — checkout requires a signed-in
+      # customer. DB connection uses services/order/src/db.ts's defaults
+      # (local mysql, checkout schema), so no DB_* vars needed here.
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
 
   ticket:
     <<: *service
@@ -70,6 +95,11 @@ services:
     environment:
       SERVICE: ticket
       PORT: 3005
+      # Which pool to verify tokens against — "my tickets" and check-in both
+      # require a signed-in caller. DB connection uses
+      # services/ticket/src/db.ts's defaults (local mysql, ticketing schema).
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
 
   notification:
     <<: *service
@@ -100,7 +130,10 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: myonestagedb
+      # The image auto-creates this one schema and grants `onestage` access
+      # to it; infrastructure/sql/03-grant-schema-access.sql extends that to
+      # the other three schemas 02-create-all-tables.sql creates.
+      MYSQL_DATABASE: onestagedb
       MYSQL_USER: onestage
       MYSQL_PASSWORD: onestage123
     ports:

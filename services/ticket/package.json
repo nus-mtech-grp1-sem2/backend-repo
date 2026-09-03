@@ -12,6 +12,7 @@
   "type": "module",
   "description": "",
   "dependencies": {
+    "aws-jwt-verify": "^5.1.0",
     "express": "^5.2.1",
     "mysql2": "^3.11.5"
   }

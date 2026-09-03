@@ -1,528 +1,223 @@
--- Create All Tables for OneStage Database
--- This script creates all 19 tables in the correct order to satisfy foreign key dependencies
--- Database: myonestagedb
+-- OneStage database schema: one MySQL instance, four independent
+-- service-owned schemas (schema-per-service, per database/onestage-system-design.md).
+-- No cross-schema FOREIGN KEY exists anywhere in this file — a reference to
+-- another service's row (e.g. checkout.orders.event_id) is a plain
+-- unconstrained column, so each schema could move to its own instance later
+-- with no schema change. Application code still runs on one shared instance
+-- today, so a service is allowed to read another schema's table directly
+-- (fully-qualified, e.g. `onestagedb.inventory_items`) rather than only
+-- through that service's HTTP API — see services/order and services/ticket.
+CREATE DATABASE IF NOT EXISTS onestagedb;
+CREATE DATABASE IF NOT EXISTS `queue`;
+CREATE DATABASE IF NOT EXISTS checkout;
+CREATE DATABASE IF NOT EXISTS ticketing;
 
-USE myonestagedb;
-
--- Ensure proper character set and collation
 SET NAMES utf8mb4;
-SET CHARACTER SET utf8mb4;
+SET FOREIGN_KEY_CHECKS = 1;
+SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';
+SET time_zone = '+00:00';
 
 -- =============================================================================
--- 1. CUSTOMERS & AUTHENTICATION
+-- onestagedb — events, per-event team roles, and the inventory that
+-- guarantees a seat or quantity is never sold twice.
 -- =============================================================================
+USE onestagedb;
 
--- Core customer information table
-CREATE TABLE customers (
-    customer_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    customer_name VARCHAR(50) NOT NULL UNIQUE,
-    admin_ind VARCHAR(1) NOT NULL DEFAULT 'N',
-    operator_ind VARCHAR(1) NOT NULL DEFAULT 'N',
-    email VARCHAR(255) NOT NULL UNIQUE,
-    password_hash VARCHAR(255) NOT NULL,
-    first_name VARCHAR(100) NOT NULL,
-    last_name VARCHAR(100) NOT NULL,
-    phone_number VARCHAR(20),
-    date_of_birth DATE,
-    status ENUM('active', 'suspended', 'deleted') DEFAULT 'active',
-    email_verified BOOLEAN DEFAULT FALSE,
-    phone_verified BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP NULL,
-    
-    INDEX idx_email (email),
-    INDEX idx_customer_name (customer_name),
-    INDEX idx_status (status),
-    INDEX idx_created_at (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Tracks all login attempts and sessions
-CREATE TABLE customer_login_history (
-    login_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    login_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    device_type VARCHAR(50),
-    login_status ENUM('success', 'failed', 'blocked') DEFAULT 'success',
-    failure_reason VARCHAR(255),
-    session_id VARCHAR(255),
-    logout_time TIMESTAMP NULL,
-    
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_login_time (login_time),
-    INDEX idx_login_status (login_status),
-    INDEX idx_session_id (session_id),
-    
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Tracks password change history for security
-CREATE TABLE customer_password_history (
-    history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    old_password_hash VARCHAR(255) NOT NULL,
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    changed_by_customer_id BIGINT UNSIGNED,
-    ip_address VARCHAR(45),
-    reason VARCHAR(255),
-    
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_changed_at (changed_at),
-    
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- =============================================================================
--- 2. EVENTS & VENUES
--- =============================================================================
-
--- Physical or virtual venues where events take place
-CREATE TABLE venues (
-    venue_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    venue_name VARCHAR(255) NOT NULL,
-    address VARCHAR(500),
-    city VARCHAR(100),
-    state VARCHAR(100),
-    country VARCHAR(100),
-    postal_code VARCHAR(20),
-    capacity INT UNSIGNED,
-    venue_type ENUM('indoor', 'outdoor', 'virtual', 'hybrid') DEFAULT 'indoor',
-    facilities JSON,
-    contact_email VARCHAR(255),
-    contact_phone VARCHAR(20),
-    latitude DECIMAL(10, 8),
-    longitude DECIMAL(11, 8),
-    status ENUM('active', 'inactive', 'maintenance') DEFAULT 'active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_city (city),
-    INDEX idx_country (country),
-    INDEX idx_status (status),
-    INDEX idx_coordinates (latitude, longitude)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Main events/shows table
 CREATE TABLE events (
-    event_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    event_name VARCHAR(255) NOT NULL,
-    event_description TEXT,
-    event_type ENUM('concert', 'sports', 'theater', 'conference', 'festival', 'other') NOT NULL,
-    venue_id BIGINT UNSIGNED,
-    organizer_id BIGINT UNSIGNED NOT NULL COMMENT 'References customers(customer_id)',
-    event_start_datetime TIMESTAMP NOT NULL,
-    event_end_datetime TIMESTAMP NOT NULL,
-    doors_open_time TIMESTAMP,
-    age_restriction VARCHAR(20),
-    dress_code VARCHAR(100),
-    status ENUM('draft', 'published', 'cancelled', 'postponed', 'completed') DEFAULT 'draft',
-    cancellation_reason TEXT,
-    total_capacity INT UNSIGNED,
-    featured BOOLEAN DEFAULT FALSE,
-    banner_image_url VARCHAR(500),
-    thumbnail_image_url VARCHAR(500),
-    terms_conditions TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    published_at TIMESTAMP NULL,
-    
-    INDEX idx_event_name (event_name),
-    INDEX idx_event_type (event_type),
-    INDEX idx_venue_id (venue_id),
-    INDEX idx_organizer_id (organizer_id),
-    INDEX idx_start_datetime (event_start_datetime),
-    INDEX idx_status (status),
-    INDEX idx_featured (featured),
-    
-    FOREIGN KEY (venue_id) REFERENCES venues(venue_id) ON DELETE SET NULL,
-    FOREIGN KEY (organizer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  event_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  organiser_sub VARCHAR(36) NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  venue VARCHAR(255) NOT NULL,
+  starts_at DATETIME NOT NULL,
+  total_seats INT UNSIGNED NOT NULL,
+  tier ENUM('TIER1_GA', 'TIER2_SEATED') NOT NULL,
+  status ENUM('DRAFT', 'PUBLISHED', 'CANCELLED') NOT NULL DEFAULT 'DRAFT',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_events_status_starts_at (status, starts_at),
+  INDEX idx_events_organiser_sub (organiser_sub)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Audit trail for event modifications
-CREATE TABLE event_history (
-    history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    event_id BIGINT UNSIGNED NOT NULL,
-    changed_by_customer_id BIGINT UNSIGNED NOT NULL,
-    change_type ENUM('created', 'updated', 'published', 'cancelled', 'postponed') NOT NULL,
-    field_changed VARCHAR(100),
-    old_value TEXT,
-    new_value TEXT,
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ip_address VARCHAR(45),
-    notes TEXT,
-    
-    INDEX idx_event_id (event_id),
-    INDEX idx_changed_by (changed_by_customer_id),
-    INDEX idx_changed_at (changed_at),
-    INDEX idx_change_type (change_type),
-    
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (changed_by_customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Which role a Cognito subject holds on one event. Includes the
+-- invite_status/responded_at pair from the start (folded in from what was a
+-- follow-up migration on the source branch) since this is a fresh schema.
+CREATE TABLE event_team_memberships (
+  membership_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  user_sub VARCHAR(36) NOT NULL,
+  user_email VARCHAR(255) NOT NULL,
+  role ENUM('ORGANISER', 'HELPER') NOT NULL,
+  invite_status ENUM('PENDING', 'ACCEPTED', 'REJECTED') NOT NULL DEFAULT 'ACCEPTED',
+  granted_by_sub VARCHAR(36) NOT NULL,
+  granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  responded_at DATETIME NULL,
+  UNIQUE KEY uq_event_team_member (event_id, user_sub),
+  INDEX idx_event_team_invitation (user_sub, invite_status),
+  CONSTRAINT fk_team_event FOREIGN KEY (event_id) REFERENCES events (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- =============================================================================
--- 3. TICKETS & INVENTORY
--- =============================================================================
+CREATE TABLE inventory_items (
+  inventory_item_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  total_qty INT UNSIGNED NOT NULL,
+  reserved_qty INT UNSIGNED NOT NULL DEFAULT 0,
+  sold_qty INT UNSIGNED NOT NULL DEFAULT 0,
+  price_cents INT UNSIGNED NOT NULL,
+  version INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_inventory_event FOREIGN KEY (event_id) REFERENCES events (event_id),
+  CONSTRAINT chk_inventory_counts CHECK (reserved_qty + sold_qty <= total_qty)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Different ticket categories for events
-CREATE TABLE ticket_types (
-    ticket_type_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    event_id BIGINT UNSIGNED NOT NULL,
-    type_name VARCHAR(100) NOT NULL,
-    type_description TEXT,
-    price DECIMAL(10, 2) NOT NULL,
-    quantity_total INT UNSIGNED NOT NULL,
-    quantity_available INT UNSIGNED NOT NULL,
-    quantity_sold INT UNSIGNED DEFAULT 0,
-    quantity_reserved INT UNSIGNED DEFAULT 0,
-    max_per_order INT UNSIGNED DEFAULT 10,
-    sale_start_datetime TIMESTAMP NOT NULL,
-    sale_end_datetime TIMESTAMP NOT NULL,
-    status ENUM('active', 'sold_out', 'inactive') DEFAULT 'active',
-    seating_section VARCHAR(50),
-    benefits JSON,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_event_id (event_id),
-    INDEX idx_status (status),
-    INDEX idx_sale_dates (sale_start_datetime, sale_end_datetime),
-    INDEX idx_price (price),
-    
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Not yet read or written by any service (see services/order's comments) —
+-- reserved for the future two-phase hold/confirm flow the design doc
+-- describes. Kept here so that flow is additive, not another migration.
+CREATE TABLE inventory_holds (
+  hold_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  inventory_item_id BIGINT UNSIGNED NULL,
+  customer_sub VARCHAR(36) NOT NULL,
+  quantity INT UNSIGNED NOT NULL DEFAULT 1,
+  status ENUM('ACTIVE', 'CONFIRMED', 'RELEASED', 'EXPIRED') NOT NULL DEFAULT 'ACTIVE',
+  order_id BIGINT UNSIGNED NULL,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_hold_event FOREIGN KEY (event_id) REFERENCES events (event_id),
+  CONSTRAINT fk_hold_inventory FOREIGN KEY (inventory_item_id) REFERENCES inventory_items (inventory_item_id),
+  INDEX idx_holds_customer_status (customer_sub, status),
+  INDEX idx_holds_expiry (status, expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Individual ticket records
-CREATE TABLE tickets (
-    ticket_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    ticket_uuid VARCHAR(36) UNIQUE NOT NULL,
-    event_id BIGINT UNSIGNED NOT NULL,
-    ticket_type_id BIGINT UNSIGNED NOT NULL,
-    order_id BIGINT UNSIGNED,
-    customer_id BIGINT UNSIGNED,
-    ticket_code VARCHAR(100) UNIQUE NOT NULL,
-    qr_code_url VARCHAR(500),
-    seat_number VARCHAR(50),
-    status ENUM('available', 'reserved', 'sold', 'used', 'cancelled', 'refunded') DEFAULT 'available',
-    price_paid DECIMAL(10, 2),
-    issued_at TIMESTAMP NULL,
-    used_at TIMESTAMP NULL,
-    checked_in_at TIMESTAMP NULL,
-    checked_in_by_customer_id BIGINT UNSIGNED,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_ticket_uuid (ticket_uuid),
-    INDEX idx_ticket_code (ticket_code),
-    INDEX idx_event_id (event_id),
-    INDEX idx_ticket_type_id (ticket_type_id),
-    INDEX idx_order_id (order_id),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_status (status),
-    
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (ticket_type_id) REFERENCES ticket_types(ticket_type_id) ON DELETE RESTRICT,
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Organiser-uploaded artwork, stored in MySQL rather than a file store or
+-- bucket so local dev needs nothing beyond the database itself. One image
+-- per event; re-uploading replaces it.
+CREATE TABLE event_images (
+  event_id BIGINT UNSIGNED PRIMARY KEY,
+  mime_type VARCHAR(50) NOT NULL,
+  image_data MEDIUMBLOB NOT NULL,
+  uploaded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_event_image_event FOREIGN KEY (event_id) REFERENCES events (event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Tracks ticket check-ins and validation attempts
-CREATE TABLE ticket_check_in_history (
-    check_in_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    ticket_id BIGINT UNSIGNED NOT NULL,
-    event_id BIGINT UNSIGNED NOT NULL,
-    customer_id BIGINT UNSIGNED,
-    checked_in_by_customer_id BIGINT UNSIGNED NOT NULL,
-    check_in_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    check_in_method ENUM('qr_scan', 'manual', 'nfc', 'barcode') NOT NULL,
-    device_info TEXT,
-    location_gate VARCHAR(50),
-    ip_address VARCHAR(45),
-    status ENUM('success', 'failed', 'duplicate', 'invalid') DEFAULT 'success',
-    failure_reason VARCHAR(255),
-    
-    INDEX idx_ticket_id (ticket_id),
-    INDEX idx_event_id (event_id),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_check_in_time (check_in_time),
-    INDEX idx_status (status),
-    
-    FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
-    FOREIGN KEY (checked_in_by_customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Tracks all inventory changes for audit purposes
-CREATE TABLE inventory_logs (
-    log_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    ticket_type_id BIGINT UNSIGNED NOT NULL,
-    change_type ENUM('created', 'reserved', 'released', 'sold', 'refunded', 'adjusted') NOT NULL,
-    quantity_change INT NOT NULL,
-    quantity_before INT UNSIGNED NOT NULL,
-    quantity_after INT UNSIGNED NOT NULL,
-    reference_id BIGINT UNSIGNED,
-    reference_type VARCHAR(50),
-    changed_by_customer_id BIGINT UNSIGNED,
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    notes TEXT,
-    
-    INDEX idx_ticket_type_id (ticket_type_id),
-    INDEX idx_change_type (change_type),
-    INDEX idx_changed_at (changed_at),
-    INDEX idx_reference (reference_type, reference_id),
-    
-    FOREIGN KEY (ticket_type_id) REFERENCES ticket_types(ticket_type_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE seats (
+  seat_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  inventory_item_id BIGINT UNSIGNED NOT NULL,
+  seat_label VARCHAR(50) NOT NULL,
+  status ENUM('AVAILABLE', 'HELD', 'SOLD') NOT NULL DEFAULT 'AVAILABLE',
+  hold_id BIGINT UNSIGNED NULL,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_event_seat_label (event_id, seat_label),
+  CONSTRAINT fk_seat_event FOREIGN KEY (event_id) REFERENCES events (event_id),
+  CONSTRAINT fk_seat_inventory FOREIGN KEY (inventory_item_id) REFERENCES inventory_items (inventory_item_id),
+  CONSTRAINT fk_seat_hold FOREIGN KEY (hold_id) REFERENCES inventory_holds (hold_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =============================================================================
--- 4. ORDERS & PAYMENTS
+-- queue — the Tier 2 waiting room. Holds no inventory of its own; the queue
+-- service is still a stub (see services/queue), so these tables exist for the
+-- schema-per-service split but nothing reads/writes them yet.
 -- =============================================================================
+USE `queue`;
 
--- Customer orders/purchases
+CREATE TABLE queue_sessions (
+  queue_session_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  opens_at DATETIME NOT NULL,
+  admission_batch_size INT UNSIGNED NOT NULL,
+  admission_interval_sec INT UNSIGNED NOT NULL,
+  status ENUM('CLOSED', 'OPEN', 'DRAINED') NOT NULL DEFAULT 'CLOSED',
+  INDEX idx_queue_sessions_event (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE queue_entries (
+  queue_entry_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  queue_session_id BIGINT UNSIGNED NOT NULL,
+  customer_sub VARCHAR(36) NOT NULL,
+  position BIGINT UNSIGNED NOT NULL,
+  status ENUM('WAITING', 'ADMITTED', 'IN_CHECKOUT', 'EXPIRED', 'LEFT') NOT NULL DEFAULT 'WAITING',
+  joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  admitted_at DATETIME NULL,
+  admission_token VARCHAR(255) NULL,
+  token_expires_at DATETIME NULL,
+  UNIQUE KEY uq_queue_customer (queue_session_id, customer_sub),
+  CONSTRAINT fk_queue_entry_session FOREIGN KEY (queue_session_id) REFERENCES queue_sessions (queue_session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- =============================================================================
+-- checkout — turns a purchase into a paid order via a simulated, tokenized
+-- payment. No real card data is ever stored here.
+-- =============================================================================
+USE checkout;
+
 CREATE TABLE orders (
-    order_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    order_number VARCHAR(50) UNIQUE NOT NULL,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    event_id BIGINT UNSIGNED NOT NULL,
-    order_status ENUM('pending', 'confirmed', 'processing', 'completed', 'cancelled', 'refunded') DEFAULT 'pending',
-    payment_status ENUM('pending', 'paid', 'failed', 'refunded', 'partial_refund') DEFAULT 'pending',
-    total_amount DECIMAL(10, 2) NOT NULL,
-    discount_amount DECIMAL(10, 2) DEFAULT 0.00,
-    tax_amount DECIMAL(10, 2) DEFAULT 0.00,
-    service_fee DECIMAL(10, 2) DEFAULT 0.00,
-    final_amount DECIMAL(10, 2) NOT NULL,
-    currency VARCHAR(3) DEFAULT 'USD',
-    promo_code VARCHAR(50),
-    payment_method VARCHAR(50),
-    billing_email VARCHAR(255),
-    billing_phone VARCHAR(20),
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    confirmed_at TIMESTAMP NULL,
-    completed_at TIMESTAMP NULL,
-    
-    INDEX idx_order_number (order_number),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_event_id (event_id),
-    INDEX idx_order_status (order_status),
-    INDEX idx_payment_status (payment_status),
-    INDEX idx_created_at (created_at),
-    
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT,
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  order_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  customer_sub VARCHAR(36) NOT NULL,
+  customer_email VARCHAR(255) NOT NULL,
+  hold_id BIGINT UNSIGNED NULL,
+  status ENUM('PENDING', 'PAID', 'FAILED', 'CANCELLED') NOT NULL DEFAULT 'PENDING',
+  total_amount_cents INT UNSIGNED NOT NULL,
+  currency CHAR(3) NOT NULL DEFAULT 'SGD',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  paid_at DATETIME NULL,
+  INDEX idx_orders_customer (customer_sub, created_at),
+  INDEX idx_orders_event (event_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Individual items within an order
 CREATE TABLE order_items (
-    order_item_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    order_id BIGINT UNSIGNED NOT NULL,
-    ticket_type_id BIGINT UNSIGNED NOT NULL,
-    ticket_id BIGINT UNSIGNED,
-    quantity INT UNSIGNED NOT NULL,
-    unit_price DECIMAL(10, 2) NOT NULL,
-    subtotal DECIMAL(10, 2) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_order_id (order_id),
-    INDEX idx_ticket_type_id (ticket_type_id),
-    INDEX idx_ticket_id (ticket_id),
-    
-    FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
-    FOREIGN KEY (ticket_type_id) REFERENCES ticket_types(ticket_type_id) ON DELETE RESTRICT,
-    FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  order_item_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  order_id BIGINT UNSIGNED NOT NULL,
+  inventory_item_id BIGINT UNSIGNED NOT NULL,
+  seat_id BIGINT UNSIGNED NULL,
+  description VARCHAR(255) NOT NULL,
+  quantity INT UNSIGNED NOT NULL,
+  unit_price_cents INT UNSIGNED NOT NULL,
+  CONSTRAINT fk_order_item_order FOREIGN KEY (order_id) REFERENCES orders (order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Complete audit trail of order status changes
-CREATE TABLE order_history (
-    history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    order_id BIGINT UNSIGNED NOT NULL,
-    status_from VARCHAR(50),
-    status_to VARCHAR(50) NOT NULL,
-    changed_by_customer_id BIGINT UNSIGNED,
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    reason TEXT,
-    notes TEXT,
-    ip_address VARCHAR(45),
-    
-    INDEX idx_order_id (order_id),
-    INDEX idx_changed_at (changed_at),
-    INDEX idx_status_to (status_to),
-    
-    FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Payment transaction records
 CREATE TABLE payments (
-    payment_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    order_id BIGINT UNSIGNED NOT NULL,
-    payment_method VARCHAR(50) NOT NULL,
-    payment_provider VARCHAR(100),
-    transaction_id VARCHAR(255),
-    amount DECIMAL(10, 2) NOT NULL,
-    currency VARCHAR(3) DEFAULT 'USD',
-    status ENUM('pending', 'processing', 'completed', 'failed', 'refunded', 'cancelled') DEFAULT 'pending',
-    payment_date TIMESTAMP NULL,
-    refund_date TIMESTAMP NULL,
-    refund_amount DECIMAL(10, 2),
-    failure_reason TEXT,
-    metadata JSON,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_order_id (order_id),
-    INDEX idx_transaction_id (transaction_id),
-    INDEX idx_status (status),
-    INDEX idx_payment_date (payment_date),
-    
-    FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE RESTRICT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  payment_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  order_id BIGINT UNSIGNED NOT NULL,
+  payment_token VARCHAR(255) NOT NULL,
+  status ENUM('AUTHORIZED', 'CAPTURED', 'FAILED') NOT NULL,
+  amount_cents INT UNSIGNED NOT NULL,
+  processed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_payment_order FOREIGN KEY (order_id) REFERENCES orders (order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =============================================================================
--- 5. QUEUE MANAGEMENT
+-- ticketing — issues the QR-coded ticket and is the source of truth at the
+-- door: a ticket can never be checked in twice.
 -- =============================================================================
+USE ticketing;
 
--- Virtual waiting queue for high-demand events
-CREATE TABLE waiting_queues (
-    queue_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    event_id BIGINT UNSIGNED NOT NULL,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    queue_token VARCHAR(255) UNIQUE NOT NULL,
-    position INT UNSIGNED,
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    estimated_wait_time INT UNSIGNED,
-    notified_at TIMESTAMP NULL,
-    expires_at TIMESTAMP NOT NULL,
-    status ENUM('waiting', 'active', 'expired', 'completed', 'cancelled') DEFAULT 'waiting',
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    
-    INDEX idx_event_id (event_id),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_queue_token (queue_token),
-    INDEX idx_status (status),
-    INDEX idx_position (position),
-    INDEX idx_joined_at (joined_at),
-    INDEX idx_expires_at (expires_at),
-    
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE tickets (
+  ticket_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  order_id BIGINT UNSIGNED NOT NULL,
+  order_item_id BIGINT UNSIGNED NOT NULL,
+  event_id BIGINT UNSIGNED NOT NULL,
+  customer_sub VARCHAR(36) NOT NULL,
+  customer_email VARCHAR(255) NOT NULL,
+  seat_id BIGINT UNSIGNED NULL,
+  qr_token VARCHAR(255) NOT NULL,
+  status ENUM('ISSUED', 'CHECKED_IN', 'VOID') NOT NULL DEFAULT 'ISSUED',
+  issued_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  checked_in_at DATETIME NULL,
+  checked_in_by_sub VARCHAR(36) NULL,
+  UNIQUE KEY uq_ticket_qr_token (qr_token),
+  INDEX idx_tickets_customer (customer_sub, issued_at),
+  INDEX idx_tickets_event (event_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Historical record of queue movements
-CREATE TABLE queue_history (
-    history_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    queue_id BIGINT UNSIGNED NOT NULL,
-    event_id BIGINT UNSIGNED NOT NULL,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    action_type ENUM('joined', 'position_changed', 'activated', 'expired', 'cancelled', 'completed') NOT NULL,
-    old_position INT UNSIGNED,
-    new_position INT UNSIGNED,
-    action_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    notes TEXT,
-    
-    INDEX idx_queue_id (queue_id),
-    INDEX idx_event_id (event_id),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_action_time (action_time),
-    INDEX idx_action_type (action_type),
-    
-    FOREIGN KEY (queue_id) REFERENCES waiting_queues(queue_id) ON DELETE CASCADE,
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- =============================================================================
--- 6. NOTIFICATIONS
--- =============================================================================
-
--- System notifications to users
-CREATE TABLE notifications (
-    notification_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    notification_type ENUM('order', 'event', 'queue', 'payment', 'reminder', 'system', 'marketing') NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    message TEXT NOT NULL,
-    related_entity_type VARCHAR(50),
-    related_entity_id BIGINT UNSIGNED,
-    priority ENUM('low', 'medium', 'high', 'urgent') DEFAULT 'medium',
-    status ENUM('pending', 'sent', 'delivered', 'read', 'failed') DEFAULT 'pending',
-    channel ENUM('email', 'sms', 'push', 'in_app') NOT NULL,
-    sent_at TIMESTAMP NULL,
-    read_at TIMESTAMP NULL,
-    retry_count INT DEFAULT 0,
-    error_message TEXT,
-    metadata JSON,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_notification_type (notification_type),
-    INDEX idx_status (status),
-    INDEX idx_channel (channel),
-    INDEX idx_created_at (created_at),
-    INDEX idx_related_entity (related_entity_type, related_entity_id),
-    
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- =============================================================================
--- 7. REVIEWS & RATINGS
--- =============================================================================
-
--- Customer reviews and ratings for events
-CREATE TABLE event_reviews (
-    review_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    event_id BIGINT UNSIGNED NOT NULL,
-    customer_id BIGINT UNSIGNED NOT NULL,
-    order_id BIGINT UNSIGNED,
-    rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
-    review_title VARCHAR(255),
-    review_text TEXT,
-    verified_purchase BOOLEAN DEFAULT FALSE,
-    status ENUM('pending', 'approved', 'rejected', 'flagged') DEFAULT 'pending',
-    helpful_count INT UNSIGNED DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_event_id (event_id),
-    INDEX idx_customer_id (customer_id),
-    INDEX idx_rating (rating),
-    INDEX idx_status (status),
-    INDEX idx_created_at (created_at),
-    
-    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
-    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE,
-    FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- =============================================================================
--- 8. AUDIT
--- =============================================================================
-
--- Comprehensive audit trail for compliance
-CREATE TABLE audit_trail (
-    audit_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    table_name VARCHAR(100) NOT NULL,
-    record_id BIGINT UNSIGNED NOT NULL,
-    action_type ENUM('INSERT', 'UPDATE', 'DELETE') NOT NULL,
-    old_values JSON,
-    new_values JSON,
-    changed_by_customer_id BIGINT UNSIGNED,
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    
-    INDEX idx_table_record (table_name, record_id),
-    INDEX idx_action_type (action_type),
-    INDEX idx_changed_by (changed_by_customer_id),
-    INDEX idx_changed_at (changed_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- =============================================================================
--- COMPLETED
--- =============================================================================
-
-SELECT 'All 19 tables created successfully!' AS Status;
-SELECT COUNT(*) AS 'Total Tables' FROM information_schema.tables WHERE table_schema = 'myonestagedb';
+CREATE TABLE check_in_logs (
+  log_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ticket_id BIGINT UNSIGNED NOT NULL,
+  scanned_by_sub VARCHAR(36) NOT NULL,
+  result ENUM('SUCCESS', 'DUPLICATE', 'INVALID', 'WRONG_EVENT') NOT NULL,
+  scanned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_check_in_ticket FOREIGN KEY (ticket_id) REFERENCES tickets (ticket_id),
+  INDEX idx_check_in_ticket (ticket_id, scanned_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
