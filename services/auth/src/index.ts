@@ -1,6 +1,5 @@
 import {
   AdminAddUserToGroupCommand,
-  AdminGetUserCommand,
   CognitoIdentityProviderClient,
 } from '@aws-sdk/client-cognito-identity-provider';
 import express from 'express';
@@ -9,13 +8,9 @@ import { CognitoJwtVerifier } from 'aws-jwt-verify';
 /**
  * Auth service.
  *
- * Grants the Cognito group matching the role a user chose at sign-up. This is
- * the server side of that flow because only an admin caller may change group
- * membership: the browser holds no AWS credentials and must never hold any.
- *
- * The client's only input is its access token. Everything else — which user,
- * which role they asked for — is read back from Cognito, so a caller cannot
- * grant a role by editing a request body.
+ * Verifies Cognito access tokens and ensures every self-registered user belongs
+ * to the customer group. Privileged groups are assigned only by an approved
+ * administrative process; the browser cannot request or grant them.
  */
 
 const SERVICE = 'auth';
@@ -25,8 +20,6 @@ const PORT = Number(process.env.PORT ?? 3007);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 
-/** Roles a user is allowed to grant themselves at sign-up. */
-const SELF_SERVICE_ROLES = new Set(['customer', 'organiser', 'event-helper']);
 const DEFAULT_ROLE = 'customer';
 
 const app = express();
@@ -56,6 +49,22 @@ interface Caller {
   readonly groups: readonly string[];
 }
 
+/** Non-mutating endpoint for verifying the complete browser-to-service flow. */
+app.get('/me', async (req, res) => {
+  if (!configured) {
+    res.status(503).json({ error: 'cognito_not_configured' });
+    return;
+  }
+
+  const caller = await authenticate(req);
+  if (!caller) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+
+  res.json(caller);
+});
+
 /**
  * Verifies the bearer token and puts the caller on the request.
  *
@@ -83,8 +92,7 @@ async function authenticate(req: express.Request): Promise<Caller | null> {
 }
 
 /**
- * Grants the group for the role recorded on the user, and reports the role the
- * caller now holds.
+ * Ensures a newly registered user belongs to the customer group.
  *
  * Idempotent: adding a user to a group they are already in is a no-op, so the
  * SPA can call this on every sign-in without checking first.
@@ -109,22 +117,15 @@ app.post('/roles/sync', async (req, res) => {
   }
 
   try {
-    const user = await cognito.send(
-      new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: caller.username }),
-    );
-
-    const requested = user.UserAttributes?.find((attr) => attr.Name === 'custom:role')?.Value;
-    const role = requested && SELF_SERVICE_ROLES.has(requested) ? requested : DEFAULT_ROLE;
-
     await cognito.send(
       new AdminAddUserToGroupCommand({
         UserPoolId: USER_POOL_ID,
         Username: caller.username,
-        GroupName: role,
+        GroupName: DEFAULT_ROLE,
       }),
     );
 
-    res.json({ role, groups: [role], changed: true });
+    res.json({ role: DEFAULT_ROLE, groups: [DEFAULT_ROLE], changed: true });
   } catch (error) {
     console.error('role sync failed for %s', caller.sub, error);
     res.status(502).json({ error: 'role_sync_failed' });
@@ -134,6 +135,8 @@ app.post('/roles/sync', async (req, res) => {
 app.listen(PORT, HOST, () => {
   console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
   if (!configured) {
-    console.warn('COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are unset: /roles/sync returns 503');
+    console.warn(
+      'COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are unset: /roles/sync returns 503',
+    );
   }
 });
