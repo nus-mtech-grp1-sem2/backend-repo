@@ -76,7 +76,7 @@ locals {
             COGNITO_CLIENT_ID    = "gh94lqsterju3qoffje1grep8"
           } : {},
           contains(keys(local.service_db_name), name) ? {
-            DB_HOST = "mysql.onestage.internal"
+            DB_HOST = "mysql.onestage.local"
             DB_NAME = local.service_db_name[name]
             DB_PORT = "3306"
             DB_SSL  = "false"
