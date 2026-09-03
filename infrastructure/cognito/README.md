@@ -1,63 +1,80 @@
-# Cognito role assignment
+# Cognito Managed Login and customer assignment
 
-The SPA lets a visitor choose Customer, Organiser or Event helper when they
-register. That choice is stored on the user as the `custom:role` attribute.
+The Angular SPA authenticates through Cognito Managed Login using OAuth 2.0
+Authorization Code with PKCE. Cognito owns registration, email confirmation,
+password recovery, and credential handling. The SPA app client must not have a
+client secret.
 
-**The attribute alone grants nothing.** Roles are Cognito *groups*, and only an
-admin caller can grant group membership, so the attribute has to be converted
-into a group by something holding AWS credentials. That is what
+## App client configuration
+
+Configure the existing app client with the authorization code grant and the
+`openid`, `email`, and `phone` scopes.
+
+Allowed callback URLs:
+
+```text
+http://localhost:4200/
+https://d84l1y8p4kdic.cloudfront.net
+```
+
+Allowed sign-out URLs:
+
+```text
+http://localhost:4200/
+https://d84l1y8p4kdic.cloudfront.net
+```
+
+The configured Cognito domain is:
+
+```text
+ap-southeast-1cgmx4fpo2.auth.ap-southeast-1.amazoncognito.com
+```
+
+These identifiers and URLs are public application configuration, not secrets.
+
+## Role model
+
+Every self-registered user receives the `customer` Cognito group. The browser
+cannot request `organiser` or `event-helper`; those privileged groups require a
+separate approved administrative process. Frontend route guards are a usability
+control only—protected backend operations must validate the access token and
+authorize its `cognito:groups` claim.
+
+## Primary assignment: PostConfirmation trigger
+
 [`post-confirmation-add-to-group.mjs`](./post-confirmation-add-to-group.mjs)
-does, running as a PostConfirmation trigger on the user pool.
+assigns `customer` after sign-up confirmation. Deploy it as a Node.js 20+ Lambda
+and attach it to `PostConfirmation_ConfirmSignUp`.
 
-Nothing here is deployed. The steps below are for a human to review and apply.
+Its execution role needs only:
 
-## Prerequisites in the user pool
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cognito-idp:AdminAddUserToGroup",
+      "Resource": "arn:aws:cognito-idp:ap-southeast-1:<account-id>:userpool/ap-southeast-1_cgmx4fpO2"
+    }
+  ]
+}
+```
 
-1. **Custom attribute** — Sign-up experience → Custom attributes → add `role`,
-   type String, **mutable**. Cognito exposes it as `custom:role`.
-   Custom attributes cannot be renamed or deleted afterwards.
-2. **App client write permission** — the app client must be allowed to *write*
-   `custom:role`, or `SignUp` fails with an attribute error. Read permission is
-   also needed for the value to appear in the id token.
-3. **Groups** — create `customer`, `organiser` and `event-helper`, spelled
-   exactly like that.
+Nothing in this directory deploys the Lambda or changes the live user pool.
 
-## Deploying the trigger
+## Recovery assignment: Auth service
 
-1. Create a Lambda (Node.js 20+) from the handler file.
-2. Give its execution role permission to add users to groups in this pool only:
+`POST /api/auth/roles/sync` is an idempotent recovery path. If a valid caller
+has no group, it adds only `customer`; it never grants a privileged group. The
+ECS task role is restricted to `AdminAddUserToGroup` on this user pool.
 
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Action": "cognito-idp:AdminAddUserToGroup",
-         "Resource": "arn:aws:cognito-idp:ap-southeast-1:<account-id>:userpool/<pool-id>"
-       }
-     ]
-   }
-   ```
+Use the non-mutating endpoint to test authentication:
 
-   Scope `Resource` to the one pool — a wildcard would let this function grant
-   membership in any pool in the account.
-3. User pool → Extensions → Add Lambda trigger → **Post confirmation** → select
-   the function. Cognito adds the `lambda:InvokeFunction` permission for you.
+```http
+GET /api/auth/me
+Authorization: Bearer <Cognito access token>
+```
 
-## After it is live
-
-Set `trustSelfDeclaredRole: false` in the frontend's `app.config.ts`. Until then
-the SPA falls back to the self-asserted `custom:role` attribute so the three
-roles can be demonstrated, which is a development convenience and not a
-security boundary. With the flag off, the frontend trusts only real group
-membership — matching what the backend services must enforce.
-
-## A note on self-service roles
-
-Anyone who can reach the register form can request Organiser and receive it.
-That is acceptable for a demo and not for production, where organiser status
-would normally require approval. The shape of that change: keep writing
-`custom:role` as a *request*, have this trigger grant only `customer`, and add
-an admin action that promotes a user after review. The frontend needs no
-changes for that, because it already derives everything from group membership.
+It returns the verified `username`, `sub`, and `groups`. Missing, expired, ID,
+wrong-client, or wrong-pool tokens return `401`.
