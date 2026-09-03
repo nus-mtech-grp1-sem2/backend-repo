@@ -128,11 +128,26 @@ interface CheckInRow extends RowDataPacket {
   customer_id: number | null;
 }
 
+interface TicketSearchRow extends RowDataPacket {
+  ticket_id: number;
+  ticket_code: string;
+  customer_name: string;
+  customer_email: string;
+  order_number: string;
+  status: string;
+}
+
+interface CheckInStatsRow extends RowDataPacket {
+  sold: number;
+  checked_in: number;
+}
+
 /** Validate and persist a manual door scan. */
-app.post('/check-ins', async (req, res) => {
+app.post('/events/:eventId/check-ins', async (req, res) => {
+  const eventId = Number(req.params.eventId);
   const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
   const helperEmail = typeof req.body?.helperEmail === 'string' ? req.body.helperEmail.trim() : '';
-  if (!code || !helperEmail) {
+  if (!Number.isInteger(eventId) || !code || !helperEmail) {
     res.status(400).json({ error: 'code_and_helper_required' });
     return;
   }
@@ -149,10 +164,16 @@ app.post('/check-ins', async (req, res) => {
       res.status(404).json({ code, outcome: 'unknown', at: new Date().toISOString() });
       return;
     }
+    if (ticket.event_id !== eventId) {
+      await connection.rollback();
+      res.status(200).json({ code, outcome: 'wrong_event', at: new Date().toISOString() });
+      return;
+    }
     const [helpers] = await connection.query<RowDataPacket[]>(
       `SELECT c.customer_id FROM customers c
        JOIN customer_event_roles cer ON cer.customer_id = c.customer_id
-       WHERE c.email = ? AND cer.event_id = ? AND cer.role_id IN (1, 3)`,
+       WHERE c.email = ? AND cer.event_id = ? AND cer.role_id IN (1, 3)
+         AND cer.status = 'ACTIVE'`,
       [helperEmail, ticket.event_id],
     );
     if (!helpers[0]) {
@@ -184,6 +205,63 @@ app.post('/check-ins', async (req, res) => {
     res.status(500).json({ error: 'check_in_failed' });
   } finally {
     connection.release();
+  }
+});
+
+app.get('/events/:eventId/tickets/search', async (req, res) => {
+  const eventId = Number(req.params.eventId);
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (!Number.isInteger(eventId) || query.length < 2) {
+    res.status(400).json({ error: 'event_and_query_required' });
+    return;
+  }
+
+  try {
+    const like = `%${query}%`;
+    const [rows] = await pool.query<TicketSearchRow[]>(
+      `SELECT t.ticket_id, t.ticket_code, c.customer_name, c.email AS customer_email,
+              o.order_number, t.status
+       FROM tickets t
+       LEFT JOIN customers c ON c.customer_id = t.customer_id
+       LEFT JOIN orders o ON o.order_id = t.order_id
+       WHERE t.event_id = ?
+         AND (t.ticket_code LIKE ? OR c.customer_name LIKE ? OR c.email LIKE ? OR o.order_number LIKE ?)
+       ORDER BY t.ticket_id
+       LIMIT 20`,
+      [eventId, like, like, like, like],
+    );
+    res.json(rows.map((row) => ({
+      ticketId: row.ticket_id,
+      code: row.ticket_code,
+      name: row.customer_name,
+      email: row.customer_email,
+      orderNumber: row.order_number,
+      status: row.status,
+    })));
+  } catch (error) {
+    console.error('GET /events/:eventId/tickets/search failed', error);
+    res.status(500).json({ error: 'ticket_search_failed' });
+  }
+});
+
+app.get('/events/:eventId/check-in-stats', async (req, res) => {
+  const eventId = Number(req.params.eventId);
+  if (!Number.isInteger(eventId)) {
+    res.status(400).json({ error: 'invalid_event_id' });
+    return;
+  }
+  try {
+    const [rows] = await pool.query<CheckInStatsRow[]>(
+      `SELECT
+         COALESCE(SUM(status IN ('sold', 'used')), 0) AS sold,
+         COALESCE(SUM(status = 'used'), 0) AS checked_in
+       FROM tickets WHERE event_id = ?`,
+      [eventId],
+    );
+    res.json({ sold: Number(rows[0]?.sold ?? 0), checkedIn: Number(rows[0]?.checked_in ?? 0) });
+  } catch (error) {
+    console.error('GET /events/:eventId/check-in-stats failed', error);
+    res.status(500).json({ error: 'check_in_stats_failed' });
   }
 });
 

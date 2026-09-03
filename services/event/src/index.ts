@@ -628,6 +628,7 @@ interface StaffRow extends RowDataPacket {
   last_name: string;
   email: string;
   role_id: number;
+  status: 'ACTIVE' | 'REVOKED';
   added_at: Date;
 }
 
@@ -640,10 +641,10 @@ app.get('/events/:id/staff', async (req, res) => {
 
   try {
     const [rows] = await pool.query<StaffRow[]>(
-      `SELECT c.customer_id, c.first_name, c.last_name, c.email, cer.role_id, cer.added_at
+      `SELECT c.customer_id, c.first_name, c.last_name, c.email, cer.role_id, cer.status, cer.added_at
        FROM customer_event_roles cer
        JOIN customers c ON c.customer_id = cer.customer_id
-       WHERE cer.event_id = ? AND cer.role_id IN (1, 3)
+       WHERE cer.event_id = ? AND cer.role_id IN (1, 3) AND cer.status = 'ACTIVE'
        ORDER BY cer.added_at`,
       [eventId],
     );
@@ -688,7 +689,8 @@ app.get('/helper/shifts', async (req, res) => {
        JOIN customers c ON c.customer_id = cer.customer_id
        JOIN events e ON e.event_id = cer.event_id
        JOIN venues v ON v.venue_id = e.venue_id
-       WHERE c.email = ? AND cer.role_id = 3 AND e.status IN ('published', 'postponed')
+       WHERE c.email = ? AND cer.role_id = 3 AND cer.status = 'ACTIVE'
+         AND e.status IN ('published', 'postponed')
        ORDER BY e.event_start_datetime`,
       [email],
     );
@@ -753,9 +755,9 @@ app.post('/events/:id/staff', async (req, res) => {
     const roleId = STAFF_ROLES[role];
 
     await pool.query(
-      `INSERT INTO customer_event_roles (customer_id, event_id, role_id)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE role_id = VALUES(role_id), added_at = CURRENT_TIMESTAMP`,
+      `INSERT INTO customer_event_roles (customer_id, event_id, role_id, status)
+       VALUES (?, ?, ?, 'ACTIVE')
+       ON DUPLICATE KEY UPDATE role_id = VALUES(role_id), status = 'ACTIVE', added_at = CURRENT_TIMESTAMP`,
       [customerId, eventId, roleId],
     );
 
@@ -776,7 +778,9 @@ app.delete('/events/:id/staff/:customerId', async (req, res) => {
 
   try {
     await pool.query(
-      'DELETE FROM customer_event_roles WHERE event_id = ? AND customer_id = ? AND role_id IN (1, 3)',
+      `UPDATE customer_event_roles
+       SET status = 'REVOKED'
+       WHERE event_id = ? AND customer_id = ? AND role_id IN (1, 3) AND status = 'ACTIVE'`,
       [eventId, customerId],
     );
     res.status(204).send();

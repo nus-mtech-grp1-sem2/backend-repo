@@ -164,7 +164,8 @@ app.delete('/orders/:reference', async (req, res) => {
     );
     if (!remaining[0]) {
       await connection.query(
-        `DELETE FROM customer_event_roles WHERE customer_id = ? AND event_id = ? AND role_id = 2`,
+        `UPDATE customer_event_roles SET status = 'REVOKED'
+         WHERE customer_id = ? AND event_id = ? AND role_id = 2 AND status = 'ACTIVE'`,
         [order.customer_id, order.event_id],
       );
     }

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS customer_event_roles (
     event_id BIGINT UNSIGNED NOT NULL,
     role_id TINYINT UNSIGNED NOT NULL,
     added_by_customer_id BIGINT UNSIGNED,
+    status ENUM('ACTIVE', 'REVOKED') NOT NULL DEFAULT 'ACTIVE',
     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (customer_id, event_id),
