@@ -1,0 +1,24 @@
+{
+  "name": "onestage-sql-utilities",
+  "version": "1.0.0",
+  "description": "Database initialization utilities for OneStage",
+  "main": "generate-admin-password.js",
+  "scripts": {
+    "generate-password": "node generate-admin-password.js",
+    "test-password": "node test-password-verification.js"
+  },
+  "keywords": [
+    "database",
+    "initialization",
+    "bcrypt",
+    "password"
+  ],
+  "author": "OneStage Team",
+  "license": "MIT",
+  "dependencies": {
+    "bcrypt": "^5.1.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

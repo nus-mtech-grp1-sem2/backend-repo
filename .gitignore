@@ -11,6 +11,13 @@ build/
 .env.*
 !.env.example
 
+# SQL initialization files with real credentials
+infrastructure/sql/*-init-*.sql
+!infrastructure/sql/*-init-*.sql.example
+
+infrastructure/sql/generate-admin-password.js
+infrastructure/sql/test-password-verification.js
+
 # Terraform artifacts must never be committed
 *.tfstate
 *.tfstate.*

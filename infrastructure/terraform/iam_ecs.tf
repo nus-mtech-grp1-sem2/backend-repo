@@ -49,12 +49,18 @@ resource "aws_iam_role" "ecs_task" {
 }
 
 data "aws_iam_policy_document" "ecs_task_permissions" {
-  # The auth service may only bootstrap a user into the customer group. Token
-  # verification uses public Cognito signing keys and needs no AWS permission.
+  # Scoped to the specific user pool already hardcoded in core-frontend's
+  # app.config.ts. Covers the common admin/lookup operations an auth service
+  # typically needs; tighten to the exact set once services/auth/src is
+  # reviewed against this list.
   statement {
-    sid       = "AddCognitoUserToCustomerGroup"
-    effect    = "Allow"
-    actions   = ["cognito-idp:AdminAddUserToGroup"]
+    sid    = "CognitoAuthOperations"
+    effect = "Allow"
+    actions = [
+      "cognito-idp:AdminGetUser",
+      "cognito-idp:AdminCreateUser",
+      "cognito-idp:ListUsers",
+    ]
     resources = ["arn:aws:cognito-idp:${var.region}:${var.account_id}:userpool/ap-southeast-1_cgmx4fpO2"]
   }
 }

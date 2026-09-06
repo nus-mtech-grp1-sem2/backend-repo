@@ -14,6 +14,7 @@
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.700.0",
     "aws-jwt-verify": "^5.1.0",
+    "bcryptjs": "^3.0.3",
     "express": "^5.2.1"
   }
 }

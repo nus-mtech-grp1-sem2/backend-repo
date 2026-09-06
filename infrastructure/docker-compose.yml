@@ -42,6 +42,19 @@ services:
     environment:
       SERVICE: event
       PORT: 3001
+      # The event service owns the event_inventory schema.
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_EVENT_INVENTORY:-event_inventory}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
 
   inventory:
     <<: *service
@@ -49,6 +62,12 @@ services:
     environment:
       SERVICE: inventory
       PORT: 3002
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_EVENT_INVENTORY:-event_inventory}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   queue:
     <<: *service
@@ -56,6 +75,12 @@ services:
     environment:
       SERVICE: queue
       PORT: 3003
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_QUEUE:-queue}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   order:
     <<: *service
@@ -63,6 +88,12 @@ services:
     environment:
       SERVICE: order
       PORT: 3004
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_CHECKOUT:-checkout}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   ticket:
     <<: *service
@@ -70,6 +101,12 @@ services:
     environment:
       SERVICE: ticket
       PORT: 3005
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_TICKETING:-ticketing}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
 
   notification:
     <<: *service
@@ -93,32 +130,6 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
-
-  mysql:
-    image: mysql:8.0
-    container_name: mysql-db
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: myonestagedb
-      MYSQL_USER: onestage
-      MYSQL_PASSWORD: onestage123
-    ports:
-      # Host 3307 because a locally installed MySQL usually owns 3306 and the
-      # bind would fail. Inside the compose network the port is still 3306, so
-      # only host tools (Workbench, migrate-database.ps1) use 3307.
-      - "3307:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ./sql:/docker-entrypoint-initdb.d
-    networks:
-      - backend
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
 
   kong:
     image: kong:3.9
@@ -157,7 +168,3 @@ services:
 networks:
   backend:
     driver: bridge
-
-volumes:
-  mysql-data:
-    driver: local

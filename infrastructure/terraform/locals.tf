@@ -1,6 +1,21 @@
 locals {
   name_prefix = "onestage"
 
+  # Schema each service owns in the shared MySQL instance — mirrors
+  # docker-compose.yml's per-service DB_NAME and the one-instance/four-schemas
+  # split documented in database/onestage-system-design.md. `inventory`
+  # shares `event_inventory` with `event` because both read/write the same
+  # tables (events, inventory_items, seats, holds). Services left out of this
+  # map (`notification`, `auth`) don't talk to MySQL: auth is Cognito-only,
+  # notification has no persistent state of its own yet.
+  service_db_name = {
+    event     = "event_inventory"
+    inventory = "event_inventory"
+    queue     = "queue"
+    order     = "checkout"
+    ticket    = "ticketing"
+  }
+
   # Every service the module.ecs_service for_each drives: Kong (the only
   # ALB-attached, internet-facing one) plus the 7 Node services. CPU/memory
   # are deliberately minimal Fargate-valid sizes (256 CPU/512MiB is the
@@ -32,6 +47,7 @@ locals {
         # tune after a real k6 run.
         scaling_metric = "alb_request_count"
         scaling_target = 75
+        secret_env     = {}
       }
     },
     {
@@ -58,8 +74,18 @@ locals {
           name == "auth" ? {
             COGNITO_USER_POOL_ID = "ap-southeast-1_cgmx4fpO2"
             COGNITO_CLIENT_ID    = "gh94lqsterju3qoffje1grep8"
+          } : {},
+          contains(keys(local.service_db_name), name) ? {
+            DB_HOST = "mysql.onestage.local"
+            DB_NAME = local.service_db_name[name]
+            DB_PORT = "3306"
+            DB_SSL  = "false"
           } : {}
         )
+        secret_env = contains(keys(local.service_db_name), name) ? {
+          DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
+          DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
+        } : {}
       }
     }
   )
