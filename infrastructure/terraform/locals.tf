@@ -70,11 +70,14 @@ locals {
           { SERVICE = name },
           # Non-secret identifiers (already hardcoded in core-frontend's
           # app.config.ts and shipped in the public JS bundle) — not
-          # Secrets Manager material.
-          name == "auth" ? {
+          # Secrets Manager material. Every service gets these, not just
+          # `auth`: `event` independently verifies bearer tokens for its
+          # own protected routes (see services/event/src/index.ts) and
+          # needs them to build its CognitoJwtVerifier.
+          {
             COGNITO_USER_POOL_ID = "ap-southeast-1_cgmx4fpO2"
             COGNITO_CLIENT_ID    = "gh94lqsterju3qoffje1grep8"
-          } : {},
+          },
           contains(keys(local.service_db_name), name) ? {
             DB_HOST = "mysql"
             DB_NAME = local.service_db_name[name]
