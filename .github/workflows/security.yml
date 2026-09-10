@@ -56,13 +56,13 @@ jobs:
 
       # 1. Dependency / SCA scan ------------------------------------------------
       # npm audit resolves package-lock.json directly; no install needed.
-      # The full report is always archived; the build only fails on CRITICAL.
-      # Tighten the gate to --audit-level=high once known advisories are triaged.
+      # The full report is always archived; the build fails on HIGH or above.
+      # --audit-level accepts: info | low | moderate | high | critical.
       - name: Node dependency audit (full report)
         run: npm audit --audit-level=low --json > npm-audit.json || true
 
-      - name: Node dependency audit (fail on critical)
-        run: npm audit --audit-level=critical
+      - name: Node dependency audit (fail on high or above)
+        run: npm audit --audit-level=high
 
       - name: Upload dependency audit report
         if: always()
