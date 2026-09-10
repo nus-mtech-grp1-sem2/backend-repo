@@ -144,13 +144,7 @@ function attribute(attributes: readonly AttributeType[] | undefined, name: strin
   return attributes?.find((item) => item.Name === name)?.Value ?? '';
 }
 
-/**
- * Published events list, newest start date first.
- *
- * Also mounted at /helper/shifts: Event Helper accounts get the same
- * read-only events view as Admin for now (their "New Event" action is
- * disabled client-side) — a dedicated shifts model doesn't exist yet.
- */
+/** Published events list, newest start date first. */
 async function listEvents(_req: express.Request, res: express.Response) {
   if (!databaseConfigured) {
     res.status(503).json({ error: 'database_not_configured' });
@@ -170,7 +164,22 @@ async function listEvents(_req: express.Request, res: express.Response) {
 }
 
 app.get('/events', listEvents);
-app.get('/helper/shifts', listEvents);
+
+app.get('/helper/shifts', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const caller = await requireAuthenticated(req, res);
+  if (!caller) return;
+  try {
+    const [events] = await database.query(
+      "SELECT events.event_id, events.title, events.venue, events.starts_at, events.total_seats FROM events INNER JOIN event_team_memberships ON event_team_memberships.event_id = events.event_id WHERE event_team_memberships.user_sub = ? AND event_team_memberships.role IN ('HELPER', 'ORGANISER') AND event_team_memberships.invite_status = 'ACCEPTED' AND events.status = 'PUBLISHED' ORDER BY events.starts_at ASC",
+      [caller.sub],
+    );
+    res.json({ events });
+  } catch (error) {
+    console.error('failed to list helper shifts', error);
+    res.status(502).json({ error: 'helper_shifts_failed' });
+  }
+});
 
 app.get('/events/manage', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
