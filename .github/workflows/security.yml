@@ -3,7 +3,8 @@ name: OneStage SAST/DAST Pipeline
 # SAST (Semgrep) and dependency / SCA (npm audit) scanning run on every push
 # and pull request to main. DAST (OWASP ZAP baseline) is deliberately separate:
 # it needs a deployed target, so it runs on demand (workflow_dispatch) and on a
-# weekly schedule against a URL supplied out of band.
+# weekly schedule against a URL supplied via the DAST_TARGET_URL repo variable
+# (or a dispatch input).
 #
 # This workflow never deploys and is given no AWS credentials, per the OneStage
 # CI governance in onestage-ai-engineering/rules/secure-coding.md.
@@ -141,15 +142,42 @@ jobs:
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       # OWASP ZAP baseline: passive scan + spider only, no active attacks.
-      # Reports (HTML / JSON / MD) are uploaded as the "zap_scan" artifact.
-      # fail_action: false keeps the pipeline green for the school project while
-      # still producing the report; flip to true to enforce.
+      # Run the ZAP image directly rather than via zaproxy/action-baseline@v0.12.0,
+      # whose bundled artifact upload uses a retired GitHub API and fails the job
+      # even on a clean scan. `.zap/rules.tsv` sets per-alert thresholds.
       - name: OWASP ZAP baseline scan
-        uses: zaproxy/action-baseline@v0.12.0
+        run: |
+          mkdir -p zap-out
+          cp .zap/rules.tsv zap-out/rules.tsv
+          chmod -R 777 zap-out
+          docker run --rm \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "${{ steps.target.outputs.url }}" \
+              -c rules.tsv \
+              -a \
+              -J report_json.json -w report_md.md -r report_html.html \
+            && rc=0 || rc=$?
+          echo "zap-baseline.py exit code: $rc"
+          # 0 = all pass, 1 = FAIL-level alert, 2 = WARN-level alert, 3 = error.
+          # School-project posture: warnings and fails are reported, not gated;
+          # only a scanner/infra error breaks the build. Tighten by treating
+          # rc == 1 as `exit 1` once alerts are triaged in .zap/rules.tsv.
+          case "$rc" in
+            0) echo "ZAP: clean" ;;
+            2) echo "::warning::ZAP baseline raised WARN-level alerts; see the zap-baseline-report artifact" ;;
+            1) echo "::warning::ZAP baseline raised FAIL-level alerts; see the zap-baseline-report artifact" ;;
+            *) echo "::error::ZAP baseline scan errored (exit $rc)"; exit 1 ;;
+          esac
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          target: ${{ steps.target.outputs.url }}
-          rules_file_name: ".zap/rules.tsv"
-          cmd_options: "-a"
-          allow_issue_writing: false
-          fail_action: false
+          name: zap-baseline-report
+          path: |
+            zap-out/report_json.json
+            zap-out/report_md.md
+            zap-out/report_html.html
+          if-no-files-found: warn
