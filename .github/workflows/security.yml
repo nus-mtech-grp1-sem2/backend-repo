@@ -1,0 +1,150 @@
+name: OneStage SAST/DAST Pipeline
+
+# SAST (Semgrep) and dependency / SCA (npm audit) scanning run on every push
+# and pull request to main. DAST (OWASP ZAP baseline) is deliberately separate:
+# it needs a deployed target, so it runs on demand (workflow_dispatch) and on a
+# weekly schedule against a URL supplied out of band.
+#
+# This workflow never deploys and is given no AWS credentials, per the OneStage
+# CI governance in onestage-ai-engineering/rules/secure-coding.md.
+#
+# NOTE: third-party actions are referenced by version tag here to match the
+# other workflows in this repo. The OneStage standard is to pin them to a full
+# commit SHA (see onestage-ai-engineering/.github/workflows/*). Do that before
+# treating this pipeline as production-grade.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "services/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/security.yml"
+      - ".zap/**"
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      dast_target_url:
+        description: "Base URL for the OWASP ZAP baseline scan (overrides the DAST_TARGET_URL repo variable)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sast-and-sca:
+    name: SAST + dependency scan
+    # Code scans only make sense on a code change, not on the scheduled/manual DAST runs.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 1. Dependency / SCA scan ------------------------------------------------
+      # npm audit resolves package-lock.json directly; no install needed.
+      # The full report is always archived; the build only fails on CRITICAL.
+      # Tighten the gate to --audit-level=high once known advisories are triaged.
+      - name: Node dependency audit (full report)
+        run: npm audit --audit-level=low --json > npm-audit.json || true
+
+      - name: Node dependency audit (fail on critical)
+        run: npm audit --audit-level=critical
+
+      - name: Upload dependency audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: npm-audit.json
+          if-no-files-found: warn
+
+      # 2. SAST scan (Semgrep) -----------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install "semgrep==1.99.0"
+
+      - name: Run Semgrep (full SARIF report)
+        run: |
+          semgrep scan \
+            --config p/ci \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejs \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --metrics off \
+            --sarif --output semgrep.sarif
+
+      - name: Upload Semgrep SARIF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+      - name: Fail on Semgrep error-level findings
+        run: |
+          count=$(jq '[.runs[].results[]? | select(.level == "error")] | length' semgrep.sarif)
+          echo "Semgrep error-level findings: $count"
+          if [ "$count" -ne 0 ]; then
+            jq -r '.runs[].results[]? | select(.level == "error")
+              | "  - \(.ruleId): \(.message.text) (\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine))"' semgrep.sarif
+            exit 1
+          fi
+
+  dast:
+    name: DAST (OWASP ZAP baseline)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve DAST target URL
+        id: target
+        env:
+          INPUT_URL: ${{ inputs.dast_target_url }}
+          VAR_URL: ${{ vars.DAST_TARGET_URL }}
+        run: |
+          URL="${INPUT_URL:-$VAR_URL}"
+          if [ -z "$URL" ]; then
+            echo "::error::No DAST target. Set the DAST_TARGET_URL repository variable" \
+                 "(Settings > Secrets and variables > Actions > Variables) to the deployed" \
+                 "CloudFront URL, e.g. https://xxxxxxxx.cloudfront.net, or pass dast_target_url" \
+                 "when dispatching this workflow."
+            exit 1
+          fi
+          echo "Target: $URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      # OWASP ZAP baseline: passive scan + spider only, no active attacks.
+      # Reports (HTML / JSON / MD) are uploaded as the "zap_scan" artifact.
+      # fail_action: false keeps the pipeline green for the school project while
+      # still producing the report; flip to true to enforce.
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target: ${{ steps.target.outputs.url }}
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a"
+          allow_issue_writing: false
+          fail_action: false
