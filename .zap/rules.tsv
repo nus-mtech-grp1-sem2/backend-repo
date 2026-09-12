@@ -1,0 +1,10 @@
+# OWASP ZAP baseline scan rule configuration
+#
+# Three tab-separated columns:  ruleId <TAB> WARN|FAIL|IGNORE|OUTOFSCOPE <TAB> optional comment
+# Any rule not listed keeps the ZAP default (WARN in a baseline scan).
+# Alert / rule ID reference: https://www.zaproxy.org/docs/alerts/
+#
+# Uncomment and adjust entries below as findings are triaged and accepted.
+# Each accepted IGNORE needs a reason (per onestage-ai-engineering/rules/secure-coding.md).
+#10015	IGNORE	Re-examine cache-control header - static SPA assets, revisit
+#10096	IGNORE	Timestamp disclosure - false positive on hashed asset filenames
