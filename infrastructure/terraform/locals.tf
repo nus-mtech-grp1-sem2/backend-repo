@@ -83,6 +83,9 @@ locals {
             DB_NAME = local.service_db_name[name]
             DB_PORT = "3306"
             DB_SSL  = "false"
+          } : {},
+          contains(["order", "ticket"], name) ? {
+            ORDER_EVENTS_QUEUE_URL = aws_sqs_queue.order_events.url
           } : {}
         )
         secret_env = contains(keys(local.service_db_name), name) ? {

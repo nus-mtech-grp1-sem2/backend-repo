@@ -1,16 +1,467 @@
 import express from 'express';
+import mysql from 'mysql2/promise';
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 
 const SERVICE = 'order';
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 3004);
+const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
+const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
+const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
+const verifier = USER_POOL_ID && CLIENT_ID
+  ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
+  : null;
+const sqs = new SQSClient({});
+const databaseConfigured = Boolean(
+  process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER && process.env.DB_PASSWORD,
+);
+const database = mysql.createPool({
+  host: process.env.DB_HOST ?? '',
+  port: Number(process.env.DB_PORT ?? 3306),
+  database: process.env.DB_NAME ?? '',
+  user: process.env.DB_USER ?? '',
+  password: process.env.DB_PASSWORD ?? '',
+  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT ?? 8),
+  connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10_000),
+  ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
+});
+
+interface Caller { readonly sub: string; readonly email: string }
+interface CreateOrderInput {
+  readonly holdId?: unknown;
+  readonly eventId?: unknown;
+  readonly inventoryItemId?: unknown;
+  readonly quantity?: unknown;
+  readonly seatIds?: unknown;
+  readonly admissionToken?: unknown;
+  readonly customerEmail?: unknown;
+}
+interface PaymentInput { readonly paymentToken?: unknown }
+interface OrderItem {
+  readonly inventoryItemId: number;
+  readonly seatId: number | null;
+  readonly description: string;
+  readonly quantity: number;
+  readonly unitPriceCents: number;
+}
+interface HoldData {
+  readonly hold_id: number;
+  readonly event_id: number;
+  readonly inventory_item_id: number | null;
+  readonly customer_sub?: string;
+  readonly quantity: number;
+  readonly status?: string;
+  readonly expires_at?: Date;
+  readonly order_id?: number | null;
+}
+interface LoadedOrder {
+  readonly order_id: number;
+  readonly event_id: number;
+  readonly customer_sub: string;
+  readonly customer_email: string;
+  readonly hold_id: number;
+  readonly status: string;
+  readonly total_amount_cents: number;
+  readonly currency: string;
+  readonly created_at: Date;
+  readonly paid_at: Date | null;
+  readonly items: mysql.RowDataPacket[];
+  readonly payments: mysql.RowDataPacket[];
+}
 
 const app = express();
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(express.json({ limit: '64kb' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: SERVICE }));
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: SERVICE });
+function positiveInteger(value: unknown): number | null {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseCreateOrder(input: CreateOrderInput): {
+  holdId: number | null;
+  eventId: number | null;
+  inventoryItemId: number | null;
+  quantity: number | null;
+  seatIds: number[];
+  admissionToken: string | null;
+  customerEmail: string;
+} | null {
+  const holdId = input.holdId === undefined ? null : positiveInteger(input.holdId);
+  const eventId = input.eventId === undefined ? null : positiveInteger(input.eventId);
+  const inventoryItemId = input.inventoryItemId === undefined ? null : positiveInteger(input.inventoryItemId);
+  const quantity = input.quantity === undefined ? null : positiveInteger(input.quantity);
+  const rawSeatIds = input.seatIds === undefined ? [] : input.seatIds;
+  if (!Array.isArray(rawSeatIds)) return null;
+  const seatIds = rawSeatIds.map(positiveInteger);
+  const admissionToken = typeof input.admissionToken === 'string' && input.admissionToken.length <= 255
+    ? input.admissionToken.trim() || null : null;
+  const customerEmail = typeof input.customerEmail === 'string' ? input.customerEmail.trim().toLowerCase() : '';
+  if (seatIds.some((id) => id === null) || new Set(seatIds).size !== seatIds.length || seatIds.length > 50) return null;
+  if (customerEmail && (customerEmail.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) return null;
+  if (holdId && !eventId && !quantity && seatIds.length === 0) {
+    return { holdId, eventId: null, inventoryItemId, quantity: null, seatIds: [], admissionToken, customerEmail };
+  }
+  if (!eventId || !quantity || quantity > 50 || (seatIds.length > 0 && seatIds.length !== quantity)) return null;
+  return { holdId: null, eventId, inventoryItemId, quantity, seatIds: seatIds as number[], admissionToken, customerEmail };
+}
+
+async function authenticate(req: express.Request): Promise<Caller | null> {
+  const header = req.header('authorization') ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token || !verifier) return null;
+  try {
+    const claims = await verifier.verify(token);
+    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email.toLowerCase() : '' };
+  } catch { return null; }
+}
+
+async function requireCaller(req: express.Request, res: express.Response): Promise<Caller | null> {
+  const caller = await authenticate(req);
+  if (!caller) res.status(401).json({ error: 'unauthenticated' });
+  return caller;
+}
+
+function requireDatabase(res: express.Response): boolean {
+  if (!databaseConfigured) res.status(503).json({ error: 'database_not_configured' });
+  return databaseConfigured;
+}
+
+async function hasEventRole(eventId: number, sub: string, roles: readonly string[]): Promise<boolean> {
+  const placeholders = roles.map(() => '?').join(', ');
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT membership_id FROM event_inventory.event_team_memberships
+     WHERE event_id = ? AND user_sub = ? AND role IN (${placeholders}) AND invite_status = 'ACCEPTED' LIMIT 1`,
+    [eventId, sub, ...roles],
+  );
+  return rows.length > 0;
+}
+
+async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
+  const [orders] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT order_id, event_id, customer_sub, customer_email, hold_id, status, total_amount_cents, currency, created_at, paid_at
+     FROM orders WHERE order_id = ? LIMIT 1`, [orderId],
+  );
+  if (!orders[0]) return null;
+  const [items] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT order_item_id, inventory_item_id, seat_id, description, quantity, unit_price_cents
+     FROM order_items WHERE order_id = ? ORDER BY order_item_id`, [orderId],
+  );
+  const [payments] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT payment_id, status, amount_cents, processed_at FROM payments WHERE order_id = ? ORDER BY payment_id', [orderId],
+  );
+  return { ...orders[0], items, payments } as LoadedOrder;
+}
+
+async function itemsForHold(connection: mysql.PoolConnection, hold: HoldData): Promise<OrderItem[]> {
+  if (hold.inventory_item_id) {
+    const [inventory] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT inventory_item_id, name, price_cents FROM event_inventory.inventory_items WHERE inventory_item_id = ? LIMIT 1',
+      [hold.inventory_item_id],
+    );
+    const item = inventory[0];
+    if (!item) throw new Error('hold_inventory_missing');
+    return [{ inventoryItemId: Number(item.inventory_item_id), seatId: null, description: String(item.name), quantity: Number(hold.quantity), unitPriceCents: Number(item.price_cents) }];
+  }
+  const [seats] = await connection.query<mysql.RowDataPacket[]>(
+    `SELECT s.seat_id, s.inventory_item_id, s.seat_label, i.name, i.price_cents
+     FROM event_inventory.seats s INNER JOIN event_inventory.inventory_items i ON i.inventory_item_id = s.inventory_item_id
+     WHERE s.hold_id = ? ORDER BY s.seat_id`, [hold.hold_id],
+  );
+  return seats.map((seat) => ({
+    inventoryItemId: Number(seat.inventory_item_id), seatId: Number(seat.seat_id),
+    description: `${seat.name} - ${seat.seat_label}`, quantity: 1, unitPriceCents: Number(seat.price_cents),
+  }));
+}
+
+app.post('/orders', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const input = parseCreateOrder((req.body ?? {}) as CreateOrderInput);
+  if (!input) return res.status(400).json({ error: 'invalid_order' });
+  const customerEmail = caller.email || input.customerEmail;
+  if (!customerEmail) return res.status(400).json({ error: 'customer_email_required' });
+
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    let holdId = input.holdId;
+    let eventId = input.eventId;
+    let hold: HoldData | undefined;
+    if (holdId) {
+      const [holds] = await connection.query<mysql.RowDataPacket[]>(
+        `SELECT hold_id, event_id, inventory_item_id, customer_sub, quantity, status, expires_at, order_id
+         FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1 FOR UPDATE`, [holdId],
+      );
+      hold = holds[0] as HoldData | undefined;
+      if (!hold) { await connection.rollback(); return res.status(404).json({ error: 'hold_not_found' }); }
+      if (hold.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'hold_owner_required' }); }
+      if (hold.order_id) {
+        await connection.commit();
+        const existing = await loadOrder(Number(hold.order_id));
+        return res.json({ order: existing });
+      }
+      if (hold.status !== 'ACTIVE' || !hold.expires_at || new Date(hold.expires_at).getTime() <= Date.now()) {
+        await connection.rollback(); return res.status(409).json({ error: 'hold_not_active' });
+      }
+      eventId = Number(hold.event_id);
+    }
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT event_id, tier, status FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    );
+    const event = events[0];
+    if (!event) { await connection.rollback(); return res.status(404).json({ error: 'event_not_found' }); }
+    if (event.status !== 'PUBLISHED') { await connection.rollback(); return res.status(409).json({ error: 'event_not_on_sale' }); }
+
+    if (event.tier === 'TIER2_SEATED' && !input.holdId) {
+      if (!input.admissionToken) { await connection.rollback(); return res.status(403).json({ error: 'queue_admission_required' }); }
+      const [entries] = await connection.query<mysql.RowDataPacket[]>(
+        `SELECT e.queue_entry_id FROM \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+         WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'ADMITTED' AND e.admission_token = ?
+           AND e.token_expires_at > CURRENT_TIMESTAMP LIMIT 1 FOR UPDATE`, [eventId, caller.sub, input.admissionToken],
+      );
+      if (!entries[0]) { await connection.rollback(); return res.status(403).json({ error: 'queue_admission_required' }); }
+    }
+
+    if (!hold) {
+      if (event.tier === 'TIER2_SEATED') {
+        if (input.seatIds.length !== input.quantity) { await connection.rollback(); return res.status(400).json({ error: 'seat_selection_required' }); }
+        const placeholders = input.seatIds.map(() => '?').join(', ');
+        const [seats] = await connection.query<mysql.RowDataPacket[]>(
+          `SELECT s.seat_id, s.inventory_item_id, s.seat_label, s.status, i.name, i.price_cents
+           FROM event_inventory.seats s INNER JOIN event_inventory.inventory_items i ON i.inventory_item_id = s.inventory_item_id
+           WHERE s.event_id = ? AND s.seat_id IN (${placeholders}) ORDER BY s.seat_id FOR UPDATE`, [eventId, ...input.seatIds],
+        );
+        if (seats.length !== input.quantity || seats.some((seat) => seat.status !== 'AVAILABLE')) {
+          await connection.rollback(); return res.status(409).json({ error: 'inventory_unavailable' });
+        }
+        const [insert] = await connection.execute<mysql.ResultSetHeader>(
+          `INSERT INTO event_inventory.inventory_holds (event_id, customer_sub, quantity, expires_at)
+           VALUES (?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))`, [eventId, caller.sub, input.quantity],
+        );
+        holdId = insert.insertId;
+        await connection.execute(
+          `UPDATE event_inventory.seats SET status = 'HELD', hold_id = ? WHERE seat_id IN (${placeholders})`, [holdId, ...input.seatIds],
+        );
+        hold = { hold_id: insert.insertId, event_id: eventId!, inventory_item_id: null, quantity: input.quantity! };
+      } else {
+        const itemSelector = input.inventoryItemId ? 'inventory_item_id = ? AND event_id = ?' : 'event_id = ?';
+        const params = input.inventoryItemId ? [input.inventoryItemId, eventId] : [eventId];
+        const [inventory] = await connection.query<mysql.RowDataPacket[]>(
+          `SELECT inventory_item_id, total_qty, reserved_qty, sold_qty FROM event_inventory.inventory_items
+           WHERE ${itemSelector} ORDER BY inventory_item_id LIMIT 1 FOR UPDATE`, params,
+        );
+        const item = inventory[0];
+        if (!item || Number(item.total_qty) - Number(item.reserved_qty) - Number(item.sold_qty) < input.quantity!) {
+          await connection.rollback(); return res.status(409).json({ error: 'inventory_unavailable' });
+        }
+        await connection.execute(
+          'UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty + ?, version = version + 1 WHERE inventory_item_id = ?',
+          [input.quantity, item.inventory_item_id],
+        );
+        const [insert] = await connection.execute<mysql.ResultSetHeader>(
+          `INSERT INTO event_inventory.inventory_holds (event_id, inventory_item_id, customer_sub, quantity, expires_at)
+           VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))`,
+          [eventId, item.inventory_item_id, caller.sub, input.quantity],
+        );
+        holdId = insert.insertId;
+        hold = { hold_id: insert.insertId, event_id: eventId!, inventory_item_id: Number(item.inventory_item_id), quantity: input.quantity! };
+      }
+    }
+
+    const items = await itemsForHold(connection, hold!);
+    if (items.length === 0) { await connection.rollback(); return res.status(409).json({ error: 'hold_has_no_inventory' }); }
+    const totalAmountCents = items.reduce((total, item) => total + item.quantity * item.unitPriceCents, 0);
+    const [insert] = await connection.execute<mysql.ResultSetHeader>(
+      `INSERT INTO orders (event_id, customer_sub, customer_email, hold_id, total_amount_cents)
+       VALUES (?, ?, ?, ?, ?)`, [eventId, caller.sub, customerEmail, holdId, totalAmountCents],
+    );
+    for (const item of items) {
+      await connection.execute(
+        `INSERT INTO order_items (order_id, inventory_item_id, seat_id, description, quantity, unit_price_cents)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [insert.insertId, item.inventoryItemId, item.seatId, item.description, item.quantity, item.unitPriceCents],
+      );
+    }
+    await connection.execute('UPDATE event_inventory.inventory_holds SET order_id = ? WHERE hold_id = ?', [insert.insertId, holdId]);
+    if (event.tier === 'TIER2_SEATED' && input.admissionToken) {
+      await connection.execute(
+        `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+         SET e.status = 'IN_CHECKOUT' WHERE s.event_id = ? AND e.customer_sub = ? AND e.admission_token = ?`,
+        [eventId, caller.sub, input.admissionToken],
+      );
+    }
+    await connection.commit();
+    return res.status(201).json({ order: await loadOrder(insert.insertId) });
+  } catch (error) {
+    await connection.rollback();
+    console.error('order creation failed', error);
+    return res.status(502).json({ error: 'order_create_failed' });
+  } finally { connection.release(); }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
+async function publishOrderPaid(order: NonNullable<Awaited<ReturnType<typeof loadOrder>>>): Promise<void> {
+  if (!ORDER_EVENTS_QUEUE_URL) return;
+  await sqs.send(new SendMessageCommand({
+    QueueUrl: ORDER_EVENTS_QUEUE_URL,
+    MessageBody: JSON.stringify({
+      type: 'OrderPaid', version: 1, occurredAt: new Date().toISOString(),
+      orderId: Number(order.order_id), eventId: Number(order.event_id), customerSub: order.customer_sub,
+      customerEmail: order.customer_email, paidAt: order.paid_at, items: order.items,
+    }),
+  }));
+}
+
+app.post('/orders/:orderId/payment', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const orderId = positiveInteger(req.params.orderId);
+  const paymentToken = ((req.body ?? {}) as PaymentInput).paymentToken;
+  const token = typeof paymentToken === 'string' ? paymentToken.trim() : '';
+  if (!orderId || !token || token.length > 255) return res.status(400).json({ error: 'invalid_payment' });
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [orders] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT order_id, customer_sub, hold_id, total_amount_cents, status FROM orders WHERE order_id = ? LIMIT 1 FOR UPDATE', [orderId],
+    );
+    const order = orders[0];
+    if (!order) { await connection.rollback(); return res.status(404).json({ error: 'order_not_found' }); }
+    if (order.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'order_owner_required' }); }
+    if (order.status === 'PAID') {
+      await connection.commit();
+      const paid = await loadOrder(orderId);
+      await publishOrderPaid(paid!);
+      return res.json({ order: paid });
+    }
+    if (order.status !== 'PENDING') { await connection.rollback(); return res.status(409).json({ error: 'order_not_payable' }); }
+    if (/^(fail|declin)/i.test(token)) {
+      await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'FAILED', ?)", [orderId, token, order.total_amount_cents]);
+      await connection.execute("UPDATE orders SET status = 'FAILED' WHERE order_id = ?", [orderId]);
+      const [failedHolds] = await connection.query<mysql.RowDataPacket[]>(
+        'SELECT event_id, inventory_item_id, customer_sub, quantity FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1', [order.hold_id],
+      );
+      const failedHold = failedHolds[0];
+      if (failedHold?.inventory_item_id) {
+        const [inventoryRelease] = await connection.execute<mysql.ResultSetHeader>(
+          'UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty - ?, version = version + 1 WHERE inventory_item_id = ? AND reserved_qty >= ?',
+          [failedHold.quantity, failedHold.inventory_item_id, failedHold.quantity],
+        );
+        if (inventoryRelease.affectedRows !== 1) throw new Error('reserved_inventory_mismatch');
+      } else {
+        await connection.execute("UPDATE event_inventory.seats SET status = 'AVAILABLE', hold_id = NULL WHERE hold_id = ? AND status = 'HELD'", [order.hold_id]);
+      }
+      await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'RELEASED' WHERE hold_id = ?", [order.hold_id]);
+      if (failedHold) {
+        await connection.execute(
+          `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+           SET e.status = 'LEFT', e.admission_token = NULL WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
+          [failedHold.event_id, failedHold.customer_sub],
+        );
+      }
+      await connection.commit();
+      return res.status(402).json({ error: 'payment_failed' });
+    }
+    const [holds] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT hold_id, inventory_item_id, quantity, status, expires_at FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1 FOR UPDATE', [order.hold_id],
+    );
+    const hold = holds[0];
+    if (!hold || hold.status !== 'ACTIVE' || new Date(hold.expires_at).getTime() <= Date.now()) {
+      await connection.rollback(); return res.status(409).json({ error: 'hold_not_active' });
+    }
+    if (hold.inventory_item_id) {
+      const [inventoryUpdate] = await connection.execute<mysql.ResultSetHeader>(
+        `UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty - ?, sold_qty = sold_qty + ?, version = version + 1
+         WHERE inventory_item_id = ? AND reserved_qty >= ?`, [hold.quantity, hold.quantity, hold.inventory_item_id, hold.quantity],
+      );
+      if (inventoryUpdate.affectedRows !== 1) throw new Error('reserved_inventory_mismatch');
+    } else {
+      const [seatUpdate] = await connection.execute<mysql.ResultSetHeader>(
+        "UPDATE event_inventory.seats SET status = 'SOLD' WHERE hold_id = ? AND status = 'HELD'", [hold.hold_id],
+      );
+      if (seatUpdate.affectedRows !== Number(hold.quantity)) throw new Error('held_seat_count_mismatch');
+    }
+    await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'CONFIRMED' WHERE hold_id = ?", [hold.hold_id]);
+    await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'CAPTURED', ?)", [orderId, token, order.total_amount_cents]);
+    await connection.execute("UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId]);
+    await connection.commit();
+    const paid = await loadOrder(orderId);
+    await publishOrderPaid(paid!);
+    return res.json({ order: paid });
+  } catch (error) {
+    await connection.rollback();
+    console.error('payment processing failed', error);
+    return res.status(502).json({ error: 'payment_processing_failed' });
+  } finally { connection.release(); }
 });
+
+app.get('/orders/:orderId', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const orderId = positiveInteger(req.params.orderId);
+  if (!orderId) return res.status(400).json({ error: 'invalid_order' });
+  const order = await loadOrder(orderId);
+  if (!order) return res.status(404).json({ error: 'order_not_found' });
+  if (order.customer_sub !== caller.sub && !(await hasEventRole(Number(order.event_id), caller.sub, ['ORGANISER']))) {
+    return res.status(403).json({ error: 'order_access_denied' });
+  }
+  return res.json({ order });
+});
+
+app.get('/customers/me/orders', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const [orders] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT order_id, event_id, customer_email, hold_id, status, total_amount_cents, currency, created_at, paid_at
+     FROM orders WHERE customer_sub = ? ORDER BY created_at DESC`, [caller.sub],
+  );
+  return res.json({ orders });
+});
+
+app.get('/events/:eventId/orders/summary', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const eventId = positiveInteger(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await hasEventRole(eventId, caller.sub, ['ORGANISER', 'HELPER']))) return res.status(403).json({ error: 'event_team_required' });
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT COUNT(DISTINCT o.order_id) AS paid_orders, COALESCE(SUM(i.quantity), 0) AS tickets_sold,
+       COALESCE(SUM(i.quantity * i.unit_price_cents), 0) AS revenue_cents
+     FROM orders o LEFT JOIN order_items i ON i.order_id = o.order_id WHERE o.event_id = ? AND o.status = 'PAID'`, [eventId],
+  );
+  const summary = rows[0]!;
+  const paidOrders = Number(summary.paid_orders);
+  const revenueCents = Number(summary.revenue_cents);
+  return res.json({ paidOrders, ticketsSold: Number(summary.tickets_sold), revenueCents, averageOrderCents: paidOrders ? Math.round(revenueCents / paidOrders) : 0 });
+});
+
+app.get('/events/:eventId/attendees', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const eventId = positiveInteger(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await hasEventRole(eventId, caller.sub, ['ORGANISER']))) return res.status(403).json({ error: 'event_organiser_required' });
+  const [attendees] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT o.order_id, o.customer_sub, o.customer_email, o.paid_at, i.description, i.quantity, i.seat_id
+     FROM orders o INNER JOIN order_items i ON i.order_id = o.order_id
+     WHERE o.event_id = ? AND o.status = 'PAID' ORDER BY o.paid_at, o.order_id, i.order_item_id`, [eventId],
+  );
+  return res.json({ attendees });
+});
+
+app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('unhandled order error', error);
+  if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
+});
+
+if (process.env.NODE_ENV !== 'test') app.listen(PORT, HOST, () => console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`));
+
+export { app, parseCreateOrder, positiveInteger };

@@ -24,7 +24,9 @@ module "services" {
   cluster_name       = aws_ecs_cluster.main.name
   namespace_arn      = aws_service_discovery_http_namespace.main.arn
   execution_role_arn = aws_iam_role.ecs_task_execution.arn
-  task_role_arn      = aws_iam_role.ecs_task.arn
+  task_role_arn      = each.key == "order" ? aws_iam_role.order_task.arn : (
+    each.key == "ticket" ? aws_iam_role.ticket_task.arn : aws_iam_role.ecs_task.arn
+  )
   subnet_ids         = aws_subnet.public[*].id
   security_group_ids = [aws_security_group.ecs_tasks.id]
 

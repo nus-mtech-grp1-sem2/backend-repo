@@ -310,6 +310,7 @@ For an existing schema created before these fields were introduced, run the migr
 
 1. `03-add-event-team-invitations.sql` adds `invite_status`, nullable `responded_at`, and the `(user_sub, invite_status)` lookup index used for a user's inbox.
 2. `04-add-event-total-seats.sql` adds the required event-capacity column with a default of `1` for existing rows.
+3. `06-add-queue-order-idempotency.sql` adds the unique event-session and hold-order keys used to make queue configuration and order creation idempotent. It fails without deleting data if legacy duplicates need manual review first.
 
 `total_seats` is configured capacity on `events`; `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
 
