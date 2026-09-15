@@ -18,6 +18,9 @@ infrastructure/sql/*-init-*.sql
 infrastructure/sql/generate-admin-password.js
 infrastructure/sql/test-password-verification.js
 
+# Local scripts with a hardcoded credential — never commit these
+create_cognito_users.py
+
 # Terraform artifacts must never be committed
 *.tfstate
 *.tfstate.*

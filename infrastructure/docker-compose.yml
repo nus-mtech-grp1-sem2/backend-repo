@@ -114,6 +114,16 @@ services:
     environment:
       SERVICE: notification
       PORT: 3006
+      # The notification service owns the notification schema.
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_NOTIFICATION:-notification}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
+      # Gmail SMTP sender for booking confirmation emails.
+      SMTP_USER: ${SMTP_USER:-onestagecontacts@gmail.com}
+      SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:?SMTP_APP_PASSWORD not set in .env}
 
   auth:
     <<: *service
