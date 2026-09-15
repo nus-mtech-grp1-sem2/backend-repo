@@ -35,7 +35,6 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^26.2.0",
-    "@types/nodemailer": "^7.0.5",
     "@types/qrcode": "^1.5.5",
     "concurrently": "^10.0.4",
     "cross-env": "^10.1.0",

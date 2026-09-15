@@ -16,7 +16,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "mysql2": "^3.23.3",
-    "nodemailer": "^7.0.10",
+    "nodemailer": "^10.0.10",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
