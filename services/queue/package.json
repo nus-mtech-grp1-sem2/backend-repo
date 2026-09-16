@@ -12,6 +12,7 @@
   "type": "module",
   "description": "",
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1132.0",
     "aws-jwt-verify": "^5.2.1",
     "express": "^5.2.1",
     "mysql2": "^3.24.4"

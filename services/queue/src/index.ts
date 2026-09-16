@@ -3,6 +3,11 @@ import { randomBytes } from 'node:crypto';
 import express from 'express';
 import mysql from 'mysql2/promise';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import {
+  SendMessageBatchCommand,
+  SQSClient,
+  type SendMessageBatchCommandInput,
+} from '@aws-sdk/client-sqs';
 
 const SERVICE = 'queue';
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -10,9 +15,11 @@ const PORT = Number(process.env.PORT ?? 3003);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN ?? '';
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
+const CUSTOMER_ADMITTED_QUEUE_URL = process.env.CUSTOMER_ADMITTED_QUEUE_URL ?? '';
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
+const sqs = new SQSClient({});
 
 const databaseConfigured = Boolean(
   process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER && process.env.DB_PASSWORD,
@@ -41,6 +48,36 @@ interface QueueEntryRow extends mysql.RowDataPacket {
   readonly admission_token: string | null;
   readonly token_expires_at: Date | null;
 }
+interface WaitingEntryRow extends QueueEntryRow { readonly customer_sub: string }
+interface CustomerAdmittedEvent {
+  readonly type: 'CustomerAdmitted';
+  readonly version: 1;
+  readonly occurredAt: string;
+  readonly queueEntryId: number;
+  readonly eventId: number;
+  readonly customerSub: string;
+  readonly tokenExpiresAt: string;
+}
+interface BatchSendResult {
+  readonly Failed?: readonly {
+    readonly Id?: string | undefined;
+    readonly Code?: string | undefined;
+  }[] | undefined;
+}
+type BatchSender = (input: SendMessageBatchCommandInput) => Promise<BatchSendResult>;
+interface AdmissionResult {
+  readonly admitted: number;
+  readonly remaining: number | null;
+  readonly reason?: 'sold_out';
+  readonly eventsPublished?: number;
+  readonly eventPublication?: 'published' | 'disabled' | 'failed' | 'not_required';
+}
+
+class QueueApiError extends Error {
+  constructor(readonly status: number, readonly code: string) {
+    super(code);
+  }
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -53,6 +90,70 @@ function positiveInteger(value: unknown): number | null {
 }
 
 const TOKEN_TTL_SEC = positiveInteger(process.env.ADMISSION_TOKEN_TTL_SEC) ?? 600;
+const AUTO_ADMISSION_ENABLED = process.env.AUTO_ADMISSION_ENABLED !== 'false';
+const ADMISSION_SCHEDULER_POLL_MS = Math.min(
+  positiveInteger(process.env.ADMISSION_SCHEDULER_POLL_MS) ?? 1_000,
+  60_000,
+);
+
+function admissionDue(lastAdmittedAt: Date | string | null, intervalSec: number, now = Date.now()): boolean {
+  if (!lastAdmittedAt) return true;
+  return new Date(lastAdmittedAt).getTime() + intervalSec * 1_000 <= now;
+}
+
+function customerAdmittedEvent(input: {
+  queueEntryId: number;
+  eventId: number;
+  customerSub: string;
+  occurredAt: Date;
+  tokenExpiresAt: Date;
+}): CustomerAdmittedEvent {
+  return {
+    type: 'CustomerAdmitted',
+    version: 1,
+    occurredAt: input.occurredAt.toISOString(),
+    queueEntryId: input.queueEntryId,
+    eventId: input.eventId,
+    customerSub: input.customerSub,
+    tokenExpiresAt: input.tokenExpiresAt.toISOString(),
+  };
+}
+
+const sendCustomerAdmittedBatch: BatchSender = async (input) =>
+  sqs.send(new SendMessageBatchCommand(input));
+
+async function publishCustomerAdmitted(
+  events: readonly CustomerAdmittedEvent[],
+  queueUrl = CUSTOMER_ADMITTED_QUEUE_URL,
+  sendBatch: BatchSender = sendCustomerAdmittedBatch,
+): Promise<number> {
+  if (!queueUrl || events.length === 0) return 0;
+  let published = 0;
+  for (let offset = 0; offset < events.length; offset += 10) {
+    const batch = events.slice(offset, offset + 10);
+    let pending = batch.map((event, index) => ({
+      Id: `${event.queueEntryId}-${offset + index}`,
+      MessageBody: JSON.stringify(event),
+      MessageAttributes: {
+        EventType: { DataType: 'String', StringValue: event.type },
+        EventId: { DataType: 'Number', StringValue: String(event.eventId) },
+      },
+    }));
+    for (let attempt = 1; attempt <= 3 && pending.length > 0; attempt += 1) {
+      const result = await sendBatch({ QueueUrl: queueUrl, Entries: pending });
+      if (result.Failed?.some((failure) => !failure.Id)) {
+        throw new Error('customer_admitted_batch_failed:unknown');
+      }
+      const failedIds = new Set(result.Failed?.map((failure) => failure.Id as string) ?? []);
+      published += pending.filter((entry) => !failedIds.has(entry.Id)).length;
+      pending = pending.filter((entry) => failedIds.has(entry.Id));
+      if (attempt === 3 && pending.length > 0) {
+        throw new Error(`customer_admitted_batch_failed:${pending.map((entry) => entry.Id).join(',')}`);
+      }
+    }
+  }
+  return published;
+}
 
 function parseConfig(input: QueueConfigInput): {
   opensAt: string;
@@ -111,6 +212,40 @@ function queueEntryResponse(entry: QueueEntryRow, livePosition?: number) {
     } : {}),
   };
 }
+
+app.get('/events/:eventId/queue', async (req, res) => {
+  const eventId = positiveInteger(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!requireDatabase(res)) return;
+  await database.execute(
+    "UPDATE queue_sessions SET status = 'OPEN' WHERE event_id = ? AND status = 'CLOSED' AND opens_at <= CURRENT_TIMESTAMP",
+    [eventId],
+  );
+  const [sessions] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT s.queue_session_id, s.event_id, s.opens_at, s.admission_batch_size,
+      s.admission_interval_sec, s.status,
+      SUM(CASE WHEN e.status = 'WAITING' THEN 1 ELSE 0 END) AS waiting_count
+     FROM queue_sessions s
+     LEFT JOIN queue_entries e ON e.queue_session_id = s.queue_session_id
+     WHERE s.event_id = ?
+     GROUP BY s.queue_session_id, s.event_id, s.opens_at, s.admission_batch_size,
+       s.admission_interval_sec, s.status
+     LIMIT 1`,
+    [eventId],
+  );
+  const session = sessions[0];
+  if (!session) return res.status(404).json({ error: 'queue_not_configured' });
+  return res.json({
+    queue: {
+      eventId: Number(session.event_id),
+      opensAt: session.opens_at,
+      admissionBatchSize: Number(session.admission_batch_size),
+      admissionIntervalSec: Number(session.admission_interval_sec),
+      status: session.status,
+      waitingCount: Number(session.waiting_count ?? 0),
+    },
+  });
+});
 
 app.put('/events/:eventId/queue/config', async (req, res) => {
   const caller = await requireCaller(req, res);
@@ -236,12 +371,48 @@ app.get('/events/:eventId/queue/me', async (req, res) => {
   return res.json(queueEntryResponse(entry, livePosition));
 });
 
-app.post('/events/:eventId/queue/admit-next', async (req, res) => {
+app.delete('/events/:eventId/queue/me', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
   const eventId = positiveInteger(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
-  if (!INTERNAL_API_TOKEN) return res.status(503).json({ error: 'internal_auth_not_configured' });
-  if (req.header('x-internal-token') !== INTERNAL_API_TOKEN) return res.status(401).json({ error: 'unauthenticated' });
   if (!requireDatabase(res)) return;
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query<QueueEntryRow[]>(
+      `SELECT e.queue_entry_id, e.position, e.status, e.admission_token, e.token_expires_at
+       FROM queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
+       WHERE s.event_id = ? AND e.customer_sub = ? LIMIT 1 FOR UPDATE`,
+      [eventId, caller.sub],
+    );
+    const entry = rows[0];
+    if (!entry) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'queue_entry_not_found' });
+    }
+    if (entry.status === 'IN_CHECKOUT') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'queue_checkout_started' });
+    }
+    if (entry.status !== 'LEFT' && entry.status !== 'EXPIRED') {
+      await connection.execute(
+        "UPDATE queue_entries SET status = 'LEFT', admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
+        [entry.queue_entry_id],
+      );
+    }
+    await connection.commit();
+    return res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('leave queue failed', error);
+    return res.status(502).json({ error: 'queue_leave_failed' });
+  } finally {
+    connection.release();
+  }
+});
+
+async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
@@ -249,14 +420,14 @@ app.post('/events/:eventId/queue/admit-next', async (req, res) => {
       'SELECT queue_session_id, admission_batch_size, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
     const session = sessions[0];
-    if (!session) { await connection.rollback(); return res.status(404).json({ error: 'queue_not_configured' }); }
-    if (session.status !== 'OPEN') { await connection.rollback(); return res.status(409).json({ error: 'queue_not_open' }); }
+    if (!session) throw new QueueApiError(404, 'queue_not_configured');
+    if (session.status !== 'OPEN') throw new QueueApiError(409, 'queue_not_open');
     const [recent] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT MAX(admitted_at) AS last_admitted_at FROM queue_entries WHERE queue_session_id = ?', [session.queue_session_id],
     );
     const lastAdmittedAt = recent[0]?.last_admitted_at ? new Date(recent[0].last_admitted_at).getTime() : 0;
-    if (lastAdmittedAt + Number(session.admission_interval_sec) * 1_000 > Date.now()) {
-      await connection.rollback(); return res.status(429).json({ error: 'admission_interval_not_elapsed' });
+    if (!admissionDue(lastAdmittedAt ? new Date(lastAdmittedAt) : null, Number(session.admission_interval_sec))) {
+      throw new QueueApiError(429, 'admission_interval_not_elapsed');
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
       `SELECT e.status, e.tier,
@@ -267,36 +438,117 @@ app.post('/events/:eventId/queue/admit-next', async (req, res) => {
        FROM event_inventory.events e WHERE e.event_id = ? LIMIT 1`, [eventId],
     );
     const event = availabilityRows[0];
-    if (!event || event.status !== 'PUBLISHED') { await connection.rollback(); return res.status(409).json({ error: 'event_not_on_sale' }); }
+    if (!event || event.status !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
     const limit = Math.min(Number(session.admission_batch_size), Number(event.available_qty ?? 0));
     if (limit <= 0) {
       await connection.execute("UPDATE queue_sessions SET status = 'DRAINED' WHERE queue_session_id = ?", [session.queue_session_id]);
       await connection.commit();
-      return res.json({ admitted: 0, remaining: null, reason: 'sold_out' });
+      return { admitted: 0, remaining: null, reason: 'sold_out' };
     }
-    const [waiting] = await connection.query<QueueEntryRow[]>(
-      `SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries
+    const [waiting] = await connection.query<WaitingEntryRow[]>(
+      `SELECT queue_entry_id, customer_sub, position, status, admission_token, token_expires_at FROM queue_entries
        WHERE queue_session_id = ? AND status = 'WAITING' ORDER BY position LIMIT ? FOR UPDATE`,
       [session.queue_session_id, limit],
     );
+    const admittedEvents: CustomerAdmittedEvent[] = [];
     for (const entry of waiting) {
+      const admittedAt = new Date();
+      const tokenExpiresAt = new Date(admittedAt.getTime() + TOKEN_TTL_SEC * 1_000);
       await connection.execute(
-        `UPDATE queue_entries SET status = 'ADMITTED', admitted_at = CURRENT_TIMESTAMP, admission_token = ?,
-          token_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ? SECOND) WHERE queue_entry_id = ?`,
-        [randomBytes(32).toString('base64url'), TOKEN_TTL_SEC, entry.queue_entry_id],
+        `UPDATE queue_entries SET status = 'ADMITTED', admitted_at = ?, admission_token = ?,
+          token_expires_at = ? WHERE queue_entry_id = ?`,
+        [admittedAt, randomBytes(32).toString('base64url'), tokenExpiresAt, entry.queue_entry_id],
       );
+      admittedEvents.push(customerAdmittedEvent({
+        queueEntryId: Number(entry.queue_entry_id), eventId, customerSub: entry.customer_sub,
+        occurredAt: admittedAt, tokenExpiresAt,
+      }));
     }
     const [remainingRows] = await connection.query<mysql.RowDataPacket[]>(
       "SELECT COUNT(*) AS remaining FROM queue_entries WHERE queue_session_id = ? AND status = 'WAITING'", [session.queue_session_id],
     );
     const remaining = Number(remainingRows[0]?.remaining ?? 0);
     await connection.commit();
-    return res.json({ admitted: waiting.length, remaining });
+    let eventPublication: 'published' | 'disabled' | 'failed' | 'not_required' = admittedEvents.length === 0
+      ? 'not_required'
+      : CUSTOMER_ADMITTED_QUEUE_URL ? 'published' : 'disabled';
+    let eventsPublished = 0;
+    try {
+      eventsPublished = await publishCustomerAdmitted(admittedEvents);
+    } catch (error) {
+      eventPublication = 'failed';
+      console.error('customer admitted event publication failed', error);
+    }
+    return { admitted: waiting.length, remaining, eventsPublished, eventPublication };
   } catch (error) {
     await connection.rollback();
+    throw error;
+  } finally { connection.release(); }
+}
+
+async function runAdmissionSweep(now = Date.now()): Promise<number> {
+  if (!databaseConfigured || !AUTO_ADMISSION_ENABLED) return 0;
+  await database.execute(
+    `UPDATE queue_entries
+     SET status = 'EXPIRED', admission_token = NULL
+     WHERE status = 'ADMITTED' AND token_expires_at <= CURRENT_TIMESTAMP`,
+  );
+  const [sessions] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT s.event_id, s.admission_interval_sec, MAX(e.admitted_at) AS last_admitted_at
+     FROM queue_sessions s
+     LEFT JOIN queue_entries e ON e.queue_session_id = s.queue_session_id
+     WHERE s.status = 'OPEN' AND s.opens_at <= CURRENT_TIMESTAMP
+       AND EXISTS (
+         SELECT 1 FROM queue_entries waiting
+         WHERE waiting.queue_session_id = s.queue_session_id AND waiting.status = 'WAITING'
+       )
+     GROUP BY s.queue_session_id, s.event_id, s.admission_interval_sec`,
+  );
+  let admitted = 0;
+  for (const session of sessions) {
+    if (!admissionDue(session.last_admitted_at ?? null, Number(session.admission_interval_sec), now)) continue;
+    try {
+      admitted += (await admitNextBatch(Number(session.event_id))).admitted;
+    } catch (error) {
+      if (error instanceof QueueApiError && [409, 429].includes(error.status)) continue;
+      console.error('automatic queue admission failed', { eventId: Number(session.event_id), error });
+    }
+  }
+  return admitted;
+}
+
+let admissionSweepRunning = false;
+function startAdmissionScheduler(): void {
+  if (!databaseConfigured || !AUTO_ADMISSION_ENABLED) return;
+  const tick = async () => {
+    if (admissionSweepRunning) return;
+    admissionSweepRunning = true;
+    try {
+      await runAdmissionSweep();
+    } catch (error) {
+      console.error('automatic admission sweep failed', error);
+    } finally {
+      admissionSweepRunning = false;
+    }
+  };
+  void tick();
+  const timer = setInterval(() => void tick(), ADMISSION_SCHEDULER_POLL_MS);
+  timer.unref();
+}
+
+app.post('/events/:eventId/queue/admit-next', async (req, res) => {
+  const eventId = positiveInteger(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!INTERNAL_API_TOKEN) return res.status(503).json({ error: 'internal_auth_not_configured' });
+  if (req.header('x-internal-token') !== INTERNAL_API_TOKEN) return res.status(401).json({ error: 'unauthenticated' });
+  if (!requireDatabase(res)) return;
+  try {
+    return res.json(await admitNextBatch(eventId));
+  } catch (error) {
+    if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
     console.error('queue admission failed', error);
     return res.status(502).json({ error: 'queue_admission_failed' });
-  } finally { connection.release(); }
+  }
 });
 
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -304,6 +556,19 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
 });
 
-if (process.env.NODE_ENV !== 'test') app.listen(PORT, HOST, () => console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`));
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, HOST, () => {
+    console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
+    startAdmissionScheduler();
+  });
+}
 
-export { app, parseConfig, positiveInteger };
+export {
+  admissionDue,
+  app,
+  customerAdmittedEvent,
+  parseConfig,
+  positiveInteger,
+  publishCustomerAdmitted,
+  runAdmissionSweep,
+};

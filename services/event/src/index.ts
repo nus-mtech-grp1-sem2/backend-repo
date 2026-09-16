@@ -144,6 +144,51 @@ function attribute(attributes: readonly AttributeType[] | undefined, name: strin
   return attributes?.find((item) => item.Name === name)?.Value ?? '';
 }
 
+async function ensureSeatedInventory(connection: mysql.PoolConnection, eventId: number): Promise<void> {
+  const [events] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT total_seats, tier FROM events WHERE event_id = ? LIMIT 1 FOR UPDATE',
+    [eventId],
+  );
+  const event = events[0];
+  if (!event || event.tier !== 'TIER2_SEATED') return;
+
+  const [items] = await connection.query<mysql.RowDataPacket[]>(
+    "SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1",
+    [eventId],
+  );
+  let inventoryItemId = Number(items[0]?.inventory_item_id ?? 0);
+  if (!inventoryItemId) {
+    const [item] = await connection.execute<mysql.ResultSetHeader>(
+      "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, 0)",
+      [eventId, Number(event.total_seats)],
+    );
+    inventoryItemId = item.insertId;
+  }
+
+  const [existing] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT seat_label FROM seats WHERE event_id = ? ORDER BY seat_id',
+    [eventId],
+  );
+  const totalSeats = Number(event.total_seats);
+  const missing = Math.max(0, totalSeats - existing.length);
+  if (missing === 0) return;
+
+  const labels = new Set(existing.map((seat) => String(seat.seat_label)));
+  const additions: string[] = [];
+  for (let sequence = 1; additions.length < missing; sequence += 1) {
+    const label = `S${sequence}`;
+    if (!labels.has(label)) additions.push(label);
+  }
+  for (let offset = 0; offset < additions.length; offset += 500) {
+    const batch = additions.slice(offset, offset + 500);
+    const placeholders = batch.map(() => '(?, ?, ?)').join(', ');
+    await connection.execute(
+      `INSERT INTO seats (event_id, inventory_item_id, seat_label) VALUES ${placeholders}`,
+      batch.flatMap((label) => [eventId, inventoryItemId, label]),
+    );
+  }
+}
+
 /** Published events list, newest start date first. */
 async function listEvents(_req: express.Request, res: express.Response) {
   if (!databaseConfigured) {
@@ -202,6 +247,42 @@ app.get('/events/:eventId', async (req, res) => {
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });
   res.json({ event: rows[0] });
+});
+
+app.get('/events/:eventId/seats', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT tier FROM events WHERE event_id = ? LIMIT 1',
+      [eventId],
+    );
+    if (!events[0]) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'event_not_found' });
+    }
+    if (events[0].tier !== 'TIER2_SEATED') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'seat_map_not_available' });
+    }
+    await ensureSeatedInventory(connection, eventId);
+    const [seats] = await connection.query(
+      'SELECT seat_id, seat_label, status FROM seats WHERE event_id = ? ORDER BY seat_id',
+      [eventId],
+    );
+    await connection.commit();
+    return res.json({ seats });
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to load seat map', error);
+    return res.status(502).json({ error: 'seat_map_failed' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.post('/events', async (req, res) => {
@@ -288,8 +369,20 @@ app.post('/events/:eventId/publish', async (req, res) => {
   const eventId = Number(req.params.eventId);
   if (!caller) return;
   if (!Number.isSafeInteger(eventId) || !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
-  await database.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [eventId]);
-  res.status(204).end();
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    await ensureSeatedInventory(connection, eventId);
+    await connection.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [eventId]);
+    await connection.commit();
+    res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to publish event', error);
+    res.status(502).json({ error: 'event_publish_failed' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.post('/events/:eventId/cancel', async (req, res) => {

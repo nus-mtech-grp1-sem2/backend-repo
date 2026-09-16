@@ -72,6 +72,9 @@ services:
   queue:
     <<: *service
     container_name: queue-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: queue
       PORT: 3003
@@ -85,10 +88,22 @@ services:
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
       ADMISSION_TOKEN_TTL_SEC: ${ADMISSION_TOKEN_TTL_SEC:-600}
+      AUTO_ADMISSION_ENABLED: ${AUTO_ADMISSION_ENABLED:-true}
+      ADMISSION_SCHEDULER_POLL_MS: ${ADMISSION_SCHEDULER_POLL_MS:-1000}
+      CUSTOMER_ADMITTED_QUEUE_URL: ${CUSTOMER_ADMITTED_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   order:
     <<: *service
     container_name: order-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: order
       PORT: 3004
@@ -105,10 +120,15 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   ticket:
     <<: *service
     container_name: ticket-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: ticket
       PORT: 3005
@@ -120,6 +140,13 @@ services:
       DB_SSL: ${DB_SSL:-false}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   notification:
     <<: *service

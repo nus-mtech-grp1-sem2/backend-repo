@@ -2,9 +2,9 @@
 
 *SWE5001 — Architecting Scalable Systems, Graduate Certificate in Architecting Scalable Systems (NUS–ISS)*
 
-Data models, domain class diagrams, and API surface for the four backend services, derived from the [user stories](https://claude.ai/code/artifact/7a3e1db9-56dc-4d3f-8bc1-3c5d870a97a2). One Amazon RDS for MySQL instance plays four independent databases via schema-per-service; Cognito owns authentication; a single SQS queue carries the one hand-off that can safely be asynchronous.
+Data models, domain class diagrams, and API surface for the four core backend services, derived from the [user stories](https://claude.ai/code/artifact/7a3e1db9-56dc-4d3f-8bc1-3c5d870a97a2). One Amazon RDS for MySQL instance plays four independent databases via schema-per-service; Cognito owns authentication; two SQS queues carry asynchronous admission and paid-order events.
 
-**At a glance:** 4 backend services · 1 MySQL instance, 4 schemas · 12 tables · 31 API endpoints · 1 SQS queue.
+**At a glance:** 4 core backend services · 1 MySQL instance, 4 schemas · 12 tables · 33 API endpoints · 2 SQS queues.
 
 ---
 
@@ -38,7 +38,9 @@ graph TB
         SchemaTI[(ticketing schema)]
     end
 
-    SQS{{"Amazon SQS<br/>order-events queue"}}
+    OrderSQS{{"Amazon SQS<br/>order-events queue"}}
+    AdmissionSQS{{"Amazon SQS<br/>customer-admitted queue"}}
+    Notification["Notification / WebSocket<br/>consumer"]
 
     Buyer -->|HTTPS + JWT| GW
     Portal -->|HTTPS + JWT| GW
@@ -57,8 +59,10 @@ graph TB
     CPS -->|owns| SchemaCO
     TIV -->|owns| SchemaTI
 
-    CPS -->|publishes OrderPaid| SQS
-    SQS -->|consumed by| TIV
+    WR -->|publishes CustomerAdmitted| AdmissionSQS
+    AdmissionSQS -->|consumed by| Notification
+    CPS -->|publishes OrderPaid| OrderSQS
+    OrderSQS -->|consumed by| TIV
     CPS -.confirm hold, sync.-> EIS
     WR -.check availability, sync.-> EIS
 ```
@@ -70,6 +74,8 @@ graph TB
 **One database, four schemas, no cross-schema foreign keys.** A single Amazon RDS for MySQL instance hosts `event_inventory`, `queue`, `checkout`, and `ticketing` — one per service — instead of four separate RDS instances, which keeps the school project's AWS bill and ops surface small. Each service's own tables carry real, enforced foreign keys. A reference to another service's row (e.g. `checkout.orders.event_id`) is stored as a plain unconstrained column instead, so the services stay logically independent and could be split onto separate instances later with zero schema change.
 
 **Only one thing has to be synchronous: not overselling.** The one failure OneStage cannot tolerate is two buyers being confirmed for the same seat. So reserving and confirming an `InventoryHold` happens inside the Event & Inventory Service under a DB transaction, and Checkout calls `POST /holds/{id}/confirm` synchronously before it will mark an order `PAID` — if that call fails, the sale fails. Ticket generation and the confirmation email are not on that critical path, so Checkout instead publishes `OrderPaid` to the `order-events` SQS queue and Ticket Issuance consumes it asynchronously. That's the proposal's "event bus that decouples inventory and order events from downstream processing," scoped to the one hand-off where eventual consistency is actually fine.
+
+**Admission notification is also asynchronous.** MySQL remains the source of truth for queue position and admission. After an admission transaction commits, the Queue Service publishes one versioned `CustomerAdmitted` message per admitted customer to the shared `customer-admitted` SQS queue. Notification or WebSocket workers consume these messages independently of the admission API.
 
 **Authorization rides on one small table, not a fifth service.** Cognito authenticates every request, but Organiser/Helper are per-event roles that don't map onto global Cognito groups. `event_team_memberships` in the Event & Inventory schema is the single source of truth: creating an event auto-inserts its creator as an accepted `ORGANISER`; an invitation creates a `PENDING` membership for the invitee's Cognito `sub`, with `granted_by_sub` set to the event owner's `organiser_sub`. Every organiser-or-helper-scoped endpoint in any service checks membership synchronously. Every other endpoint just requires a valid Cognito JWT — any signed-in user is a Customer by default.
 
@@ -409,9 +415,17 @@ classDiagram
 | Method | Path | Description | Caller |
 |---|---|---|---|
 | PUT | `/events/{eventId}/queue/config` | Configure on-sale time & admission rate | Organiser |
+| GET | `/events/{eventId}/queue` | Queue opening time, state, and waiting count | Public |
 | POST | `/events/{eventId}/queue/join` | Join the waiting room | Customer |
 | GET | `/events/{eventId}/queue/me` | My live position & status | Customer |
-| POST | `/events/{eventId}/queue/admit-next` | Admit the next batch (scheduled) | Internal (scheduled task) |
+| DELETE | `/events/{eventId}/queue/me` | Leave the waiting room or surrender admission | Customer |
+| POST | `/events/{eventId}/queue/admit-next` | Admit the next batch manually | Internal operations |
+
+`admit-next` publishes a `CustomerAdmitted` version 1 message containing `queueEntryId`, `eventId`, `customerSub`, `occurredAt`, and `tokenExpiresAt`. Every ticketed event shares the same queue; consumers use `eventId` and `customerSub` to route the notification. The admission token is deliberately omitted and must be retrieved through the authenticated `/queue/me` API. SQS delivery is at least once, so consumers must handle duplicate messages safely.
+
+The Queue Service runs the same admission operation automatically for every open session that has waiting customers. It admits the first batch immediately, then respects `admission_interval_sec` between later batches. The internal `admit-next` endpoint remains available for operational retries and manual testing.
+
+An admitted customer has `ADMISSION_TOKEN_TTL_SEC` seconds to begin checkout. The Queue Service continuously changes overdue `ADMITTED` entries to `EXPIRED` and removes their admission token. Customers can also surrender either a waiting place or an unused admission through `DELETE /events/{eventId}/queue/me`.
 
 ---
 
@@ -647,12 +661,17 @@ sequenceDiagram
     participant WR as Waiting Room / Queue Service
     participant EIS as Event & Inventory Service
     participant CPS as Checkout & Payment Service
-    participant SQS as SQS: order-events
+    participant ASQS as SQS: customer-admitted
+    participant Notification as Notification / WebSocket worker
+    participant OSQS as SQS: order-events
     participant TIV as Ticket Issuance & Validation Service
 
     C->>WR: POST /queue/join
     WR-->>C: queue position (polls /queue/me)
     WR->>WR: admission worker admits next batch
+    WR->>ASQS: publish CustomerAdmitted
+    ASQS-->>Notification: deliver CustomerAdmitted
+    Notification-->>C: admission notification
     WR-->>C: ADMITTED + admission token
 
     C->>EIS: POST /inventory/hold (seats/qty, admission token)
@@ -666,8 +685,8 @@ sequenceDiagram
     EIS-->>CPS: hold CONFIRMED
     CPS->>CPS: mark order PAID
     CPS-->>C: order PAID
-    CPS->>SQS: publish OrderPaid  (async — decouples issuance)
-    SQS-->>TIV: deliver OrderPaid
+    CPS->>OSQS: publish OrderPaid  (async — decouples issuance)
+    OSQS-->>TIV: deliver OrderPaid
     TIV->>TIV: issue ticket(s), generate QR
     TIV-->>C: email ticket with QR (async)
 ```

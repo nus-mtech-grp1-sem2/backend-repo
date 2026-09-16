@@ -1,12 +1,19 @@
 import express from 'express';
 import mysql from 'mysql2/promise';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import { randomBytes } from 'node:crypto';
+import {
+  DeleteMessageCommand,
+  ReceiveMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 
 const SERVICE = 'ticket';
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 3005);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
+const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
@@ -20,6 +27,7 @@ const database = mysql.createPool({
   connectionLimit: 8,
   ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
 });
+const sqs = new SQSClient({});
 
 const app = express();
 app.disable('x-powered-by');
@@ -39,6 +47,22 @@ interface CheckinInput {
   readonly eventId?: unknown;
   readonly ticketId?: unknown;
   readonly qrToken?: unknown;
+}
+
+interface OrderPaidItem {
+  readonly orderItemId: number;
+  readonly seatId: number | null;
+  readonly quantity: number;
+}
+
+interface OrderPaidEvent {
+  readonly type: 'OrderPaid';
+  readonly version: 1;
+  readonly orderId: number;
+  readonly eventId: number;
+  readonly customerSub: string;
+  readonly customerEmail: string;
+  readonly items: readonly OrderPaidItem[];
 }
 
 async function authenticate(req: express.Request): Promise<Caller | null> {
@@ -75,6 +99,113 @@ function parseToken(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const token = value.trim();
   return token.length > 0 && token.length <= 255 ? token : null;
+}
+
+export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
+  if (!value || typeof value !== 'object') return null;
+  const event = value as Record<string, unknown>;
+  const orderId = parseTicketId(event['orderId']);
+  const eventId = parseEventId(event['eventId']);
+  const customerSub = typeof event['customerSub'] === 'string' ? event['customerSub'].trim() : '';
+  const customerEmail = typeof event['customerEmail'] === 'string' ? event['customerEmail'].trim() : '';
+  if (event['type'] !== 'OrderPaid' || event['version'] !== 1 || !orderId || !eventId ||
+      !customerSub || customerSub.length > 36 || !customerEmail || customerEmail.length > 255 ||
+      !Array.isArray(event['items']) || event['items'].length === 0) return null;
+
+  const items: OrderPaidItem[] = [];
+  for (const raw of event['items']) {
+    if (!raw || typeof raw !== 'object') return null;
+    const item = raw as Record<string, unknown>;
+    const orderItemId = parseTicketId(item['order_item_id']);
+    const quantity = parseTicketId(item['quantity']);
+    const seatId = item['seat_id'] === null ? null : parseTicketId(item['seat_id']);
+    if (!orderItemId || !quantity || quantity > 50 || (item['seat_id'] !== null && !seatId) || (seatId && quantity !== 1)) {
+      return null;
+    }
+    items.push({ orderItemId, seatId, quantity });
+  }
+  return { type: 'OrderPaid', version: 1, orderId, eventId, customerSub, customerEmail, items };
+}
+
+async function issueTickets(event: OrderPaidEvent): Promise<number> {
+  const connection = await database.getConnection();
+  const lockName = `ticket-order-${event.orderId}`;
+  let lockAcquired = false;
+  try {
+    const [locks] = await connection.query<mysql.RowDataPacket[]>('SELECT GET_LOCK(?, 10) AS acquired', [lockName]);
+    lockAcquired = Number(locks[0]?.acquired) === 1;
+    if (!lockAcquired) throw new Error('ticket_order_lock_timeout');
+    await connection.beginTransaction();
+    const [existing] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT order_item_id FROM tickets WHERE order_id = ? FOR UPDATE',
+      [event.orderId],
+    );
+    const issuedByItem = new Map<number, number>();
+    for (const row of existing) {
+      const orderItemId = Number(row.order_item_id);
+      issuedByItem.set(orderItemId, (issuedByItem.get(orderItemId) ?? 0) + 1);
+    }
+    let issued = 0;
+    for (const item of event.items) {
+      const missing = Math.max(0, item.quantity - (issuedByItem.get(item.orderItemId) ?? 0));
+      for (let index = 0; index < missing; index += 1) {
+        await connection.execute(
+          `INSERT INTO tickets
+            (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [event.orderId, item.orderItemId, event.eventId, event.customerSub, event.customerEmail,
+            item.seatId, randomBytes(32).toString('base64url')],
+        );
+        issued += 1;
+      }
+    }
+    await connection.commit();
+    return issued;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    if (lockAcquired) {
+      try {
+        await connection.query('SELECT RELEASE_LOCK(?)', [lockName]);
+      } catch (error) {
+        console.error('ticket order lock release failed', { orderId: event.orderId, error });
+      }
+    }
+    connection.release();
+  }
+}
+
+async function consumeOrderPaidEvents(): Promise<void> {
+  if (!ORDER_EVENTS_QUEUE_URL || !databaseConfigured) return;
+  for (;;) {
+    try {
+      const result = await sqs.send(new ReceiveMessageCommand({
+        QueueUrl: ORDER_EVENTS_QUEUE_URL,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 20,
+        VisibilityTimeout: 60,
+      }));
+      for (const message of result.Messages ?? []) {
+        if (!message.ReceiptHandle) continue;
+        let event: OrderPaidEvent | null = null;
+        try {
+          event = parseOrderPaid(message.Body ? JSON.parse(message.Body) : null);
+        } catch {
+          event = null;
+        }
+        if (event) await issueTickets(event);
+        else console.error('discarding invalid OrderPaid message', { messageId: message.MessageId });
+        await sqs.send(new DeleteMessageCommand({
+          QueueUrl: ORDER_EVENTS_QUEUE_URL,
+          ReceiptHandle: message.ReceiptHandle,
+        }));
+      }
+    } catch (error) {
+      console.error('order event consumption failed', error);
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+  }
 }
 
 async function requireConfigured(res: express.Response): Promise<boolean> {
@@ -151,6 +282,23 @@ app.post('/tickets/validate', async (req, res) => {
   }
 });
 
+app.get('/customers/me/tickets', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!(await requireConfigured(res))) return;
+  const [tickets] = await database.query(
+    `SELECT t.ticket_id, t.order_id, t.event_id, e.title AS event_title, e.venue, e.starts_at,
+      s.seat_label, t.qr_token, t.status, t.issued_at, t.checked_in_at
+     FROM tickets t
+     INNER JOIN event_inventory.events e ON e.event_id = t.event_id
+     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+     WHERE t.customer_sub = ?
+     ORDER BY e.starts_at ASC, t.ticket_id ASC`,
+    [caller.sub],
+  );
+  return res.json({ tickets });
+});
+
 app.get('/tickets/search', async (req, res) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
@@ -184,6 +332,7 @@ app.get('/events/:eventId/checkin-stats', async (req, res) => {
 if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, HOST, () => {
     console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
+    void consumeOrderPaidEvents();
   });
 }
 

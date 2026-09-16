@@ -418,8 +418,18 @@ app.get('/customers/me/orders', async (req, res) => {
   if (!caller) return;
   if (!requireDatabase(res)) return;
   const [orders] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT order_id, event_id, customer_email, hold_id, status, total_amount_cents, currency, created_at, paid_at
-     FROM orders WHERE customer_sub = ? ORDER BY created_at DESC`, [caller.sub],
+    `SELECT o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
+      o.total_amount_cents, o.currency, o.created_at, o.paid_at,
+      e.title AS event_title, e.venue, e.starts_at,
+      COALESCE(SUM(i.quantity), 0) AS ticket_count
+     FROM orders o
+     INNER JOIN event_inventory.events e ON e.event_id = o.event_id
+     LEFT JOIN order_items i ON i.order_id = o.order_id
+     WHERE o.customer_sub = ?
+     GROUP BY o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
+       o.total_amount_cents, o.currency, o.created_at, o.paid_at,
+       e.title, e.venue, e.starts_at
+     ORDER BY o.created_at DESC`, [caller.sub],
   );
   return res.json({ orders });
 });
