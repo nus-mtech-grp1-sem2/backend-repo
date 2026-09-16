@@ -710,7 +710,7 @@ classDiagram
 | Method | Path | Description | Caller |
 |---|---|---|---|
 | POST | `/notifications/order-confirmation` | Render QR codes and send the booking confirmation email; idempotent on `orderId` — returns the existing record unchanged if already `SENT` | Ticket Issuance & Validation Service |
-| GET | `/notifications/{orderId}` | Look up the send outcome for an order | Ticket Issuance & Validation Service / internal |
+| GET | `/notifications/{orderId}` | Look up the send outcome (status, error, timestamps) for an order's confirmation email, for support/ops diagnosis | Not yet called by another service — read-only diagnostic route |
 
 ### Schema installation
 
