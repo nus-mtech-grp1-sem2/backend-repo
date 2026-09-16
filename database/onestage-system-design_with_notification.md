@@ -2,9 +2,9 @@
 
 *SWE5001 — Architecting Scalable Systems, Graduate Certificate in Architecting Scalable Systems (NUS–ISS)*
 
-Data models, domain class diagrams, and API surface for the four backend services, derived from the [user stories](https://claude.ai/code/artifact/7a3e1db9-56dc-4d3f-8bc1-3c5d870a97a2). One Amazon RDS for MySQL instance plays four independent databases via schema-per-service; Cognito owns authentication; a single SQS queue carries the one hand-off that can safely be asynchronous.
+Data models, domain class diagrams, and API surface for the five backend services, derived from the [user stories](https://claude.ai/code/artifact/7a3e1db9-56dc-4d3f-8bc1-3c5d870a97a2). One Amazon RDS for MySQL instance plays five independent databases via schema-per-service; Cognito owns authentication; a single SQS queue carries the one hand-off that can safely be asynchronous.
 
-**At a glance:** 4 backend services · 1 MySQL instance, 4 schemas · 12 tables · 31 API endpoints · 1 SQS queue.
+**At a glance:** 5 backend services · 1 MySQL instance, 5 schemas · 13 tables · 36 API endpoints · 1 SQS queue.
 
 ---
 
@@ -29,6 +29,7 @@ graph TB
         WR["Waiting Room /<br/>Queue Service"]
         CPS["Checkout & Payment<br/>Service"]
         TIV["Ticket Issuance &<br/>Validation Service"]
+        NS["Notification<br/>Service"]
     end
 
     subgraph DB["Single Amazon RDS for MySQL Instance"]
@@ -36,9 +37,11 @@ graph TB
         SchemaQ[(queue schema)]
         SchemaCO[(checkout schema)]
         SchemaTI[(ticketing schema)]
+        SchemaN[(notification schema)]
     end
 
     SQS{{"Amazon SQS<br/>order-events queue"}}
+    Gmail[("Gmail SMTP")]
 
     Buyer -->|HTTPS + JWT| GW
     Portal -->|HTTPS + JWT| GW
@@ -56,22 +59,27 @@ graph TB
     WR -->|owns| SchemaQ
     CPS -->|owns| SchemaCO
     TIV -->|owns| SchemaTI
+    NS -->|owns| SchemaN
 
     CPS -->|publishes OrderPaid| SQS
     SQS -->|consumed by| TIV
     CPS -.confirm hold, sync.-> EIS
     WR -.check availability, sync.-> EIS
+    TIV -.order confirmation, sync.-> NS
+    NS -.sends via.-> Gmail
 ```
 
 ---
 
 ## Design decisions
 
-**One database, four schemas, no cross-schema foreign keys.** A single Amazon RDS for MySQL instance hosts `event_inventory`, `queue`, `checkout`, and `ticketing` — one per service — instead of four separate RDS instances, which keeps the school project's AWS bill and ops surface small. Each service's own tables carry real, enforced foreign keys. A reference to another service's row (e.g. `checkout.orders.event_id`) is stored as a plain unconstrained column instead, so the services stay logically independent and could be split onto separate instances later with zero schema change.
+**One database, five schemas, no cross-schema foreign keys.** A single Amazon RDS for MySQL instance hosts `event_inventory`, `queue`, `checkout`, `ticketing`, and `notification` — one per service — instead of five separate RDS instances, which keeps the school project's AWS bill and ops surface small. Each service's own tables carry real, enforced foreign keys. A reference to another service's row (e.g. `checkout.orders.event_id`) is stored as a plain unconstrained column instead, so the services stay logically independent and could be split onto separate instances later with zero schema change.
 
 **Only one thing has to be synchronous: not overselling.** The one failure OneStage cannot tolerate is two buyers being confirmed for the same seat. So reserving and confirming an `InventoryHold` happens inside the Event & Inventory Service under a DB transaction, and Checkout calls `POST /holds/{id}/confirm` synchronously before it will mark an order `PAID` — if that call fails, the sale fails. Ticket generation and the confirmation email are not on that critical path, so Checkout instead publishes `OrderPaid` to the `order-events` SQS queue and Ticket Issuance consumes it asynchronously. That's the proposal's "event bus that decouples inventory and order events from downstream processing," scoped to the one hand-off where eventual consistency is actually fine.
 
-**Authorization rides on one small table, not a fifth service.** Cognito authenticates every request, but Organiser/Helper are per-event roles that don't map onto global Cognito groups. `event_team_memberships` in the Event & Inventory schema is the single source of truth: creating an event auto-inserts its creator as an accepted `ORGANISER`; an invitation creates a `PENDING` membership for the invitee's Cognito `sub`, with `granted_by_sub` set to the event owner's `organiser_sub`. Every organiser-or-helper-scoped endpoint in any service checks membership synchronously. Every other endpoint just requires a valid Cognito JWT — any signed-in user is a Customer by default.
+**Authorization rides on one small table, not another service.** Cognito authenticates every request, but Organiser/Helper are per-event roles that don't map onto global Cognito groups. `event_team_memberships` in the Event & Inventory schema is the single source of truth: creating an event auto-inserts its creator as an accepted `ORGANISER`; an invitation creates a `PENDING` membership for the invitee's Cognito `sub`, with `granted_by_sub` set to the event owner's `organiser_sub`. Every organiser-or-helper-scoped endpoint in any service checks membership synchronously. Every other endpoint just requires a valid Cognito JWT — any signed-in user is a Customer by default.
+
+**The confirmation email is its own service, called synchronously but idempotently.** After Ticket Issuance consumes `OrderPaid` and creates the ticket rows, it calls the Notification Service's `POST /notifications/order-confirmation` to render the QR codes and send the Gmail-based confirmation email, rather than sending mail itself. That call is synchronous so the caller gets back a definite `SENT`/`FAILED` outcome, but it's idempotent on `order_id` — a unique key on `email_notifications` — so a retried call after a timeout can never double-email a customer; it just returns the already-`SENT` record. A delivery failure is recorded as `FAILED` and returned with a 201, not thrown back as an error: the order is already paid and the tickets already exist, so a bad SMTP credential degrades to "no confirmation email" instead of blocking or reversing the sale.
 
 **What's deliberately left out.** Cognito's own login/token-refresh flow, network firewalls and WAF rules, a service mesh, and rate limiting beyond the waiting room's own admission control are all out of scope. IDs below are plain auto-increment `BIGINT`s rather than UUIDs, and every "email" field is a denormalized snapshot taken from the Cognito JWT at write time, so no service has to call another just to render a name.
 
@@ -632,7 +640,81 @@ classDiagram
 | POST | `/tickets/validate` | Scan & validate a QR code | Helper / Organiser |
 | GET | `/tickets/search` | Manual lookup by name / email / order ID | Helper / Organiser |
 | GET | `/events/{eventId}/checkin-stats` | Live check-in count | Organiser / Helper |
-| *(async)* | SQS `order-events` → `OrderPaid` | Consumer: issues ticket(s), sends email | System |
+| *(async)* | SQS `order-events` → `OrderPaid` | Consumer: issues ticket(s), then calls Notification Service | System |
+
+---
+
+## Notification Service — `notification` schema
+
+Sends the post-purchase confirmation email (event details, order total, and a QR code per ticket) once Ticket Issuance has created the tickets for a paid order. It owns no inventory or money state — just the record of what was sent, to whom, and whether it succeeded — and delivers over Gmail SMTP via nodemailer.
+
+### Data model
+
+```mermaid
+erDiagram
+    EMAIL_NOTIFICATIONS {
+        bigint notification_id PK
+        bigint order_id "logical ref -> checkout.orders, no FK, unique"
+        bigint event_id "logical ref -> event_inventory.events, no FK"
+        varchar customer_sub "Cognito sub"
+        varchar customer_email
+        enum type "ORDER_CONFIRMATION"
+        enum status "PENDING, SENT, FAILED"
+        varchar subject
+        text error_message "nullable"
+        datetime sent_at "nullable"
+        datetime created_at
+    }
+```
+
+`order_id` carries a unique key, not just an index — it's what makes the send idempotent. A second call for the same order updates the existing row (`ON DUPLICATE KEY UPDATE`) instead of inserting a duplicate.
+
+### Domain model
+
+```mermaid
+classDiagram
+    class EmailNotification {
+        +Long notificationId
+        +Long orderId
+        +Long eventId
+        +String customerSub
+        +String customerEmail
+        +NotificationType type
+        +NotificationStatus status
+        +String subject
+        +String errorMessage
+        +DateTime sentAt
+        +DateTime createdAt
+    }
+    class NotificationType {
+        <<enumeration>>
+        ORDER_CONFIRMATION
+    }
+    class NotificationStatus {
+        <<enumeration>>
+        PENDING
+        SENT
+        FAILED
+    }
+    class NotificationService {
+        <<service>>
+        +sendOrderConfirmation(dto) EmailNotification
+        +getNotification(orderId) EmailNotification
+    }
+
+    NotificationService ..> EmailNotification : manages
+```
+
+### API endpoints
+
+| Method | Path | Description | Caller |
+|---|---|---|---|
+| POST | `/notifications/order-confirmation` | Render QR codes and send the booking confirmation email; idempotent on `orderId` — returns the existing record unchanged if already `SENT` | Ticket Issuance & Validation Service |
+| GET | `/notifications/{orderId}` | Look up the send outcome for an order | Ticket Issuance & Validation Service / internal |
+
+### Schema installation
+
+Run `06-add-notification-schema.sql` once, in addition to `02-init-create-tables-index.sql`; it creates the `notification` database and the `email_notifications` table (`CREATE ... IF NOT EXISTS`, so it's safe to re-run). Afterward, re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new schema too.
 
 ---
 
@@ -648,6 +730,7 @@ sequenceDiagram
     participant CPS as Checkout & Payment Service
     participant SQS as SQS: order-events
     participant TIV as Ticket Issuance & Validation Service
+    participant NS as Notification Service
 
     C->>WR: POST /queue/join
     WR-->>C: queue position (polls /queue/me)
@@ -667,8 +750,11 @@ sequenceDiagram
     CPS-->>C: order PAID
     CPS->>SQS: publish OrderPaid  (async — decouples issuance)
     SQS-->>TIV: deliver OrderPaid
-    TIV->>TIV: issue ticket(s), generate QR
-    TIV-->>C: email ticket with QR (async)
+    TIV->>TIV: issue ticket(s), generate QR tokens
+    TIV->>NS: POST /notifications/order-confirmation (sync, idempotent on orderId)
+    NS->>NS: render QR images, send via Gmail SMTP
+    NS-->>TIV: notification record (SENT or FAILED)
+    NS-->>C: confirmation email with QR codes (async delivery)
 ```
 
 A Tier 1 purchase runs the same path with the Waiting Room steps skipped entirely — `POST /inventory/hold` succeeds immediately since there's no queue to admit from.
