@@ -126,6 +126,15 @@ async function isEventOrganiser(eventId: number, sub: string): Promise<boolean> 
   return rows.length > 0;
 }
 
+async function provisionSeats(connection: mysql.PoolConnection, eventId: number, inventoryItemId: number, totalSeats: number): Promise<void> {
+  for (let seatNumber = 1; seatNumber <= totalSeats; seatNumber += 1) {
+    await connection.execute(
+      'INSERT INTO seats (event_id, inventory_item_id, seat_label) VALUES (?, ?, ?)',
+      [eventId, inventoryItemId, `S${String(seatNumber).padStart(3, '0')}`],
+    );
+  }
+}
+
 async function requireEventOrganiser(req: express.Request, res: express.Response, eventId: number): Promise<Caller | null> {
   const caller = await authenticate(req);
   if (!caller) {
@@ -240,10 +249,11 @@ app.post('/events', async (req, res) => {
       [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.tier],
     );
     if (input.priceCents !== null) {
-      await connection.execute(
+      const [inventory] = await connection.execute<mysql.ResultSetHeader>(
         'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
         [result.insertId, 'General Admission', input.totalSeats, input.priceCents],
       );
+      if (input.tier === 'TIER2_SEATED') await provisionSeats(connection, result.insertId, inventory.insertId, input.totalSeats);
     }
     await connection.execute(
       "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",

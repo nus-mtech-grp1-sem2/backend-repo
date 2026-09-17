@@ -49,6 +49,8 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
       SCANNER_SESSION_TTL_MIN: ${SCANNER_SESSION_TTL_MIN:-480}
       TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
@@ -83,6 +85,8 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
 
   order:
     <<: *service

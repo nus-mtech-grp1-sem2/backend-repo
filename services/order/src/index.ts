@@ -118,8 +118,8 @@ app.post('/orders', async (req, res) => {
   if (!input) {
     return res.status(422).json({ error: 'invalid_order' });
   }
-  if (input.seatIds && input.seatIds.length > 0) return res.status(501).json({ error: 'reserved_seating_unavailable' });
   const { eventId, quantity } = input;
+  if (input.seatIds && input.seatIds.length !== quantity) return res.status(422).json({ error: 'seat_quantity_mismatch' });
 
   const connection = await database.getConnection();
   try {
@@ -141,6 +141,19 @@ app.post('/orders', async (req, res) => {
       await connection.rollback();
       return res.status(409).json({ error: 'insufficient_inventory' });
     }
+    let selectedSeats: mysql.RowDataPacket[] = [];
+    if (input.seatIds?.length) {
+      const placeholders = input.seatIds.map(() => '?').join(',');
+      const [seats] = await connection.query<mysql.RowDataPacket[]>(
+        `SELECT seat_id, seat_label FROM event_inventory.seats WHERE event_id = ? AND seat_id IN (${placeholders}) AND status = 'AVAILABLE' FOR UPDATE`,
+        [eventId, ...input.seatIds],
+      );
+      if (seats.length !== input.seatIds.length) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'seat_unavailable' });
+      }
+      selectedSeats = seats;
+    }
     await connection.execute('UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty + ? WHERE inventory_item_id = ?', [quantity, item.inventory_item_id]);
     const [hold] = await connection.execute<mysql.ResultSetHeader>(
       `INSERT INTO event_inventory.inventory_holds
@@ -151,9 +164,20 @@ app.post('/orders', async (req, res) => {
     const [order] = await connection.execute<mysql.ResultSetHeader>(
       `INSERT INTO orders (event_id, customer_sub, customer_email, customer_name, hold_id, status, total_amount_cents)
        VALUES (?, ?, ?, ?, ?, 'PENDING', ?)`, [eventId, caller.sub, caller.email, caller.name, hold.insertId, total]);
-    await connection.execute(
-      `INSERT INTO order_items (order_id, inventory_item_id, description, quantity, unit_price_cents)
-       VALUES (?, ?, ?, ?, ?)`, [order.insertId, item.inventory_item_id, item.title, quantity, item.price_cents]);
+    if (selectedSeats.length) {
+      for (const seat of selectedSeats) {
+        await connection.execute(
+          `INSERT INTO order_items (order_id, inventory_item_id, seat_id, description, quantity, unit_price_cents)
+           VALUES (?, ?, ?, ?, 1, ?)`,
+          [order.insertId, item.inventory_item_id, seat.seat_id, `${item.title} - ${seat.seat_label}`, item.price_cents],
+        );
+      }
+      await connection.query(`UPDATE event_inventory.seats SET status = 'HELD', hold_id = ? WHERE seat_id IN (${selectedSeats.map(() => '?').join(',')})`, [hold.insertId, ...selectedSeats.map((seat) => seat.seat_id)]);
+    } else {
+      await connection.execute(
+        `INSERT INTO order_items (order_id, inventory_item_id, description, quantity, unit_price_cents)
+         VALUES (?, ?, ?, ?, ?)`, [order.insertId, item.inventory_item_id, item.title, quantity, item.price_cents]);
+    }
     await connection.execute('UPDATE event_inventory.inventory_holds SET order_id = ? WHERE hold_id = ?', [order.insertId, hold.insertId]);
     await connection.commit();
     return res.status(201).json({ order: { order_id: order.insertId, total_amount_cents: total } });
@@ -198,6 +222,7 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     await connection.execute("UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId]);
     await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'CONFIRMED' WHERE hold_id = ?", [order.hold_id]);
     await connection.execute('UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty - ?, sold_qty = sold_qty + ? WHERE inventory_item_id = ?', [hold.quantity, hold.quantity, hold.inventory_item_id]);
+    await connection.execute("UPDATE event_inventory.seats SET status = 'SOLD', hold_id = NULL WHERE hold_id = ?", [order.hold_id]);
     await connection.commit();
     if (!(await issueTickets(orderId))) {
       console.error('ticket issuance failed after payment', { orderId });
