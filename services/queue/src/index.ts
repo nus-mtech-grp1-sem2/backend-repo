@@ -106,9 +106,16 @@ function admissionBatchSize(totalTickets: number): number {
   return Math.max(1, Math.ceil(totalTickets * 0.1));
 }
 
-function availableAdmissionSlots(totalTickets: number, activeBuyers: number, availableTickets: number): number {
+function buyerCapacity(totalTickets: number, configuredBuyers: number | null): number {
+  if (configuredBuyers !== null && Number.isSafeInteger(configuredBuyers) && configuredBuyers > 0) {
+    return Math.min(configuredBuyers, Math.max(0, Math.floor(totalTickets)));
+  }
+  return admissionBatchSize(totalTickets);
+}
+
+function availableAdmissionSlots(totalTickets: number, configuredBuyers: number | null, activeBuyers: number, availableTickets: number): number {
   return Math.max(0, Math.min(
-    admissionBatchSize(totalTickets) - Math.max(0, Math.floor(activeBuyers)),
+    buyerCapacity(totalTickets, configuredBuyers) - Math.max(0, Math.floor(activeBuyers)),
     Math.max(0, Math.floor(availableTickets)),
   ));
 }
@@ -234,14 +241,14 @@ app.get('/events/:eventId/queue', async (req, res) => {
     [eventId],
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT s.queue_session_id, s.event_id, s.opens_at, ev.total_seats,
+    `SELECT s.queue_session_id, s.event_id, s.opens_at, ev.total_seats, ev.available_buyers,
       s.admission_interval_sec, s.status,
       SUM(CASE WHEN e.status = 'WAITING' THEN 1 ELSE 0 END) AS waiting_count
      FROM queue_sessions s
      INNER JOIN event_inventory.events ev ON ev.event_id = s.event_id
      LEFT JOIN queue_entries e ON e.queue_session_id = s.queue_session_id
      WHERE s.event_id = ?
-     GROUP BY s.queue_session_id, s.event_id, s.opens_at, ev.total_seats,
+     GROUP BY s.queue_session_id, s.event_id, s.opens_at, ev.total_seats, ev.available_buyers,
        s.admission_interval_sec, s.status
      LIMIT 1`,
     [eventId],
@@ -252,7 +259,10 @@ app.get('/events/:eventId/queue', async (req, res) => {
     queue: {
       eventId: Number(session.event_id),
       opensAt: session.opens_at,
-      admissionBatchSize: admissionBatchSize(Number(session.total_seats)),
+      admissionBatchSize: buyerCapacity(
+        Number(session.total_seats),
+        session.available_buyers === null ? null : Number(session.available_buyers),
+      ),
       admissionIntervalSec: Number(session.admission_interval_sec),
       status: session.status,
       waitingCount: Number(session.waiting_count ?? 0),
@@ -272,7 +282,7 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
     return res.status(403).json({ error: 'event_organiser_required' });
   }
   const [events] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT tier, total_seats FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    'SELECT tier, total_seats, available_buyers FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
   );
   if (!events[0]) 
     return res.status(404).json({ error: 'event_not_found' });
@@ -285,7 +295,10 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
      VALUES (?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE opens_at = VALUES(opens_at), admission_batch_size = VALUES(admission_batch_size),
        admission_interval_sec = VALUES(admission_interval_sec), status = VALUES(status)`,
-    [eventId, input.opensAt, admissionBatchSize(Number(events[0].total_seats)), input.admissionIntervalSec, status],
+    [eventId, input.opensAt, buyerCapacity(
+      Number(events[0].total_seats),
+      events[0].available_buyers === null ? null : Number(events[0].available_buyers),
+    ), input.admissionIntervalSec, status],
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
     'SELECT queue_session_id, event_id, opens_at, admission_batch_size, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1',
@@ -445,7 +458,7 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
       throw new QueueApiError(429, 'admission_interval_not_elapsed');
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT e.status, e.tier, e.total_seats,
+      `SELECT e.status, e.tier, e.total_seats, e.available_buyers,
         CASE WHEN e.tier = 'TIER2_SEATED'
           THEN (SELECT COUNT(*) FROM event_inventory.seats WHERE event_id = e.event_id AND status = 'AVAILABLE')
           ELSE (SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) FROM event_inventory.inventory_items WHERE event_id = e.event_id)
@@ -474,7 +487,12 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
     );
     const activeBuyers = Number(counts[0]?.active_buyers ?? 0);
     const remainingBeforeAdmission = Number(counts[0]?.remaining ?? 0);
-    const limit = availableAdmissionSlots(Number(event.total_seats), activeBuyers, availableTickets);
+    const limit = availableAdmissionSlots(
+      Number(event.total_seats),
+      event.available_buyers === null ? null : Number(event.available_buyers),
+      activeBuyers,
+      availableTickets,
+    );
     if (limit <= 0) {
       await connection.commit();
       return { admitted: 0, remaining: remainingBeforeAdmission, reason: 'capacity_reached' };
@@ -602,6 +620,7 @@ export {
   admissionDue,
   availableAdmissionSlots,
   app,
+  buyerCapacity,
   customerAdmittedEvent,
   parseConfig,
   positiveInteger,

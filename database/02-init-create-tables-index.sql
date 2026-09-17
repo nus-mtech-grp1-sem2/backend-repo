@@ -18,10 +18,14 @@ CREATE TABLE events (
   venue VARCHAR(255) NOT NULL,
   starts_at DATETIME NOT NULL,
   total_seats INT UNSIGNED NOT NULL,
+  available_buyers INT UNSIGNED NULL,
   tier ENUM('TIER1_GA', 'TIER2_SEATED') NOT NULL,
   status ENUM('DRAFT', 'PUBLISHED', 'CANCELLED') NOT NULL DEFAULT 'DRAFT',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT chk_events_available_buyers CHECK (
+    available_buyers IS NULL OR (available_buyers >= 1 AND available_buyers <= total_seats)
+  ),
   INDEX idx_events_status_starts_at (status, starts_at),
   INDEX idx_events_organiser_sub (organiser_sub)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -6,6 +6,7 @@ import {
   admissionDue,
   app,
   availableAdmissionSlots,
+  buyerCapacity,
   customerAdmittedEvent,
   parseConfig,
   positiveInteger,
@@ -24,14 +25,24 @@ describe('capacity-based admission batches', () => {
     assert.equal(admissionBatchSize(1), 1);
   });
 
+  it('uses the configured buyer capacity instead of the percentage default', () => {
+    assert.equal(buyerCapacity(100, 7), 7);
+    assert.equal(buyerCapacity(10, 2), 2);
+  });
+
+  it('defaults to ten percent when buyer capacity is not configured', () => {
+    assert.equal(buyerCapacity(100, null), 10);
+    assert.equal(buyerCapacity(5, null), 1);
+  });
+
   it('does not admit another customer while every buying slot is occupied', () => {
-    assert.equal(availableAdmissionSlots(10, 1, 10), 0);
-    assert.equal(availableAdmissionSlots(100, 10, 90), 0);
+    assert.equal(availableAdmissionSlots(10, 1, 1, 10), 0);
+    assert.equal(availableAdmissionSlots(100, 10, 10, 90), 0);
   });
 
   it('reopens capacity when an active buyer finishes', () => {
-    assert.equal(availableAdmissionSlots(10, 0, 9), 1);
-    assert.equal(availableAdmissionSlots(100, 8, 92), 2);
+    assert.equal(availableAdmissionSlots(10, 1, 0, 9), 1);
+    assert.equal(availableAdmissionSlots(100, 10, 8, 92), 2);
   });
 });
 

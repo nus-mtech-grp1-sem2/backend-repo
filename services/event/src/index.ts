@@ -52,6 +52,7 @@ interface EventInput {
   readonly venue?: unknown;
   readonly startsAt?: unknown;
   readonly totalSeats?: unknown;
+  readonly availableBuyers?: unknown;
   readonly tier?: unknown;
   readonly price?: unknown;
   readonly priceCents?: unknown;
@@ -93,17 +94,21 @@ function parsePriceCents(price: unknown): number | null {
   return Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
 }
 
-function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; totalSeats: number; tier: string; priceCents: number | null } | null {
+function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; totalSeats: number; availableBuyers: number | null; tier: string; priceCents: number | null } | null {
   const title = typeof input.title === 'string' ? input.title.trim() : '';
   const description = typeof input.description === 'string' ? input.description.trim() || null : null;
   const venue = typeof input.venue === 'string' ? input.venue.trim() : '';
   const startsAt = typeof input.startsAt === 'string' ? input.startsAt.trim() : '';
   const totalSeats = typeof input.totalSeats === 'number' ? input.totalSeats : Number.NaN;
+  const availableBuyers = input.availableBuyers === undefined || input.availableBuyers === null || input.availableBuyers === ''
+    ? null
+    : typeof input.availableBuyers === 'number' ? input.availableBuyers : Number.NaN;
   const tier = input.tier === 'TIER1_GA' || input.tier === 'TIER2_SEATED' ? input.tier : '';
   const priceCents = input.price === undefined ? (input.priceCents === undefined ? null : typeof input.priceCents === 'number' ? input.priceCents : Number.NaN) : parsePriceCents(input.price);
   if (!title || title.length > 255 || !venue || venue.length > 255 || !Number.isSafeInteger(totalSeats) || totalSeats < 1 || totalSeats > 1_000_000 || !tier || Number.isNaN(Date.parse(startsAt))) return null;
+  if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > totalSeats)) return null;
   if (priceCents !== null && (!Number.isSafeInteger(priceCents) || priceCents < 0 || priceCents > 100_000_000)) return null;
-  return { title, description, venue, startsAt, totalSeats, tier, priceCents };
+  return { title, description, venue, startsAt, totalSeats, availableBuyers, tier, priceCents };
 }
 
 async function ownsEvent(eventId: number, sub: string): Promise<boolean> {
@@ -231,7 +236,7 @@ app.get('/events/manage', async (req, res) => {
   const caller = await requireAuthenticated(req, res);
   if (!caller) return;
   const [events] = await database.query(
-    "SELECT events.event_id, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.tier, events.status, inventory.price_cents, COALESCE(inventory.remaining_qty, 0) AS remaining_qty, COALESCE(inventory.total_qty, 0) AS inventory_total_qty FROM events INNER JOIN event_team_memberships ON event_team_memberships.event_id = events.event_id LEFT JOIN (SELECT event_id, MIN(price_cents) AS price_cents, SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty, SUM(total_qty) AS total_qty FROM inventory_items GROUP BY event_id) AS inventory ON inventory.event_id = events.event_id WHERE event_team_memberships.user_sub = ? AND event_team_memberships.role = 'ORGANISER' AND event_team_memberships.invite_status = 'ACCEPTED' ORDER BY events.starts_at ASC",
+    "SELECT events.event_id, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.available_buyers, events.tier, events.status, inventory.price_cents, COALESCE(inventory.remaining_qty, 0) AS remaining_qty, COALESCE(inventory.total_qty, 0) AS inventory_total_qty FROM events INNER JOIN event_team_memberships ON event_team_memberships.event_id = events.event_id LEFT JOIN (SELECT event_id, MIN(price_cents) AS price_cents, SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty, SUM(total_qty) AS total_qty FROM inventory_items GROUP BY event_id) AS inventory ON inventory.event_id = events.event_id WHERE event_team_memberships.user_sub = ? AND event_team_memberships.role = 'ORGANISER' AND event_team_memberships.invite_status = 'ACCEPTED' ORDER BY events.starts_at ASC",
     [caller.sub],
   );
   res.json({ events });
@@ -242,7 +247,7 @@ app.get('/events/:eventId', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   const [rows] = await database.query<mysql.RowDataPacket[]>(
-    "SELECT events.event_id, events.organiser_sub, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.tier, events.status, inventory_items.price_cents FROM events LEFT JOIN inventory_items ON inventory_items.event_id = events.event_id AND inventory_items.name = 'General Admission' WHERE events.event_id = ? LIMIT 1",
+    "SELECT events.event_id, events.organiser_sub, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.available_buyers, events.tier, events.status, inventory_items.price_cents FROM events LEFT JOIN inventory_items ON inventory_items.event_id = events.event_id AND inventory_items.name = 'General Admission' WHERE events.event_id = ? LIMIT 1",
     [eventId],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });
@@ -296,8 +301,8 @@ app.post('/events', async (req, res) => {
   try {
     await connection.beginTransaction();
     const [result] = await connection.execute<mysql.ResultSetHeader>(
-      'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, tier) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.tier],
+      'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, available_buyers, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier],
     );
     if (input.priceCents !== null) {
       await connection.execute(
@@ -332,8 +337,8 @@ app.put('/events/:eventId', async (req, res) => {
   try {
     await connection.beginTransaction();
     await connection.execute(
-      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, tier = ? WHERE event_id = ?',
-      [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.tier, eventId],
+      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
+      [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier, eventId],
     );
     if (input.priceCents !== null) {
       const [items] = await connection.query<mysql.RowDataPacket[]>(

@@ -107,6 +107,7 @@ erDiagram
         varchar venue
         datetime starts_at
         int total_seats "event capacity"
+        int available_buyers "nullable; concurrent queue buyers"
         enum tier "TIER1_GA, TIER2_SEATED"
         enum status "DRAFT, PUBLISHED, CANCELLED"
         datetime created_at
@@ -168,6 +169,7 @@ classDiagram
         +String venue
         +DateTime startsAt
         +int totalSeats
+        +Integer availableBuyers
         +Tier tier
         +EventStatus status
         +publish()
@@ -317,8 +319,9 @@ For an existing schema created before these fields were introduced, run the migr
 1. `03-add-event-team-invitations.sql` adds `invite_status`, nullable `responded_at`, and the `(user_sub, invite_status)` lookup index used for a user's inbox.
 2. `04-add-event-total-seats.sql` adds the required event-capacity column with a default of `1` for existing rows.
 3. `06-add-queue-order-idempotency.sql` adds the unique event-session and hold-order keys used to make queue configuration and order creation idempotent. It fails without deleting data if legacy duplicates need manual review first.
+4. `07-add-event-available-buyers.sql` adds the nullable concurrent-buyer limit and its capacity check. A `NULL` value keeps the default of 10% of total seats, rounded up with a minimum of one.
 
-`total_seats` is configured capacity on `events`; `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
+`total_seats` is configured capacity on `events`; `available_buyers` limits how many customers may be admitted or checking out concurrently. `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
 
 On AWS, `05-grant-onestage-app-schema-access.sql` is also required once per MySQL instance — the ECS-hosted MySQL container only grants the app user access to its own `onestage` database on creation, not to any of the four schemas above. See `infrastructure/sql/QUICK-START.md`.
 
@@ -423,7 +426,7 @@ classDiagram
 
 `admit-next` publishes a `CustomerAdmitted` version 1 message containing `queueEntryId`, `eventId`, `customerSub`, `occurredAt`, and `tokenExpiresAt`. Every ticketed event shares the same queue; consumers use `eventId` and `customerSub` to route the notification. The admission token is deliberately omitted and must be retrieved through the authenticated `/queue/me` API. SQS delivery is at least once, so consumers must handle duplicate messages safely.
 
-The Queue Service runs the same admission operation automatically for every open session that has waiting customers. It admits the first batch immediately, then respects `admission_interval_sec` between later batches. The internal `admit-next` endpoint remains available for operational retries and manual testing.
+The Queue Service runs the same admission operation automatically for every open session that has waiting customers. It admits customers until the event's `available_buyers` concurrency limit is occupied, then respects `admission_interval_sec` before filling reopened slots. If that event field is `NULL`, capacity defaults to 10% of total seats, rounded up with a minimum of one. The internal `admit-next` endpoint remains available for operational retries and manual testing.
 
 An admitted customer has `ADMISSION_TOKEN_TTL_SEC` seconds to begin checkout. The Queue Service continuously changes overdue `ADMITTED` entries to `EXPIRED` and removes their admission token. Customers can also surrender either a waiting place or an unused admission through `DELETE /events/{eventId}/queue/me`.
 
