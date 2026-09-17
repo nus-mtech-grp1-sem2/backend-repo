@@ -278,7 +278,8 @@ app.get('/attendees', async (req, res) => {
   if (!caller) return;
   try {
     const [rows] = await database.query<mysql.RowDataPacket[]>(
-      `SELECT o.customer_email AS email, o.customer_email AS buyer,
+            `SELECT o.customer_email AS email,
+              COALESCE(NULLIF(o.customer_name, ''), o.customer_email) AS buyer,
               oi.description AS ticketType, oi.quantity, o.created_at AS orderedAt
          FROM orders o INNER JOIN order_items oi ON oi.order_id = o.order_id
         WHERE o.event_id = ? AND o.status = 'PAID' ORDER BY o.created_at DESC`, [eventId]);
