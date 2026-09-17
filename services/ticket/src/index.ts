@@ -43,6 +43,7 @@ type Outcome = 'VALID' | 'ALREADY_USED' | 'INVALID' | 'WRONG_EVENT';
 interface Caller {
   readonly sub: string;
   readonly email: string;
+  readonly name: string;
 }
 
 interface ScannerSession {
@@ -67,7 +68,9 @@ async function authenticate(req: express.Request): Promise<Caller | null> {
   if (!token || !verifier) return null;
   try {
     const claims = await verifier.verify(token);
-    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '' };
+    const firstName = typeof claims.given_name === 'string' ? claims.given_name : '';
+    const lastName = typeof claims.family_name === 'string' ? claims.family_name : '';
+    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '', name: `${firstName} ${lastName}`.trim() };
   } catch {
     return null;
   }
@@ -218,7 +221,7 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
   try {
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
-      "SELECT order_id, event_id, customer_sub, customer_email, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
+      "SELECT order_id, event_id, customer_sub, customer_email, customer_name, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
       [orderId],
     );
     const order = orders[0];
@@ -239,9 +242,9 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
       for (let unit = existingCount; unit < quantity; unit += 1) {
         await connection.execute(
           `INSERT INTO ticketing.tickets
-             (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
-          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, item.seat_id ?? null, createQrToken()],
+             (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
+          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, order.customer_name ?? '', item.seat_id ?? null, createQrToken()],
         );
         issued += 1;
       }
@@ -399,12 +402,12 @@ app.get('/tickets/search', async (req, res) => {
   if (!query) return res.status(422).json({ error: 'invalid_search_query' });
   const orderId = parseTicketId(query);
   const [tickets] = await database.query(
-    `SELECT ticket_id, customer_email, seat_id, status, checked_in_at
+    `SELECT ticket_id, customer_name, customer_email, seat_id, status, checked_in_at
      FROM tickets
      WHERE event_id = ?
-       AND (customer_email LIKE ? OR (? IS NOT NULL AND order_id = ?))
+       AND (customer_name LIKE ? OR customer_email LIKE ? OR (? IS NOT NULL AND order_id = ?))
      ORDER BY ticket_id LIMIT 20`,
-    [session.eventId, `${query}%`, orderId, orderId],
+    [session.eventId, `%${query}%`, `${query}%`, orderId, orderId],
   );
   console.log(JSON.stringify({ svc: SERVICE, route: '/tickets/search', eventId: session.eventId, sub: session.sub, durationMs: Date.now() - startedAt }));
   return res.json({ tickets });

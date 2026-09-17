@@ -28,7 +28,7 @@ const database = mysql.createPool({
   ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
 });
 
-interface Caller { readonly sub: string; readonly email: string; }
+interface Caller { readonly sub: string; readonly email: string; readonly name: string; }
 
 export interface OrderInput {
   readonly eventId: number;
@@ -48,7 +48,9 @@ async function authenticate(req: express.Request): Promise<Caller | null> {
   if (!token || !verifier) return null;
   try {
     const claims = await verifier.verify(token);
-    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '' };
+    const firstName = typeof claims.given_name === 'string' ? claims.given_name : '';
+    const lastName = typeof claims.family_name === 'string' ? claims.family_name : '';
+    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '', name: `${firstName} ${lastName}`.trim() };
   } catch { return null; }
 }
 
@@ -72,6 +74,10 @@ export function shouldIssueTickets(orderStatus: string): boolean {
   return orderStatus === 'PENDING' || orderStatus === 'PAID';
 }
 
+export function parsePositiveId(value: unknown): number | null {
+  return positiveInteger(value);
+}
+
 async function issueTickets(orderId: number): Promise<boolean> {
   const response = await fetch(`${TICKET_SERVICE_URL}/internal/orders/${orderId}/issue-tickets`, {
     method: 'POST',
@@ -83,6 +89,24 @@ async function issueTickets(orderId: number): Promise<boolean> {
 async function requireCaller(req: express.Request, res: express.Response): Promise<Caller | null> {
   const caller = await authenticate(req);
   if (!caller) res.status(401).json({ error: 'unauthenticated' });
+  return caller;
+}
+
+async function isEventOrganiser(sub: string, eventId: number): Promise<boolean> {
+  const [members] = await database.query<mysql.RowDataPacket[]>(
+    "SELECT membership_id FROM event_inventory.event_team_memberships WHERE event_id = ? AND user_sub = ? AND role = 'ORGANISER' AND invite_status = 'ACCEPTED' LIMIT 1",
+    [eventId, sub],
+  );
+  return members.length > 0;
+}
+
+async function requireEventOrganiser(req: express.Request, res: express.Response, eventId: number): Promise<Caller | null> {
+  const caller = await requireCaller(req, res);
+  if (!caller) return null;
+  if (!(await isEventOrganiser(caller.sub, eventId))) {
+    res.status(403).json({ error: 'event_organiser_required' });
+    return null;
+  }
   return caller;
 }
 
@@ -125,8 +149,8 @@ app.post('/orders', async (req, res) => {
       [eventId, item.inventory_item_id, caller.sub, quantity]);
     const total = Number(item.price_cents) * quantity;
     const [order] = await connection.execute<mysql.ResultSetHeader>(
-      `INSERT INTO orders (event_id, customer_sub, customer_email, hold_id, status, total_amount_cents)
-       VALUES (?, ?, ?, ?, 'PENDING', ?)`, [eventId, caller.sub, caller.email, hold.insertId, total]);
+      `INSERT INTO orders (event_id, customer_sub, customer_email, customer_name, hold_id, status, total_amount_cents)
+       VALUES (?, ?, ?, ?, ?, 'PENDING', ?)`, [eventId, caller.sub, caller.email, caller.name, hold.insertId, total]);
     await connection.execute(
       `INSERT INTO order_items (order_id, inventory_item_id, description, quantity, unit_price_cents)
        VALUES (?, ?, ?, ?, ?)`, [order.insertId, item.inventory_item_id, item.title, quantity, item.price_cents]);
@@ -185,6 +209,103 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     console.error('payment failed', error);
     return res.status(502).json({ error: 'payment_failed' });
   } finally { connection.release(); }
+});
+
+app.get('/orders/:orderId', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  const orderId = parsePositiveId(req.params.orderId);
+  if (!orderId) return res.status(400).json({ error: 'invalid_order' });
+  try {
+    const [orders] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT order_id, event_id, customer_email, status, total_amount_cents, currency, created_at, paid_at
+         FROM orders WHERE order_id = ? AND customer_sub = ? LIMIT 1`, [orderId, caller.sub]);
+    if (!orders[0]) return res.status(404).json({ error: 'order_not_found' });
+    const [items] = await database.query<mysql.RowDataPacket[]>(
+      'SELECT order_item_id, inventory_item_id, seat_id, description, quantity, unit_price_cents FROM order_items WHERE order_id = ? ORDER BY order_item_id', [orderId]);
+    return res.json({ order: { ...orders[0], items } });
+  } catch (error) {
+    console.error('order lookup failed', error);
+    return res.status(502).json({ error: 'order_query_failed' });
+  }
+});
+
+app.get('/customers/me/orders', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  try {
+    const [orders] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT o.order_id, o.event_id, e.title AS event_title, e.venue, e.starts_at,
+              o.customer_email, o.status, o.total_amount_cents, o.currency, o.created_at, o.paid_at
+         FROM orders o INNER JOIN event_inventory.events e ON e.event_id = o.event_id
+        WHERE o.customer_sub = ? ORDER BY o.created_at DESC`, [caller.sub]);
+    return res.json({ orders });
+  } catch (error) {
+    console.error('customer orders lookup failed', error);
+    return res.status(502).json({ error: 'orders_query_failed' });
+  }
+});
+
+app.get('/sales', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  try {
+    const [rows] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT e.event_id AS eventId, e.title AS event, e.venue,
+              COALESCE(SUM(CASE WHEN o.status = 'PAID' THEN oi.quantity ELSE 0 END), 0) AS sold,
+              e.total_seats AS capacity,
+              COALESCE(SUM(CASE WHEN o.status = 'PAID' THEN o.total_amount_cents ELSE 0 END), 0) / 100 AS revenue,
+              CASE WHEN e.total_seats <= COALESCE(SUM(CASE WHEN o.status = 'PAID' THEN oi.quantity ELSE 0 END), 0) THEN 'Sold out'
+                   WHEN e.total_seats - COALESCE(SUM(CASE WHEN o.status = 'PAID' THEN oi.quantity ELSE 0 END), 0) < 10 THEN 'Few left'
+                   ELSE 'On sale' END AS status
+         FROM event_inventory.events e
+         INNER JOIN event_inventory.event_team_memberships m ON m.event_id = e.event_id
+          AND m.user_sub = ? AND m.role = 'ORGANISER' AND m.invite_status = 'ACCEPTED'
+         LEFT JOIN orders o ON o.event_id = e.event_id
+         LEFT JOIN order_items oi ON oi.order_id = o.order_id
+        GROUP BY e.event_id, e.title, e.venue, e.total_seats ORDER BY e.starts_at`, [caller.sub]);
+    return res.json(rows);
+  } catch (error) {
+    console.error('sales lookup failed', error);
+    return res.status(502).json({ error: 'sales_query_failed' });
+  }
+});
+
+app.get('/attendees', async (req, res) => {
+  const eventId = parsePositiveId(req.query.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  const caller = await requireEventOrganiser(req, res, eventId);
+  if (!caller) return;
+  try {
+    const [rows] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT o.customer_email AS email, o.customer_email AS buyer,
+              oi.description AS ticketType, oi.quantity, o.created_at AS orderedAt
+         FROM orders o INNER JOIN order_items oi ON oi.order_id = o.order_id
+        WHERE o.event_id = ? AND o.status = 'PAID' ORDER BY o.created_at DESC`, [eventId]);
+    return res.json(rows);
+  } catch (error) {
+    console.error('attendees lookup failed', error);
+    return res.status(502).json({ error: 'attendees_query_failed' });
+  }
+});
+
+app.get('/events/:eventId/orders/summary', async (req, res) => {
+  const eventId = parsePositiveId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  const caller = await requireEventOrganiser(req, res, eventId);
+  if (!caller) return;
+  try {
+    const [rows] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT COUNT(DISTINCT o.order_id) AS orders,
+              COALESCE(SUM(oi.quantity), 0) AS tickets,
+              COALESCE(SUM(o.total_amount_cents), 0) AS revenueCents
+         FROM orders o INNER JOIN order_items oi ON oi.order_id = o.order_id
+        WHERE o.event_id = ? AND o.status = 'PAID'`, [eventId]);
+    return res.json({ eventId, ...rows[0] });
+  } catch (error) {
+    console.error('order summary lookup failed', error);
+    return res.status(502).json({ error: 'order_summary_failed' });
+  }
 });
 
 if (process.env.NODE_ENV !== 'test') {

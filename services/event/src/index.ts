@@ -208,6 +208,23 @@ app.get('/events/:eventId', async (req, res) => {
   res.json({ event: rows[0] });
 });
 
+app.get('/events/:eventId/seats', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = Number(req.params.eventId);
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  try {
+    const [seats] = await database.query<mysql.RowDataPacket[]>(
+      `SELECT seat_id, seat_label, status
+         FROM seats WHERE event_id = ? ORDER BY seat_id`,
+      [eventId],
+    );
+    return res.json({ seats });
+  } catch (error) {
+    console.error('failed to list event seats', error);
+    return res.status(502).json({ error: 'event_seats_failed' });
+  }
+});
+
 app.post('/events', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const caller = await requireAuthenticated(req, res);
