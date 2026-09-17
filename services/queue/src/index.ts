@@ -20,6 +20,7 @@ interface Caller { readonly sub: string; }
 const app = express(); app.disable('x-powered-by'); app.use(express.json());
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: SERVICE }));
 function positive(value: unknown): number | null { const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN; return Number.isSafeInteger(n) && n > 0 ? n : null; }
+function mysqlDateTime(value: string): string { return value.replace('T', ' ').replace(/\.\d{3}Z$/, '').replace('Z', ''); }
 async function caller(req: express.Request, res: express.Response): Promise<Caller | null> {
   const raw = req.header('authorization') ?? ''; const token = raw.startsWith('Bearer ') ? raw.slice(7) : '';
   if (!token || !verifier) { res.status(401).json({ error: 'unauthenticated' }); return null; }
@@ -38,9 +39,10 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
   const user = await requireOrganiser(req, res, eventId); if (!user) return;
   const opensAt = typeof req.body?.opensAt === 'string' ? req.body.opensAt : ''; const batch = positive(req.body?.admissionBatchSize); const interval = positive(req.body?.admissionIntervalSec);
   if (!opensAt || Number.isNaN(Date.parse(opensAt)) || !batch || !interval) return res.status(422).json({ error: 'invalid_queue_config' });
+  const databaseOpensAt = mysqlDateTime(opensAt);
   const [existing] = await database.query<mysql.RowDataPacket[]>('SELECT queue_session_id FROM queue_sessions WHERE event_id = ? ORDER BY queue_session_id DESC LIMIT 1', [eventId]);
-  if (existing[0]) await database.execute("UPDATE queue_sessions SET opens_at = ?, admission_batch_size = ?, admission_interval_sec = ?, status = 'OPEN' WHERE queue_session_id = ?", [opensAt, batch, interval, existing[0].queue_session_id]);
-  else await database.execute("INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status) VALUES (?, ?, ?, ?, 'OPEN')", [eventId, opensAt, batch, interval]);
+  if (existing[0]) await database.execute("UPDATE queue_sessions SET opens_at = ?, admission_batch_size = ?, admission_interval_sec = ?, status = 'OPEN' WHERE queue_session_id = ?", [databaseOpensAt, batch, interval, existing[0].queue_session_id]);
+  else await database.execute("INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status) VALUES (?, ?, ?, ?, 'OPEN')", [eventId, databaseOpensAt, batch, interval]);
   return res.status(204).end();
 });
 
