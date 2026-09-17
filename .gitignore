@@ -10,6 +10,7 @@ build/
 .env
 .env.*
 !.env.example
+variables.env
 
 # SQL initialization files with real credentials
 infrastructure/sql/*-init-*.sql

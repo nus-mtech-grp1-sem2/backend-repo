@@ -5,6 +5,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "docker compose -f infrastructure/docker-compose.yml --env-file .env up --build",
+    "dev:aws": "docker compose -f infrastructure/docker-compose.yml --env-file variables.env up --build",
+    "db:check": "node scripts/check-db.mjs",
     "down": "docker compose -f infrastructure/docker-compose.yml --env-file .env down",
     "logs": "docker compose -f infrastructure/docker-compose.yml --env-file .env logs -f",
     "db:aws-ip": "powershell -ExecutionPolicy Bypass -File scripts/mysql-public-ip.ps1",
