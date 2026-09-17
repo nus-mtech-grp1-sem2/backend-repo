@@ -34,6 +34,7 @@ export interface OrderInput {
   readonly eventId: number;
   readonly quantity: number;
   readonly seatIds?: readonly number[];
+  readonly admissionToken?: string;
 }
 
 const app = express();
@@ -67,7 +68,9 @@ export function parseOrderInput(body: unknown): OrderInput | null {
   if (!eventId || !quantity || quantity > 10) return null;
   if (input.seatIds !== undefined && !Array.isArray(input.seatIds)) return null;
   if (Array.isArray(input.seatIds) && input.seatIds.some((seatId) => typeof seatId !== 'number' || !positiveInteger(seatId))) return null;
-  return { eventId, quantity, ...(Array.isArray(input.seatIds) ? { seatIds: input.seatIds as number[] } : {}) };
+  const admissionToken = (body as { admissionToken?: unknown }).admissionToken;
+  if (admissionToken !== undefined && (typeof admissionToken !== 'string' || admissionToken.length < 1 || admissionToken.length > 255)) return null;
+  return { eventId, quantity, ...(Array.isArray(input.seatIds) ? { seatIds: input.seatIds as number[] } : {}), ...(typeof admissionToken === 'string' ? { admissionToken } : {}) };
 }
 
 export function shouldIssueTickets(orderStatus: string): boolean {
@@ -135,6 +138,24 @@ app.post('/orders', async (req, res) => {
     if (!item || item.status !== 'PUBLISHED') {
       await connection.rollback();
       return res.status(404).json({ error: 'event_not_found' });
+    }
+    const [eventRows] = await connection.query<mysql.RowDataPacket[]>('SELECT tier FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId]);
+    if (eventRows[0]?.tier === 'TIER2_SEATED') {
+      if (!input.admissionToken) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'queue_admission_required' });
+      }
+      const [admissions] = await connection.query<mysql.RowDataPacket[]>(
+        `SELECT qe.queue_entry_id FROM queue.queue_entries qe
+         JOIN queue.queue_sessions qs ON qs.queue_session_id = qe.queue_session_id
+        WHERE qs.event_id = ? AND qe.customer_sub = ? AND qe.status = 'ADMITTED'
+          AND qe.admission_token = ? AND qe.token_expires_at > CURRENT_TIMESTAMP LIMIT 1`,
+        [eventId, caller.sub, input.admissionToken],
+      );
+      if (!admissions[0]) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'invalid_queue_admission' });
+      }
     }
     const remaining = Number(item.total_qty) - Number(item.reserved_qty) - Number(item.sold_qty);
     if (remaining < quantity) {

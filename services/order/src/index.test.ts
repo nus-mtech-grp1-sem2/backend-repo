@@ -24,4 +24,12 @@ describe('order input', () => {
     assert.equal(parsePositiveId(0), null);
     assert.equal(parsePositiveId('not-an-id'), null);
   });
+
+  it('accepts an optional queue admission token', () => {
+    assert.deepEqual(parseOrderInput({ eventId: 1, quantity: 1, admissionToken: 'queue-token' }), {
+      eventId: 1,
+      quantity: 1,
+      admissionToken: 'queue-token',
+    });
+  });
 });
