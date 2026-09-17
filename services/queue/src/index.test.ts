@@ -2,13 +2,38 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
 import {
+  admissionBatchSize,
   admissionDue,
   app,
+  availableAdmissionSlots,
   customerAdmittedEvent,
   parseConfig,
   positiveInteger,
   publishCustomerAdmitted,
 } from './index.js';
+
+describe('capacity-based admission batches', () => {
+  it('admits ten percent of the original ticket capacity, rounded up', () => {
+    assert.equal(admissionBatchSize(100), 10);
+    assert.equal(admissionBatchSize(11), 2);
+  });
+
+  it('always admits at least one customer for a positive-capacity event', () => {
+    assert.equal(admissionBatchSize(10), 1);
+    assert.equal(admissionBatchSize(5), 1);
+    assert.equal(admissionBatchSize(1), 1);
+  });
+
+  it('does not admit another customer while every buying slot is occupied', () => {
+    assert.equal(availableAdmissionSlots(10, 1, 10), 0);
+    assert.equal(availableAdmissionSlots(100, 10, 90), 0);
+  });
+
+  it('reopens capacity when an active buyer finishes', () => {
+    assert.equal(availableAdmissionSlots(10, 0, 9), 1);
+    assert.equal(availableAdmissionSlots(100, 8, 92), 2);
+  });
+});
 
 describe('queue input validation', () => {
   it('accepts a bounded queue configuration', () => {

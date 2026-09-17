@@ -290,8 +290,10 @@ app.post('/orders', async (req, res) => {
     if (event.tier === 'TIER2_SEATED' && input.admissionToken) {
       await connection.execute(
         `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
-         SET e.status = 'IN_CHECKOUT' WHERE s.event_id = ? AND e.customer_sub = ? AND e.admission_token = ?`,
-        [eventId, caller.sub, input.admissionToken],
+         SET e.status = 'IN_CHECKOUT',
+           e.token_expires_at = (SELECT h.expires_at FROM event_inventory.inventory_holds h WHERE h.hold_id = ?)
+         WHERE s.event_id = ? AND e.customer_sub = ? AND e.admission_token = ?`,
+        [holdId, eventId, caller.sub, input.admissionToken],
       );
     }
     await connection.commit();
@@ -327,12 +329,18 @@ app.post('/orders/:orderId/payment', async (req, res) => {
   try {
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT order_id, customer_sub, hold_id, total_amount_cents, status FROM orders WHERE order_id = ? LIMIT 1 FOR UPDATE', [orderId],
+      'SELECT order_id, event_id, customer_sub, hold_id, total_amount_cents, status FROM orders WHERE order_id = ? LIMIT 1 FOR UPDATE', [orderId],
     );
     const order = orders[0];
     if (!order) { await connection.rollback(); return res.status(404).json({ error: 'order_not_found' }); }
     if (order.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'order_owner_required' }); }
     if (order.status === 'PAID') {
+      await connection.execute(
+        `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+         SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
+         WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
+        [order.event_id, order.customer_sub],
+      );
       await connection.commit();
       const paid = await loadOrder(orderId);
       await publishOrderPaid(paid!);
@@ -359,7 +367,8 @@ app.post('/orders/:orderId/payment', async (req, res) => {
       if (failedHold) {
         await connection.execute(
           `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
-           SET e.status = 'LEFT', e.admission_token = NULL WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
+           SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
+           WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
           [failedHold.event_id, failedHold.customer_sub],
         );
       }
@@ -388,6 +397,12 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'CONFIRMED' WHERE hold_id = ?", [hold.hold_id]);
     await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'CAPTURED', ?)", [orderId, token, order.total_amount_cents]);
     await connection.execute("UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId]);
+    await connection.execute(
+      `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+       SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
+       WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
+      [order.event_id, order.customer_sub],
+    );
     await connection.commit();
     const paid = await loadOrder(orderId);
     await publishOrderPaid(paid!);

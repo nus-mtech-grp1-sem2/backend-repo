@@ -68,7 +68,7 @@ type BatchSender = (input: SendMessageBatchCommandInput) => Promise<BatchSendRes
 interface AdmissionResult {
   readonly admitted: number;
   readonly remaining: number | null;
-  readonly reason?: 'sold_out';
+  readonly reason?: 'sold_out' | 'capacity_reached';
   readonly eventsPublished?: number;
   readonly eventPublication?: 'published' | 'disabled' | 'failed' | 'not_required';
 }
@@ -99,6 +99,18 @@ const ADMISSION_SCHEDULER_POLL_MS = Math.min(
 function admissionDue(lastAdmittedAt: Date | string | null, intervalSec: number, now = Date.now()): boolean {
   if (!lastAdmittedAt) return true;
   return new Date(lastAdmittedAt).getTime() + intervalSec * 1_000 <= now;
+}
+
+function admissionBatchSize(totalTickets: number): number {
+  if (!Number.isFinite(totalTickets) || totalTickets <= 0) return 0;
+  return Math.max(1, Math.ceil(totalTickets * 0.1));
+}
+
+function availableAdmissionSlots(totalTickets: number, activeBuyers: number, availableTickets: number): number {
+  return Math.max(0, Math.min(
+    admissionBatchSize(totalTickets) - Math.max(0, Math.floor(activeBuyers)),
+    Math.max(0, Math.floor(availableTickets)),
+  ));
 }
 
 function customerAdmittedEvent(input: {
@@ -222,13 +234,14 @@ app.get('/events/:eventId/queue', async (req, res) => {
     [eventId],
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT s.queue_session_id, s.event_id, s.opens_at, s.admission_batch_size,
+    `SELECT s.queue_session_id, s.event_id, s.opens_at, ev.total_seats,
       s.admission_interval_sec, s.status,
       SUM(CASE WHEN e.status = 'WAITING' THEN 1 ELSE 0 END) AS waiting_count
      FROM queue_sessions s
+     INNER JOIN event_inventory.events ev ON ev.event_id = s.event_id
      LEFT JOIN queue_entries e ON e.queue_session_id = s.queue_session_id
      WHERE s.event_id = ?
-     GROUP BY s.queue_session_id, s.event_id, s.opens_at, s.admission_batch_size,
+     GROUP BY s.queue_session_id, s.event_id, s.opens_at, ev.total_seats,
        s.admission_interval_sec, s.status
      LIMIT 1`,
     [eventId],
@@ -239,7 +252,7 @@ app.get('/events/:eventId/queue', async (req, res) => {
     queue: {
       eventId: Number(session.event_id),
       opensAt: session.opens_at,
-      admissionBatchSize: Number(session.admission_batch_size),
+      admissionBatchSize: admissionBatchSize(Number(session.total_seats)),
       admissionIntervalSec: Number(session.admission_interval_sec),
       status: session.status,
       waitingCount: Number(session.waiting_count ?? 0),
@@ -259,7 +272,7 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
     return res.status(403).json({ error: 'event_organiser_required' });
   }
   const [events] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT tier FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    'SELECT tier, total_seats FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
   );
   if (!events[0]) 
     return res.status(404).json({ error: 'event_not_found' });
@@ -272,7 +285,7 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
      VALUES (?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE opens_at = VALUES(opens_at), admission_batch_size = VALUES(admission_batch_size),
        admission_interval_sec = VALUES(admission_interval_sec), status = VALUES(status)`,
-    [eventId, input.opensAt, input.admissionBatchSize, input.admissionIntervalSec, status],
+    [eventId, input.opensAt, admissionBatchSize(Number(events[0].total_seats)), input.admissionIntervalSec, status],
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
     'SELECT queue_session_id, event_id, opens_at, admission_batch_size, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1',
@@ -309,7 +322,8 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
       [session.queue_session_id, caller.sub],
     );
     let entry = existingRows[0];
-    const tokenExpired = entry?.status === 'ADMITTED' && entry.token_expires_at && new Date(entry.token_expires_at).getTime() <= Date.now();
+    const tokenExpired = entry && ['ADMITTED', 'IN_CHECKOUT'].includes(entry.status) &&
+      entry.token_expires_at && new Date(entry.token_expires_at).getTime() <= Date.now();
     if (entry && !tokenExpired && ['WAITING', 'ADMITTED', 'IN_CHECKOUT'].includes(entry.status)) {
       await connection.commit();
       return res.json(queueEntryResponse(entry));
@@ -350,7 +364,8 @@ app.get('/events/:eventId/queue/me', async (req, res) => {
   await database.execute(
     `UPDATE queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
      SET e.status = 'EXPIRED', e.admission_token = NULL
-     WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'ADMITTED' AND e.token_expires_at <= CURRENT_TIMESTAMP`,
+     WHERE s.event_id = ? AND e.customer_sub = ? AND e.status IN ('ADMITTED', 'IN_CHECKOUT')
+       AND e.token_expires_at <= CURRENT_TIMESTAMP`,
     [eventId, caller.sub],
   );
   const [rows] = await database.query<QueueEntryRow[]>(
@@ -417,7 +432,7 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
   try {
     await connection.beginTransaction();
     const [sessions] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT queue_session_id, admission_batch_size, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
+      'SELECT queue_session_id, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
     const session = sessions[0];
     if (!session) throw new QueueApiError(404, 'queue_not_configured');
@@ -430,7 +445,7 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
       throw new QueueApiError(429, 'admission_interval_not_elapsed');
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT e.status, e.tier,
+      `SELECT e.status, e.tier, e.total_seats,
         CASE WHEN e.tier = 'TIER2_SEATED'
           THEN (SELECT COUNT(*) FROM event_inventory.seats WHERE event_id = e.event_id AND status = 'AVAILABLE')
           ELSE (SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) FROM event_inventory.inventory_items WHERE event_id = e.event_id)
@@ -439,11 +454,30 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
     );
     const event = availabilityRows[0];
     if (!event || event.status !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
-    const limit = Math.min(Number(session.admission_batch_size), Number(event.available_qty ?? 0));
-    if (limit <= 0) {
+    const availableTickets = Number(event.available_qty ?? 0);
+    if (availableTickets <= 0) {
       await connection.execute("UPDATE queue_sessions SET status = 'DRAINED' WHERE queue_session_id = ?", [session.queue_session_id]);
       await connection.commit();
       return { admitted: 0, remaining: null, reason: 'sold_out' };
+    }
+    await connection.execute(
+      `UPDATE queue_entries SET status = 'EXPIRED', admission_token = NULL
+       WHERE queue_session_id = ? AND status IN ('ADMITTED', 'IN_CHECKOUT')
+         AND token_expires_at <= CURRENT_TIMESTAMP`,
+      [session.queue_session_id],
+    );
+    const [counts] = await connection.query<mysql.RowDataPacket[]>(
+      `SELECT SUM(status IN ('ADMITTED', 'IN_CHECKOUT')) AS active_buyers,
+        SUM(status = 'WAITING') AS remaining
+       FROM queue_entries WHERE queue_session_id = ?`,
+      [session.queue_session_id],
+    );
+    const activeBuyers = Number(counts[0]?.active_buyers ?? 0);
+    const remainingBeforeAdmission = Number(counts[0]?.remaining ?? 0);
+    const limit = availableAdmissionSlots(Number(event.total_seats), activeBuyers, availableTickets);
+    if (limit <= 0) {
+      await connection.commit();
+      return { admitted: 0, remaining: remainingBeforeAdmission, reason: 'capacity_reached' };
     }
     const [waiting] = await connection.query<WaitingEntryRow[]>(
       `SELECT queue_entry_id, customer_sub, position, status, admission_token, token_expires_at FROM queue_entries
@@ -491,7 +525,7 @@ async function runAdmissionSweep(now = Date.now()): Promise<number> {
   await database.execute(
     `UPDATE queue_entries
      SET status = 'EXPIRED', admission_token = NULL
-     WHERE status = 'ADMITTED' AND token_expires_at <= CURRENT_TIMESTAMP`,
+     WHERE status IN ('ADMITTED', 'IN_CHECKOUT') AND token_expires_at <= CURRENT_TIMESTAMP`,
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
     `SELECT s.event_id, s.admission_interval_sec, MAX(e.admitted_at) AS last_admitted_at
@@ -564,7 +598,9 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 export {
+  admissionBatchSize,
   admissionDue,
+  availableAdmissionSlots,
   app,
   customerAdmittedEvent,
   parseConfig,
