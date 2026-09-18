@@ -17,6 +17,10 @@ const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
 const SCANNER_SESSION_SECRET = process.env.SCANNER_SESSION_SECRET ?? '';
 const SCANNER_SESSION_TTL_MIN = Number(process.env.SCANNER_SESSION_TTL_MIN ?? 480);
 const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
+const TICKET_RECONCILIATION_INTERVAL_MS = Math.max(
+  10_000,
+  Number(process.env.TICKET_RECONCILIATION_INTERVAL_MS ?? 60_000) || 60_000,
+);
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
@@ -351,9 +355,18 @@ export function createQrToken(): string {
   return randomBytes(32).toString('base64url');
 }
 
+export async function closeTicketDatabase(): Promise<void> {
+  await database.end();
+}
+
 export async function issueTicketsForOrder(orderId: number): Promise<{ issued: number; alreadyIssued: boolean }> {
   const connection = await database.getConnection();
+  const lockName = `ticket-order-${orderId}`;
+  let lockAcquired = false;
   try {
+    const [locks] = await connection.query<mysql.RowDataPacket[]>('SELECT GET_LOCK(?, 10) AS acquired', [lockName]);
+    lockAcquired = Number(locks[0]?.acquired) === 1;
+    if (!lockAcquired) throw new Error('ticket_order_lock_timeout');
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
       "SELECT order_id, event_id, customer_sub, customer_email, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
@@ -390,7 +403,76 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
     await connection.rollback();
     throw error;
   } finally {
+    if (lockAcquired) {
+      try {
+        await connection.query('SELECT RELEASE_LOCK(?)', [lockName]);
+      } catch (error) {
+        console.error('ticket order lock release failed', { orderId, error });
+      }
+    }
     connection.release();
+  }
+}
+
+async function findPaidOrdersMissingTickets(limit: number): Promise<readonly number[]> {
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT o.order_id, MIN(o.paid_at) AS paid_at
+       FROM checkout.orders o
+       JOIN checkout.order_items oi ON oi.order_id = o.order_id
+       LEFT JOIN (
+         SELECT order_item_id, COUNT(*) AS issued_count
+           FROM ticketing.tickets
+          GROUP BY order_item_id
+       ) issued ON issued.order_item_id = oi.order_item_id
+      WHERE o.status = 'PAID'
+        AND COALESCE(issued.issued_count, 0) < oi.quantity
+      GROUP BY o.order_id
+      ORDER BY paid_at ASC
+      LIMIT ?`,
+    [limit],
+  );
+  return rows.map((row) => Number(row.order_id)).filter((orderId) => Number.isSafeInteger(orderId) && orderId > 0);
+}
+
+interface ReconciliationResult {
+  readonly matchedOrders: number;
+  readonly issuedTickets: number;
+  readonly failedOrders: number;
+}
+
+export async function reconcilePaidOrders(
+  limit = 50,
+  findMissing: (limit: number) => Promise<readonly number[]> = findPaidOrdersMissingTickets,
+  issue: (orderId: number) => Promise<{ issued: number; alreadyIssued: boolean }> = issueTicketsForOrder,
+): Promise<ReconciliationResult> {
+  const orderIds = await findMissing(limit);
+  let issuedTickets = 0;
+  let failedOrders = 0;
+  for (const orderId of orderIds) {
+    try {
+      issuedTickets += (await issue(orderId)).issued;
+    } catch (error) {
+      failedOrders += 1;
+      console.error('paid order ticket reconciliation failed', { orderId, error });
+    }
+  }
+  return { matchedOrders: orderIds.length, issuedTickets, failedOrders };
+}
+
+let reconciliationRunning = false;
+
+async function runPaidOrderReconciliation(): Promise<void> {
+  if (reconciliationRunning || !databaseConfigured) return;
+  reconciliationRunning = true;
+  try {
+    const result = await reconcilePaidOrders();
+    if (result.matchedOrders > 0 || result.failedOrders > 0) {
+      console.log(JSON.stringify({ svc: SERVICE, operation: 'ticket-reconciliation', ...result }));
+    }
+  } catch (error) {
+    console.error('paid order ticket reconciliation sweep failed', error);
+  } finally {
+    reconciliationRunning = false;
   }
 }
 
@@ -719,6 +801,12 @@ if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, HOST, () => {
     console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
     void consumeOrderPaidEvents();
+    void runPaidOrderReconciliation();
+    const reconciliationTimer = setInterval(
+      () => void runPaidOrderReconciliation(),
+      TICKET_RECONCILIATION_INTERVAL_MS,
+    );
+    reconciliationTimer.unref();
   });
 }
 

@@ -162,13 +162,13 @@ function attribute(attributes: readonly AttributeType[] | undefined, name: strin
   return attributes?.find((item) => item.Name === name)?.Value ?? '';
 }
 
-async function ensureSeatedInventory(connection: mysql.PoolConnection, eventId: number): Promise<void> {
+async function ensureEventInventory(connection: mysql.PoolConnection, eventId: number): Promise<void> {
   const [events] = await connection.query<mysql.RowDataPacket[]>(
     'SELECT total_seats, tier FROM events WHERE event_id = ? LIMIT 1 FOR UPDATE',
     [eventId],
   );
   const event = events[0];
-  if (!event || event.tier !== 'TIER2_SEATED') return;
+  if (!event) return;
 
   const [items] = await connection.query<mysql.RowDataPacket[]>(
     "SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1",
@@ -182,6 +182,8 @@ async function ensureSeatedInventory(connection: mysql.PoolConnection, eventId: 
     );
     inventoryItemId = item.insertId;
   }
+
+  if (event.tier !== 'TIER2_SEATED') return;
 
   const [existing] = await connection.query<mysql.RowDataPacket[]>(
     'SELECT seat_label FROM seats WHERE event_id = ? ORDER BY seat_id',
@@ -305,7 +307,7 @@ app.get('/events/:eventId/seats', async (req, res) => {
       await connection.rollback();
       return res.status(409).json({ error: 'seat_map_not_available' });
     }
-    await ensureSeatedInventory(connection, eventId);
+    await ensureEventInventory(connection, eventId);
     const [seats] = await connection.query(
       'SELECT seat_id, seat_label, status FROM seats WHERE event_id = ? ORDER BY seat_id',
       [eventId],
@@ -335,13 +337,11 @@ app.post('/events', async (req, res) => {
       'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, available_buyers, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier],
     );
-    if (input.priceCents !== null || input.tier === 'TIER2_SEATED') {
-      const [inventory] = await connection.execute<mysql.ResultSetHeader>(
-        'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
-        [result.insertId, 'General Admission', input.totalSeats, input.priceCents ?? 0],
-      );
-      if (input.tier === 'TIER2_SEATED') await provisionSeats(connection, result.insertId, inventory.insertId, input.totalSeats);
-    }
+    const [inventory] = await connection.execute<mysql.ResultSetHeader>(
+      'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
+      [result.insertId, 'General Admission', input.totalSeats, input.priceCents ?? 0],
+    );
+    if (input.tier === 'TIER2_SEATED') await provisionSeats(connection, result.insertId, inventory.insertId, input.totalSeats);
     await connection.execute(
       "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",
       [result.insertId, caller.sub, caller.sub],
@@ -372,22 +372,25 @@ app.put('/events/:eventId', async (req, res) => {
       'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
       [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier, eventId],
     );
-    if (input.priceCents !== null) {
-      const [items] = await connection.query<mysql.RowDataPacket[]>(
-        "SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1",
-        [eventId],
+    const [items] = await connection.query<mysql.RowDataPacket[]>(
+      "SELECT inventory_item_id, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1 FOR UPDATE",
+      [eventId],
+    );
+    if (items.length === 0) {
+      await connection.execute(
+        "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, ?)",
+        [eventId, input.totalSeats, input.priceCents ?? 0],
       );
-      if (items.length === 0) {
-        await connection.execute(
-          "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, ?)",
-          [eventId, input.totalSeats, input.priceCents],
-        );
-      } else {
-        await connection.execute(
-          'UPDATE inventory_items SET price_cents = ? WHERE inventory_item_id = ?',
-          [input.priceCents, items[0]!.inventory_item_id],
-        );
+    } else {
+      const item = items[0]!;
+      if (Number(item.reserved_qty) + Number(item.sold_qty) > input.totalSeats) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'total_seats_below_allocated' });
       }
+      await connection.execute(
+        'UPDATE inventory_items SET total_qty = ?, price_cents = COALESCE(?, price_cents), version = version + 1 WHERE inventory_item_id = ?',
+        [input.totalSeats, input.priceCents, item.inventory_item_id],
+      );
     }
     await connection.commit();
   } catch (error) {
@@ -409,7 +412,7 @@ app.post('/events/:eventId/publish', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
-    await ensureSeatedInventory(connection, eventId);
+    await ensureEventInventory(connection, eventId);
     await connection.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [eventId]);
     await connection.commit();
     res.status(204).end();
