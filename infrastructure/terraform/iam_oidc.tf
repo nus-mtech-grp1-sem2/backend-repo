@@ -137,12 +137,8 @@ resource "aws_iam_role" "github_deploy_frontend" {
 
 data "aws_iam_policy_document" "github_deploy_frontend_permissions" {
   statement {
-    sid    = "S3Sync"
-    effect = "Allow"
-    # tfsec:ignore:aws-iam-no-policy-wildcards -- the /* suffix is required
-    # for S3 object-level actions (PutObject/DeleteObject apply to objects,
-    # not the bucket itself); this is scoped to exactly one named bucket,
-    # not a wildcarded set of resources.
+    sid       = "S3Sync"
+    effect    = "Allow"
     actions   = ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
     resources = [aws_s3_bucket.frontend.arn, "${aws_s3_bucket.frontend.arn}/*"]
   }
