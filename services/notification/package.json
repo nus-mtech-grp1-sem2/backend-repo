@@ -3,15 +3,25 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "dev": "tsx watch src/index.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
-  "description": "",
+  "description": "Sends the post-purchase confirmation email (event details, booking id, QR code) once an order is paid.",
   "dependencies": {
-    "express": "^5.2.1"
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mysql2": "^3.23.3",
+    "nodemailer": "^10.0.10",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.1.4",
+    "vitest": "^3.2.4"
   }
 }

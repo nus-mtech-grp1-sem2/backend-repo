@@ -1,0 +1,89 @@
+# Local validation only. This ignored override replaces the shared AWS database.
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: onestage-local-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../database/02-init-create-tables-index.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+      - ../database/06-ticket-checkin-attempts.sql:/docker-entrypoint-initdb.d/06-ticket-checkin-attempts.sql:ro
+      - ../database/07-add-customer-name.sql:/docker-entrypoint-initdb.d/07-add-customer-name.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  event:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: event_inventory
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+
+  inventory:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: event_inventory
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+
+  queue:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: queue
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+
+  order:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: checkout
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+
+  ticket:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ticketing
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+
+volumes:
+  mysql-data:
+    driver: local

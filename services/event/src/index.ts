@@ -36,7 +36,11 @@ const database = mysql.createPool({
   database: process.env.DB_NAME ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
-  connectionLimit: 4,
+  waitForConnections: true,
+  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT ?? 4),
+  connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10000),
+  enableKeepAlive: true,
+  idleTimeout: Number(process.env.DB_IDLE_TIMEOUT ?? 60000),
   ...(process.env.DB_SSL === 'false'
     ? {}
     : { ssl: { rejectUnauthorized: false } }),
@@ -125,6 +129,15 @@ async function isEventOrganiser(eventId: number, sub: string): Promise<boolean> 
     [eventId, sub],
   );
   return rows.length > 0;
+}
+
+async function provisionSeats(connection: mysql.PoolConnection, eventId: number, inventoryItemId: number, totalSeats: number): Promise<void> {
+  for (let seatNumber = 1; seatNumber <= totalSeats; seatNumber += 1) {
+    await connection.execute(
+      'INSERT INTO seats (event_id, inventory_item_id, seat_label) VALUES (?, ?, ?)',
+      [eventId, inventoryItemId, `S${String(seatNumber).padStart(3, '0')}`],
+    );
+  }
 }
 
 async function requireEventOrganiser(req: express.Request, res: express.Response, eventId: number): Promise<Caller | null> {
@@ -304,11 +317,12 @@ app.post('/events', async (req, res) => {
       'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, available_buyers, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier],
     );
-    if (input.priceCents !== null) {
-      await connection.execute(
+    if (input.priceCents !== null || input.tier === 'TIER2_SEATED') {
+      const [inventory] = await connection.execute<mysql.ResultSetHeader>(
         'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
-        [result.insertId, 'General Admission', input.totalSeats, input.priceCents],
+        [result.insertId, 'General Admission', input.totalSeats, input.priceCents ?? 0],
       );
+      if (input.tier === 'TIER2_SEATED') await provisionSeats(connection, result.insertId, inventory.insertId, input.totalSeats);
     }
     await connection.execute(
       "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",

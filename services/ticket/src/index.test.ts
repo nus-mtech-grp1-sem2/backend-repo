@@ -68,3 +68,31 @@ describe('paid order event validation', () => {
     }), null);
   });
 });
+describe('EH-01 scanner sessions', () => {
+  it('rejects malformed or expired scanner tokens', () => {
+    assert.equal(verifyScannerSession('not-a-jwt'), null);
+  });
+
+  it('does not accept a token with the wrong shape', () => {
+    assert.equal(verifyScannerSession('header.payload.signature.extra'), null);
+  });
+});
+
+describe('EH-05 manual lookup query validation', () => {
+  it('requires at least three characters and accepts only q', () => {
+    assert.equal(parseSearchQuery({ q: 'pr' }), null);
+    assert.equal(parseSearchQuery({ q: 'priya' }), 'priya');
+    assert.equal(parseSearchQuery({ q: 'priya', eventId: '2' }), null);
+  });
+});
+
+describe('CU-07 ticket issuance primitives', () => {
+  it('creates URL-safe random QR tokens', () => {
+    const first = createQrToken();
+    const second = createQrToken();
+    assert.equal(Buffer.from(first, 'base64url').length, 32);
+    assert.equal(Buffer.from(second, 'base64url').length, 32);
+    assert.notEqual(first, second);
+    assert.match(first, /^[A-Za-z0-9_-]+$/);
+  });
+});

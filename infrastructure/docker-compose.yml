@@ -51,6 +51,8 @@ services:
       DB_SSL: ${DB_SSL:-false}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      SCANNER_SESSION_TTL_MIN: ${SCANNER_SESSION_TTL_MIN:-480}
+      TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
       AWS_REGION: ${AWS_REGION:-ap-southeast-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
@@ -138,6 +140,8 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      SCANNER_SESSION_SECRET: ${SCANNER_SESSION_SECRET:?SCANNER_SESSION_SECRET not set in variables.env}
+      TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
       ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}
@@ -154,6 +158,16 @@ services:
     environment:
       SERVICE: notification
       PORT: 3006
+      # The notification service owns the notification schema.
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_NOTIFICATION:-notification}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
+      # Gmail SMTP sender for booking confirmation emails.
+      SMTP_USER: ${SMTP_USER:-onestagecontacts@gmail.com}
+      SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:?SMTP_APP_PASSWORD not set in .env}
 
   auth:
     <<: *service
