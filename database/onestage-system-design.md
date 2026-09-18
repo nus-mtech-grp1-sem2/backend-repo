@@ -310,6 +310,7 @@ For an existing schema created before these fields were introduced, run the migr
 
 1. `03-add-event-team-invitations.sql` adds `invite_status`, nullable `responded_at`, and the `(user_sub, invite_status)` lookup index used for a user's inbox.
 2. `04-add-event-total-seats.sql` adds the required event-capacity column with a default of `1` for existing rows.
+3. `06-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, so the Event & Inventory Service can generate and render a structured seat grid per section.
 
 `total_seats` is configured capacity on `events`; `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
 

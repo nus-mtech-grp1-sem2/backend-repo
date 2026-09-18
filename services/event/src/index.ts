@@ -17,7 +17,9 @@ const cognito = new CognitoIdentityProviderClient({});
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json());
+// Higher than the default 100kb so a base64-encoded event photo (~5MB binary
+// -> ~6.7MB base64) fits; every route still validates its own field sizes.
+app.use(express.json({ limit: '8mb' }));
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: SERVICE });
@@ -188,7 +190,9 @@ app.get('/events/:eventId', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   const [rows] = await database.query<mysql.RowDataPacket[]>(
-    "SELECT events.event_id, events.organiser_sub, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.tier, events.status, inventory_items.price_cents FROM events LEFT JOIN inventory_items ON inventory_items.event_id = events.event_id AND inventory_items.name = 'General Admission' WHERE events.event_id = ? LIMIT 1",
+    "SELECT events.event_id, events.organiser_sub, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.tier, events.status, inventory.price_cents " +
+      'FROM events LEFT JOIN (SELECT event_id, MIN(price_cents) AS price_cents FROM inventory_items GROUP BY event_id) AS inventory ON inventory.event_id = events.event_id ' +
+      'WHERE events.event_id = ? LIMIT 1',
     [eventId],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });
@@ -209,12 +213,6 @@ app.post('/events', async (req, res) => {
       'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, tier) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.tier],
     );
-    if (input.priceCents !== null) {
-      await connection.execute(
-        'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
-        [result.insertId, 'General Admission', input.totalSeats, input.priceCents],
-      );
-    }
     await connection.execute(
       "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",
       [result.insertId, caller.sub, caller.sub],
@@ -245,23 +243,6 @@ app.put('/events/:eventId', async (req, res) => {
       'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, tier = ? WHERE event_id = ?',
       [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.tier, eventId],
     );
-    if (input.priceCents !== null) {
-      const [items] = await connection.query<mysql.RowDataPacket[]>(
-        "SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1",
-        [eventId],
-      );
-      if (items.length === 0) {
-        await connection.execute(
-          "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, ?)",
-          [eventId, input.totalSeats, input.priceCents],
-        );
-      } else {
-        await connection.execute(
-          'UPDATE inventory_items SET price_cents = ? WHERE inventory_item_id = ?',
-          [input.priceCents, items[0]!.inventory_item_id],
-        );
-      }
-    }
     await connection.commit();
   } catch (error) {
     await connection.rollback();
@@ -271,6 +252,59 @@ app.put('/events/:eventId', async (req, res) => {
     connection.release();
   }
   res.status(204).end();
+});
+
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+interface EventImageInput {
+  readonly imageBase64?: unknown;
+  readonly mimeType?: unknown;
+}
+
+app.put('/events/:eventId/image', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const body = req.body as EventImageInput;
+  const mimeType = typeof body.mimeType === 'string' ? body.mimeType : '';
+  const base64 = typeof body.imageBase64 === 'string' ? body.imageBase64.replace(/^data:[^;]+;base64,/, '') : '';
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(mimeType) || !base64) return res.status(400).json({ error: 'invalid_image' });
+
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch {
+    return res.status(400).json({ error: 'invalid_image' });
+  }
+  if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) return res.status(400).json({ error: 'image_too_large' });
+
+  try {
+    await database.execute('UPDATE events SET image_mime_type = ?, image_data = ? WHERE event_id = ?', [mimeType, buffer, eventId]);
+    res.status(204).end();
+  } catch (error) {
+    console.error('failed to save event image', error);
+    res.status(502).json({ error: 'image_save_failed' });
+  }
+});
+
+app.get('/events/:eventId/image', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT image_mime_type, image_data FROM events WHERE event_id = ? LIMIT 1',
+    [eventId],
+  );
+  const row = rows[0];
+  if (!row || !row.image_data || !row.image_mime_type) return res.status(404).json({ error: 'image_not_set' });
+  res.set('Content-Type', row.image_mime_type as string);
+  res.set('Cache-Control', 'private, max-age=300');
+  res.send(row.image_data as Buffer);
 });
 
 app.post('/events/:eventId/publish', async (req, res) => {
@@ -356,6 +390,30 @@ app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
   if (member.role === 'ORGANISER' && event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
   if (member.role === 'HELPER' && !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
   await database.execute('DELETE FROM event_team_memberships WHERE event_id = ? AND user_sub = ?', [eventId, memberSub]);
+  res.status(204).end();
+});
+
+app.patch('/events/:eventId/team-members/:userSub', async (req, res) => {
+  const eventId = validEventId(req.params.eventId);
+  const caller = await requireAuthenticated(req, res);
+  const memberSub = req.params.userSub;
+  const body = req.body as { role?: unknown };
+  const role = body.role === 'ORGANISER' || body.role === 'HELPER' ? body.role : '';
+  if (!caller) return;
+  if (!eventId || !memberSub || !role || memberSub === caller.sub) return res.status(400).json({ error: 'invalid_role_change' });
+  const [events] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT organiser_sub FROM events WHERE event_id = ? LIMIT 1',
+    [eventId],
+  );
+  if (events.length === 0) return res.status(404).json({ error: 'event_not_found' });
+  const event = events[0]!;
+  if (event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
+  if (memberSub === event.organiser_sub) return res.status(400).json({ error: 'cannot_change_owner_role' });
+  const [result] = await database.execute<mysql.ResultSetHeader>(
+    'UPDATE event_team_memberships SET role = ? WHERE event_id = ? AND user_sub = ?',
+    [role, eventId, memberSub],
+  );
+  if (result.affectedRows === 0) return res.status(404).json({ error: 'team_member_not_found' });
   res.status(204).end();
 });
 

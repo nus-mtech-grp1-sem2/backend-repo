@@ -36,10 +36,12 @@ Run these once, in order, only when upgrading a schema created before the fields
 ```powershell
 Get-Content ..\..\database\03-add-event-team-invitations.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\04-add-event-total-seats.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\06-add-inventory-layout.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 ```
 
 - `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
 - `04-add-event-total-seats.sql` adds the event capacity column with a default of `1` for existing events.
+- `06-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, used by the organiser inventory/seat-map configuration UI.
 
 Do not rerun an upgrade after it has been applied: MySQL will reject a duplicate column or index.
 
