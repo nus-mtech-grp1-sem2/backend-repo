@@ -156,6 +156,10 @@ app.post('/orders', async (req, res) => {
         await connection.rollback();
         return res.status(409).json({ error: 'invalid_queue_admission' });
       }
+      await connection.execute(
+        "UPDATE queue.queue_entries SET status = 'IN_CHECKOUT' WHERE queue_entry_id = ? AND status = 'ADMITTED'",
+        [admissions[0].queue_entry_id],
+      );
     }
     const remaining = Number(item.total_qty) - Number(item.reserved_qty) - Number(item.sold_qty);
     if (remaining < quantity) {
