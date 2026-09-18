@@ -32,6 +32,11 @@ export const ticketingPool = mysql.createPool({
   database: process.env.DB_NAME_TICKETING ?? '',
 });
 
+export const checkoutPool = mysql.createPool({
+  ...poolOptions,
+  database: process.env.DB_NAME_CHECKOUT ?? '',
+});
+
 /** A fake Cognito verifier for `__setVerifierForTests`: any token of the form
  * `test-token:<sub>` authenticates as that `sub`; anything else is rejected,
  * the same as a real bad/expired token would be. */
@@ -78,23 +83,56 @@ export async function createEventFixture(): Promise<EventFixture> {
   return { eventId, organiserSub };
 }
 
+export interface OrderFixtureInput {
+  readonly eventId: number;
+  readonly customerSub: string;
+  readonly status?: 'PENDING' | 'PAID' | 'FAILED' | 'CANCELLED';
+  readonly totalAmountCents?: number;
+}
+
+/** Inserts an order directly into `checkout.orders`, bypassing the order
+ * flow (not yet implemented). `hold_id` has no cross-database FK from this
+ * schema but is uniquely constrained, so each fixture needs its own
+ * placeholder value rather than a shared literal. */
+export async function createOrderFixture(input: OrderFixtureInput): Promise<number> {
+  const [result] = await checkoutPool.execute<mysql.ResultSetHeader>(
+    `INSERT INTO orders
+       (event_id, customer_sub, customer_email, hold_id, status, total_amount_cents, currency, paid_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'SGD', ?)`,
+    [
+      input.eventId,
+      input.customerSub,
+      `${input.customerSub}@test.example`,
+      Date.now() * 1000 + (counter += 1),
+      input.status ?? 'PAID',
+      input.totalAmountCents ?? 5000,
+      input.status === 'PENDING' ? null : new Date(),
+    ],
+  );
+  return result.insertId;
+}
+
 export interface TicketFixtureInput {
   readonly eventId: number;
   readonly customerSub: string;
   readonly seatId?: number | null;
   readonly status?: 'ISSUED' | 'CHECKED_IN' | 'VOID';
+  readonly orderId?: number;
 }
 
 /** Inserts a ticket directly into `ticketing.tickets`, bypassing the order
  * flow (not yet implemented) since this schema has no cross-database FK on
- * order_id/order_item_id — any placeholder integer is valid. */
+ * order_id/order_item_id — any placeholder integer is valid, or pass a real
+ * `orderId` from `createOrderFixture` when a test needs to join through to
+ * `checkout.orders`. */
 export async function createTicketFixture(input: TicketFixtureInput): Promise<number> {
   const suffix = uniqueSuffix();
   const [result] = await ticketingPool.execute<mysql.ResultSetHeader>(
     `INSERT INTO tickets
        (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status)
-     VALUES (1, 1, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, 1, ?, ?, ?, ?, ?, ?)`,
     [
+      input.orderId ?? 1,
       input.eventId,
       input.customerSub,
       `${input.customerSub}@test.example`,
@@ -109,6 +147,7 @@ export async function createTicketFixture(input: TicketFixtureInput): Promise<nu
 /** Deletes a fixture event and everything hanging off it, respecting FKs. */
 export async function destroyFixture(eventId: number): Promise<void> {
   await ticketingPool.execute('DELETE FROM tickets WHERE event_id = ?', [eventId]);
+  await checkoutPool.execute('DELETE FROM orders WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM event_team_memberships WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM events WHERE event_id = ?', [eventId]);
 }

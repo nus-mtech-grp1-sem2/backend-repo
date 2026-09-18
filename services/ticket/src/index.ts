@@ -151,6 +151,62 @@ app.get('/events/:eventId/checkin-stats', async (req, res) => {
   res.json({ eventId, ticketsSold: Number(row.tickets_sold), checkedIn: Number(row.checked_in) });
 });
 
+// -----------------------------------------------------------------------
+// GET /events/:eventId/attendees — OR-08: lets an event's organiser view
+// (and, client-side, export) their own attendee contact info and order
+// details. Orders live in the Checkout & Payment Service's schema; this
+// service already has a pool with cross-schema grants, so it joins in.
+// -----------------------------------------------------------------------
+
+interface AttendeeRow extends mysql.RowDataPacket {
+  ticket_id: number;
+  customer_sub: string;
+  customer_email: string;
+  seat_label: string | null;
+  status: 'ISSUED' | 'CHECKED_IN' | 'VOID';
+  order_id: number;
+  order_status: 'PENDING' | 'PAID' | 'FAILED' | 'CANCELLED';
+  total_amount_cents: number;
+  currency: string;
+  paid_at: Date | null;
+}
+
+app.get('/events/:eventId/attendees', async (req, res) => {
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const [rows] = await database.query<AttendeeRow[]>(
+    `SELECT
+       t.ticket_id, t.customer_sub, t.customer_email, s.seat_label, t.status,
+       o.order_id, o.status AS order_status, o.total_amount_cents, o.currency, o.paid_at
+     FROM tickets t
+     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+     JOIN checkout.orders o ON o.order_id = t.order_id
+     WHERE t.event_id = ?
+     ORDER BY t.ticket_id`,
+    [eventId],
+  );
+
+  res.json({
+    eventId,
+    attendees: rows.map((row) => ({
+      ticket_id: row.ticket_id,
+      customer_sub: row.customer_sub,
+      customer_email: row.customer_email,
+      seat_label: row.seat_label,
+      status: row.status,
+      order_id: row.order_id,
+      order_status: row.order_status,
+      total_amount_cents: row.total_amount_cents,
+      currency: row.currency,
+      paid_at: row.paid_at,
+    })),
+  });
+});
+
 // Guarded so importing this module from tests (NODE_ENV=test) doesn't also
 // bind the real port — tests start their own ephemeral listener via `app`.
 if (process.env.NODE_ENV !== 'test') {
