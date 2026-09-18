@@ -1,5 +1,6 @@
 resource "aws_sns_topic" "budget_alerts" {
-  name = "${local.name_prefix}-budget-alerts"
+  name              = "${local.name_prefix}-budget-alerts"
+  kms_master_key_id = "alias/aws/sns" # AWS-managed key, no extra cost
 }
 
 resource "aws_sns_topic_subscription" "budget_alerts_email" {
