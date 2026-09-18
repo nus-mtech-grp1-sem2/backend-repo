@@ -1,7 +1,6 @@
 import express from 'express';
 import mysql from 'mysql2/promise';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
-import { randomBytes } from 'node:crypto';
 import {
   DeleteMessageCommand,
   ReceiveMessageCommand,
@@ -141,7 +140,7 @@ export async function requireScannerSession(req: express.Request, res: express.R
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   const session = verifyScannerSession(token);
   if (!session) {
-    res.status(401).json({ error: 'invalid_session' });
+    res.status(401).json({ error: 'invalid_scanner_session' });
     return null;
   }
   const [memberships] = await database.query<mysql.RowDataPacket[]>(
@@ -315,30 +314,35 @@ app.post('/scanner/sessions', async (req, res) => {
     return;
   }
 
-  const [events] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT event_id, title, status FROM event_inventory.events WHERE event_id = ? LIMIT 1',
-    [eventId],
-  );
-  const event = events[0];
-  if (!event) return res.status(404).json({ error: 'event_not_found' });
-  if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_not_scannable' });
+  try {
+    const [events] = await database.query<mysql.RowDataPacket[]>(
+      'SELECT event_id, title, status FROM event_inventory.events WHERE event_id = ? LIMIT 1',
+      [eventId],
+    );
+    const event = events[0];
+    if (!event) return res.status(404).json({ error: 'event_not_found' });
+    if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_not_scannable' });
 
-  const [memberships] = await database.query<mysql.RowDataPacket[]>(
-    "SELECT role FROM event_inventory.event_team_memberships WHERE event_id = ? AND user_sub = ? AND role IN ('HELPER', 'ORGANISER') AND invite_status = 'ACCEPTED' LIMIT 1",
-    [eventId, caller.sub],
-  );
-  const role = memberships[0]?.role as ScannerSession['role'] | undefined;
-  if (!role) return res.status(403).json({ error: 'not_event_staff' });
+    const [memberships] = await database.query<mysql.RowDataPacket[]>(
+      "SELECT role FROM event_inventory.event_team_memberships WHERE event_id = ? AND user_sub = ? AND role IN ('HELPER', 'ORGANISER') AND invite_status = 'ACCEPTED' LIMIT 1",
+      [eventId, caller.sub],
+    );
+    const role = memberships[0]?.role as ScannerSession['role'] | undefined;
+    if (!role) return res.status(403).json({ error: 'not_event_staff' });
 
-  const expiresAtSeconds = Math.floor(Date.now() / 1000) + SCANNER_SESSION_TTL_MIN * 60;
-  const sessionToken = signScannerSession({ sub: caller.sub, email: caller.email, eventId, role, exp: expiresAtSeconds });
-  return res.status(200).json({
-    sessionToken,
-    eventId,
-    eventTitle: event.title,
-    role,
-    expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
-  });
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + SCANNER_SESSION_TTL_MIN * 60;
+    const sessionToken = signScannerSession({ sub: caller.sub, email: caller.email, eventId, role, exp: expiresAtSeconds });
+    return res.status(200).json({
+      sessionToken,
+      eventId,
+      eventTitle: event.title,
+      role,
+      expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
+    });
+  } catch (error) {
+    console.error('scanner session issue failed', error);
+    return res.status(502).json({ error: 'scanner_session_failed' });
+  }
 });
 
 app.delete('/scanner/sessions/current', (_req, res) => res.status(204).end());
@@ -352,7 +356,7 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
   try {
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
-      "SELECT order_id, event_id, customer_sub, customer_email, customer_name, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
+      "SELECT order_id, event_id, customer_sub, customer_email, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
       [orderId],
     );
     const order = orders[0];
@@ -373,9 +377,9 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
       for (let unit = existingCount; unit < quantity; unit += 1) {
         await connection.execute(
           `INSERT INTO ticketing.tickets
-             (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
-          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, order.customer_name ?? '', item.seat_id ?? null, createQrToken()],
+             (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
+          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, item.seat_id ?? null, createQrToken()],
         );
         issued += 1;
       }
@@ -426,11 +430,23 @@ export function parseSearchQuery(query: Record<string, unknown>): string | null 
   return value.length >= 3 && value.length <= 255 ? value : null;
 }
 
-function scannerCheckinInput(body: ScannerCheckinInput): { ticketId: number | null; qrToken: string | null } | null {
-  const ticketId = parseTicketId(body.ticketId);
-  const qrToken = parseToken(body.qrToken);
-  if ((!ticketId && !qrToken) || (ticketId && qrToken) || Object.keys(body).some((key) => key !== 'ticketId' && key !== 'qrToken')) return null;
-  return { ticketId, qrToken };
+type ScannerCheckinParse =
+  | { readonly ok: true; readonly ticketId: number | null; readonly qrToken: string | null }
+  | { readonly ok: false; readonly detail: string };
+
+function scannerCheckinInput(body: ScannerCheckinInput | undefined): ScannerCheckinParse {
+  if (!body || typeof body !== 'object') return { ok: false, detail: 'Request body must be a JSON object.' };
+  const unknownKeys = Object.keys(body).filter((key) => key !== 'ticketId' && key !== 'qrToken');
+  if (unknownKeys.length) return { ok: false, detail: `Unexpected field(s): ${unknownKeys.join(', ')}.` };
+  const hasTicketId = body.ticketId !== undefined && body.ticketId !== null;
+  const hasQrToken = body.qrToken !== undefined && body.qrToken !== null;
+  if (hasTicketId && hasQrToken) return { ok: false, detail: 'Send either ticketId or qrToken, not both.' };
+  if (!hasTicketId && !hasQrToken) return { ok: false, detail: 'Either ticketId or qrToken is required.' };
+  const ticketId = hasTicketId ? parseTicketId(body.ticketId) : null;
+  if (hasTicketId && !ticketId) return { ok: false, detail: 'ticketId must be a positive integer.' };
+  const qrToken = hasQrToken ? parseToken(body.qrToken) : null;
+  if (hasQrToken && !qrToken) return { ok: false, detail: 'qrToken must be a non-empty string of at most 255 characters.' };
+  return { ok: true, ticketId, qrToken };
 }
 
 type PublicOutcome = 'SUCCESS' | 'DUPLICATE' | 'INVALID' | 'WRONG_EVENT';
@@ -471,8 +487,8 @@ app.post('/tickets/validate', async (req, res) => {
   const session = await requireScannerSession(req, res);
   if (!session) return;
   if (!(await requireConfigured(res))) return;
-  const input = scannerCheckinInput(req.body as ScannerCheckinInput);
-  if (!input) return res.status(422).json({ error: 'invalid_checkin_request' });
+  const input = scannerCheckinInput(req.body as ScannerCheckinInput | undefined);
+  if (!input.ok) return res.status(422).json({ error: 'invalid_checkin_request', detail: input.detail });
   const startedAt = Date.now();
 
   const connection = await database.getConnection();
@@ -648,8 +664,8 @@ app.get('/events/:eventId/checkin-stats', async (req, res) => {
   if (!(await requireConfigured(res))) return;
   const eventId = parseEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
-  if (!(await requireStatsAccess(req, res, eventId))) return;
   try {
+    if (!(await requireStatsAccess(req, res, eventId))) return;
     const [rows] = await database.query<CheckinStatsRow[]>(
       `SELECT
          SUM(status IN ('ISSUED', 'CHECKED_IN')) AS issued,

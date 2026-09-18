@@ -228,6 +228,24 @@ async function listEvents(_req: express.Request, res: express.Response) {
 
 app.get('/events', listEvents);
 
+/** Published-event venues grouped from the free-text events.venue column. */
+app.get('/venues', async (_req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  try {
+    const [venues] = await database.query(
+      `SELECT venue, COUNT(*) AS upcoming, MIN(event_id) AS sample_event_id
+       FROM events
+       WHERE status = 'PUBLISHED' AND venue <> ''
+       GROUP BY venue
+       ORDER BY venue`,
+    );
+    return res.json({ venues });
+  } catch (error) {
+    console.error('failed to list venues', error);
+    return res.status(502).json({ error: 'venues_list_failed' });
+  }
+});
+
 app.get('/helper/shifts', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const caller = await requireAuthenticated(req, res);

@@ -175,14 +175,15 @@ async function publishCustomerAdmitted(
 }
 
 function parseConfig(input: QueueConfigInput): {
-  opensAt: string;
+  opensAt: Date;
   admissionBatchSize: number;
   admissionIntervalSec: number;
 } | null {
-  const opensAt = typeof input.opensAt === 'string' ? input.opensAt.trim() : '';
+  const opensAtValue = typeof input.opensAt === 'string' ? input.opensAt.trim() : '';
+  const opensAt = new Date(opensAtValue);
   const admissionBatchSize = positiveInteger(input.admissionBatchSize);
   const admissionIntervalSec = positiveInteger(input.admissionIntervalSec);
-  if (!opensAt || Number.isNaN(Date.parse(opensAt)) || !admissionBatchSize || admissionBatchSize > 10_000 ||
+  if (!opensAtValue || Number.isNaN(opensAt.getTime()) || !admissionBatchSize || admissionBatchSize > 10_000 ||
       !admissionIntervalSec || admissionIntervalSec > 86_400) return null;
   return { opensAt, admissionBatchSize, admissionIntervalSec };
 }
@@ -289,7 +290,7 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
   if (events[0].tier !== 'TIER2_SEATED') 
     return res.status(409).json({ error: 'queue_only_supported_for_tier2' });
 
-  const status = Date.parse(input.opensAt) <= Date.now() ? 'OPEN' : 'CLOSED';
+  const status = input.opensAt.getTime() <= Date.now() ? 'OPEN' : 'CLOSED';
   await database.execute(
     `INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
      VALUES (?, ?, ?, ?, ?)
@@ -591,9 +592,18 @@ function startAdmissionScheduler(): void {
 app.post('/events/:eventId/queue/admit-next', async (req, res) => {
   const eventId = positiveInteger(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
-  if (!INTERNAL_API_TOKEN) return res.status(503).json({ error: 'internal_auth_not_configured' });
-  if (req.header('x-internal-token') !== INTERNAL_API_TOKEN) return res.status(401).json({ error: 'unauthenticated' });
+  const internalRequest = Boolean(
+    INTERNAL_API_TOKEN && req.header('x-internal-token') === INTERNAL_API_TOKEN,
+  );
+  let caller: Caller | null = null;
+  if (!internalRequest) {
+    caller = await requireCaller(req, res);
+    if (!caller) return;
+  }
   if (!requireDatabase(res)) return;
+  if (caller && !(await hasEventRole(eventId, caller.sub, ['ORGANISER']))) {
+    return res.status(403).json({ error: 'event_organiser_required' });
+  }
   try {
     return res.json(await admitNextBatch(eventId));
   } catch (error) {

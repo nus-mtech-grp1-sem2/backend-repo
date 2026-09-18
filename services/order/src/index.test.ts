@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 
-import { app, parseCreateOrder, positiveInteger } from './index.js';
+import { app, parseCreateOrder, positiveInteger, requestTicketIssuance } from './index.js';
 
 describe('order input validation', () => {
   it('accepts the documented hold contract', () => {
@@ -44,4 +44,29 @@ describe('order HTTP boundary', () => {
   });
 
   after(() => server?.close());
+});
+
+describe('local ticket issuance fallback', () => {
+  it('calls the secured internal ticket endpoint when local fallback is configured', async () => {
+    let requestedUrl = '';
+    let requestedSecret = '';
+    const issued = await requestTicketIssuance(
+      17,
+      'http://ticket:3005/',
+      'shared-secret',
+      async (input, init) => {
+        requestedUrl = String(input);
+        requestedSecret = new Headers(init?.headers).get('x-ticket-internal-secret') ?? '';
+        return new Response(JSON.stringify({ issued: 1 }), { status: 200 });
+      },
+    );
+
+    assert.equal(issued, true);
+    assert.equal(requestedUrl, 'http://ticket:3005/internal/orders/17/issue-tickets');
+    assert.equal(requestedSecret, 'shared-secret');
+  });
+
+  it('stays disabled when no local ticket service is configured', async () => {
+    assert.equal(await requestTicketIssuance(17, '', ''), false);
+  });
 });

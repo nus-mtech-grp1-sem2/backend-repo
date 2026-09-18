@@ -51,7 +51,7 @@ describe('queue input validation', () => {
     assert.deepEqual(parseConfig({
       opensAt: '2026-10-01T04:00:00.000Z', admissionBatchSize: 20, admissionIntervalSec: 30,
     }), {
-      opensAt: '2026-10-01T04:00:00.000Z', admissionBatchSize: 20, admissionIntervalSec: 30,
+      opensAt: new Date('2026-10-01T04:00:00.000Z'), admissionBatchSize: 20, admissionIntervalSec: 30,
     });
   });
 
@@ -174,6 +174,16 @@ describe('queue HTTP boundary', () => {
     const response = await fetch(`http://127.0.0.1:${address.port}/events/not-a-number/queue`);
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: 'invalid_event' });
+  });
+
+  it('requires authentication for manual organiser admission', async () => {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const response = await fetch(`http://127.0.0.1:${address.port}/events/1/queue/admit-next`, {
+      method: 'POST',
+    });
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: 'unauthenticated' });
   });
 
   after(() => server?.close());

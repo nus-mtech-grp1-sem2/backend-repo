@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 
-import { app, checkinInput, parseOrderPaid } from './index.js';
+import {
+  app,
+  checkinInput,
+  createQrToken,
+  parseOrderPaid,
+  parseSearchQuery,
+  verifyScannerSession,
+} from './index.js';
 
 describe('ticket input validation', () => {
   it('accepts one event and one opaque QR token', () => {

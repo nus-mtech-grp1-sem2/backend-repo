@@ -9,6 +9,8 @@ const PORT = Number(process.env.PORT ?? 3004);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
+const TICKET_SERVICE_URL = process.env.TICKET_SERVICE_URL ?? '';
+const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
@@ -306,7 +308,10 @@ app.post('/orders', async (req, res) => {
 });
 
 async function publishOrderPaid(order: NonNullable<Awaited<ReturnType<typeof loadOrder>>>): Promise<void> {
-  if (!ORDER_EVENTS_QUEUE_URL) return;
+  if (!ORDER_EVENTS_QUEUE_URL) {
+    await requestTicketIssuance(Number(order.order_id));
+    return;
+  }
   await sqs.send(new SendMessageCommand({
     QueueUrl: ORDER_EVENTS_QUEUE_URL,
     MessageBody: JSON.stringify({
@@ -315,6 +320,24 @@ async function publishOrderPaid(order: NonNullable<Awaited<ReturnType<typeof loa
       customerEmail: order.customer_email, paidAt: order.paid_at, items: order.items,
     }),
   }));
+}
+
+export async function requestTicketIssuance(
+  orderId: number,
+  ticketServiceUrl = TICKET_SERVICE_URL,
+  sharedSecret = TICKET_INTERNAL_SHARED_SECRET,
+  requester: typeof fetch = fetch,
+): Promise<boolean> {
+  if (!ticketServiceUrl || !sharedSecret) return false;
+  const response = await requester(
+    `${ticketServiceUrl.replace(/\/$/, '')}/internal/orders/${orderId}/issue-tickets`,
+    {
+      method: 'POST',
+      headers: { 'x-ticket-internal-secret': sharedSecret },
+    },
+  );
+  if (!response.ok) throw new Error(`ticket_issuance_failed:${response.status}`);
+  return true;
 }
 
 app.post('/orders/:orderId/payment', async (req, res) => {
