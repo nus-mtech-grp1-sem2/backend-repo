@@ -39,10 +39,8 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
   policy = data.aws_iam_policy_document.ecs_task_execution_secrets.json
 }
 
-# Application-level task role, assumed by the running containers themselves.
-# Only the auth service currently calls AWS APIs at runtime (Cognito, via
-# @aws-sdk/client-cognito-identity-provider) — everything else gets no AWS
-# permissions at all.
+# Default application task role, assumed by services that call Cognito admin
+# APIs. Order and ticket use dedicated, SQS-scoped roles declared in sqs.tf.
 resource "aws_iam_role" "ecs_task" {
   name               = "${local.name_prefix}-ecs-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_trust.json

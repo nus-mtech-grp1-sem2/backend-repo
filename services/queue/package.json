@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "cross-env NODE_ENV=test node --import tsx --test src/index.test.ts",
     "dev": "tsx watch src/index.ts"
   },
   "keywords": [],
@@ -12,8 +12,9 @@
   "type": "module",
   "description": "",
   "dependencies": {
-    "aws-jwt-verify": "^5.1.1",
-    "mysql2": "^3.23.3",
-    "express": "^5.2.1"
+    "@aws-sdk/client-sqs": "^3.1132.0",
+    "aws-jwt-verify": "^5.2.1",
+    "express": "^5.2.1",
+    "mysql2": "^3.24.4"
   }
 }

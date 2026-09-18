@@ -1,35 +1,72 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 
-import { parseOrderInput, parsePositiveId, shouldIssueTickets } from './index.js';
+import { app, parseCreateOrder, positiveInteger, requestTicketIssuance } from './index.js';
 
-describe('order input', () => {
-  it('accepts a bounded general-admission order', () => {
-    assert.deepEqual(parseOrderInput({ eventId: 1, quantity: 2 }), { eventId: 1, quantity: 2 });
-  });
-
-  it('rejects invalid quantities and malformed seat ids', () => {
-    assert.equal(parseOrderInput({ eventId: 1, quantity: 0 }), null);
-    assert.equal(parseOrderInput({ eventId: 1, quantity: 11 }), null);
-    assert.equal(parseOrderInput({ eventId: 1, quantity: 1, seatIds: ['1'] }), null);
-  });
-
-  it('allows paid orders to retry ticket issuance after a transient failure', () => {
-    assert.equal(shouldIssueTickets('PAID'), true);
-    assert.equal(shouldIssueTickets('CANCELLED'), false);
-  });
-
-  it('accepts only positive integer resource ids', () => {
-    assert.equal(parsePositiveId('12'), 12);
-    assert.equal(parsePositiveId(0), null);
-    assert.equal(parsePositiveId('not-an-id'), null);
-  });
-
-  it('accepts an optional queue admission token', () => {
-    assert.deepEqual(parseOrderInput({ eventId: 1, quantity: 1, admissionToken: 'queue-token' }), {
-      eventId: 1,
-      quantity: 1,
-      admissionToken: 'queue-token',
+describe('order input validation', () => {
+  it('accepts the documented hold contract', () => {
+    assert.deepEqual(parseCreateOrder({ holdId: 41, customerEmail: 'Buyer@example.com' }), {
+      holdId: 41, eventId: null, inventoryItemId: null, quantity: null, seatIds: [],
+      admissionToken: null, customerEmail: 'buyer@example.com',
     });
+  });
+
+  it('accepts the compatible seated checkout contract', () => {
+    assert.deepEqual(parseCreateOrder({
+      eventId: 7, quantity: 2, seatIds: [10, 11], admissionToken: 'opaque-admission-token',
+      customerEmail: 'buyer@example.com',
+    }), {
+      holdId: null, eventId: 7, inventoryItemId: null, quantity: 2, seatIds: [10, 11],
+      admissionToken: 'opaque-admission-token', customerEmail: 'buyer@example.com',
+    });
+  });
+
+  it('rejects duplicates, mismatched quantities, and malformed identifiers', () => {
+    assert.equal(positiveInteger('1 OR 1=1'), null);
+    assert.equal(parseCreateOrder({ eventId: 7, quantity: 2, seatIds: [10, 10] }), null);
+    assert.equal(parseCreateOrder({ eventId: 7, quantity: 2, seatIds: [10] }), null);
+  });
+});
+
+describe('order HTTP boundary', () => {
+  let server: ReturnType<typeof app.listen>;
+
+  it('rejects unauthenticated order creation before accessing persistence', async () => {
+    server = app.listen(0);
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const response = await fetch(`http://127.0.0.1:${address.port}/orders`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ holdId: 41 }),
+    });
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: 'unauthenticated' });
+  });
+
+  after(() => server?.close());
+});
+
+describe('local ticket issuance fallback', () => {
+  it('calls the secured internal ticket endpoint when local fallback is configured', async () => {
+    let requestedUrl = '';
+    let requestedSecret = '';
+    const issued = await requestTicketIssuance(
+      17,
+      'http://ticket:3005/',
+      'shared-secret',
+      async (input, init) => {
+        requestedUrl = String(input);
+        requestedSecret = new Headers(init?.headers).get('x-ticket-internal-secret') ?? '';
+        return new Response(JSON.stringify({ issued: 1 }), { status: 200 });
+      },
+    );
+
+    assert.equal(issued, true);
+    assert.equal(requestedUrl, 'http://ticket:3005/internal/orders/17/issue-tickets');
+    assert.equal(requestedSecret, 'shared-secret');
+  });
+
+  it('stays disabled when no local ticket service is configured', async () => {
+    assert.equal(await requestTicketIssuance(17, '', ''), false);
   });
 });

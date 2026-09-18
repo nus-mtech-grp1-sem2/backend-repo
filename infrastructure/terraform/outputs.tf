@@ -26,6 +26,10 @@ output "ecs_cluster_name" {
   value = aws_ecs_cluster.main.name
 }
 
+output "customer_admitted_queue_url" {
+  value = aws_sqs_queue.customer_admitted.url
+}
+
 output "github_deploy_backend_role_arn" {
   value = aws_iam_role.github_deploy_backend.arn
 }

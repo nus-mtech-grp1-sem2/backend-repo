@@ -18,10 +18,14 @@ CREATE TABLE events (
   venue VARCHAR(255) NOT NULL,
   starts_at DATETIME NOT NULL,
   total_seats INT UNSIGNED NOT NULL,
+  available_buyers INT UNSIGNED NULL,
   tier ENUM('TIER1_GA', 'TIER2_SEATED') NOT NULL,
   status ENUM('DRAFT', 'PUBLISHED', 'CANCELLED') NOT NULL DEFAULT 'DRAFT',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT chk_events_available_buyers CHECK (
+    available_buyers IS NULL OR (available_buyers >= 1 AND available_buyers <= total_seats)
+  ),
   INDEX idx_events_status_starts_at (status, starts_at),
   INDEX idx_events_organiser_sub (organiser_sub)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -93,7 +97,7 @@ CREATE TABLE queue_sessions (
   admission_batch_size INT UNSIGNED NOT NULL,
   admission_interval_sec INT UNSIGNED NOT NULL,
   status ENUM('CLOSED', 'OPEN', 'DRAINED') NOT NULL DEFAULT 'CLOSED',
-  INDEX idx_queue_sessions_event (event_id)
+  UNIQUE KEY uq_queue_sessions_event (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE queue_entries (
@@ -123,6 +127,7 @@ CREATE TABLE orders (
   currency CHAR(3) NOT NULL DEFAULT 'SGD',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   paid_at DATETIME NULL,
+  UNIQUE KEY uq_orders_hold (hold_id),
   INDEX idx_orders_customer (customer_sub, created_at),
   INDEX idx_orders_event (event_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

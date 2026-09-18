@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 
-import { app, checkinInput, createQrToken, parseSearchQuery, verifyScannerSession } from './index.js';
+import {
+  app,
+  checkinInput,
+  createQrToken,
+  parseOrderPaid,
+  parseSearchQuery,
+  verifyScannerSession,
+} from './index.js';
 
 describe('ticket input validation', () => {
   it('accepts one event and one opaque QR token', () => {
@@ -38,6 +45,36 @@ describe('ticket HTTP boundary', () => {
   after(() => server?.close());
 });
 
+describe('paid order event validation', () => {
+  it('accepts the paid order contract published by the order service', () => {
+    assert.deepEqual(parseOrderPaid({
+      type: 'OrderPaid',
+      version: 1,
+      orderId: 81,
+      eventId: 12,
+      customerSub: 'customer-123',
+      customerEmail: 'customer@example.com',
+      items: [{ order_item_id: 91, seat_id: 31, quantity: 1 }],
+    }), {
+      type: 'OrderPaid',
+      version: 1,
+      orderId: 81,
+      eventId: 12,
+      customerSub: 'customer-123',
+      customerEmail: 'customer@example.com',
+      items: [{ orderItemId: 91, seatId: 31, quantity: 1 }],
+    });
+  });
+
+  it('rejects an invalid or repeated seated ticket quantity', () => {
+    assert.equal(parseOrderPaid({ type: 'Other', version: 1 }), null);
+    assert.equal(parseOrderPaid({
+      type: 'OrderPaid', version: 1, orderId: 81, eventId: 12,
+      customerSub: 'customer-123', customerEmail: 'customer@example.com',
+      items: [{ order_item_id: 91, seat_id: 31, quantity: 2 }],
+    }), null);
+  });
+});
 describe('EH-01 scanner sessions', () => {
   it('rejects malformed or expired scanner tokens', () => {
     assert.equal(verifyScannerSession('not-a-jwt'), null);
