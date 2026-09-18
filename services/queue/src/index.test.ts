@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
 import {
+  admissionAllowed,
   admissionBatchSize,
   admissionDue,
   app,
@@ -72,6 +73,10 @@ describe('automatic admission timing', () => {
   it('waits for the configured interval between batches', () => {
     assert.equal(admissionDue('2026-09-16T12:00:01.000Z', 30, now), false);
     assert.equal(admissionDue('2026-09-16T12:00:00.000Z', 30, now), true);
+  });
+
+  it('immediately refills a buyer slot released before the interval elapses', () => {
+    assert.equal(admissionAllowed('2026-09-16T12:00:29.000Z', 30, true, now), true);
   });
 });
 

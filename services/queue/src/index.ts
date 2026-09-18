@@ -101,6 +101,15 @@ function admissionDue(lastAdmittedAt: Date | string | null, intervalSec: number,
   return new Date(lastAdmittedAt).getTime() + intervalSec * 1_000 <= now;
 }
 
+function admissionAllowed(
+  lastAdmittedAt: Date | string | null,
+  intervalSec: number,
+  bypassInterval: boolean,
+  now = Date.now(),
+): boolean {
+  return bypassInterval || admissionDue(lastAdmittedAt, intervalSec, now);
+}
+
 function admissionBatchSize(totalTickets: number): number {
   if (!Number.isFinite(totalTickets) || totalTickets <= 0) return 0;
   return Math.max(1, Math.ceil(totalTickets * 0.1));
@@ -424,6 +433,7 @@ app.delete('/events/:eventId/queue/me', async (req, res) => {
       await connection.rollback();
       return res.status(409).json({ error: 'queue_checkout_started' });
     }
+    const releasedBuyerSlot = entry.status === 'ADMITTED';
     if (entry.status !== 'LEFT' && entry.status !== 'EXPIRED') {
       await connection.execute(
         "UPDATE queue_entries SET status = 'LEFT', admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
@@ -431,6 +441,15 @@ app.delete('/events/:eventId/queue/me', async (req, res) => {
       );
     }
     await connection.commit();
+    if (releasedBuyerSlot) {
+      try {
+        await admitNextBatch(eventId, true);
+      } catch (error) {
+        if (!(error instanceof QueueApiError && [404, 409].includes(error.status))) {
+          console.error('failed to refill released queue slot', { eventId, error });
+        }
+      }
+    }
     return res.status(204).end();
   } catch (error) {
     await connection.rollback();
@@ -441,7 +460,7 @@ app.delete('/events/:eventId/queue/me', async (req, res) => {
   }
 });
 
-async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
+async function admitNextBatch(eventId: number, bypassInterval = false): Promise<AdmissionResult> {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
@@ -455,7 +474,11 @@ async function admitNextBatch(eventId: number): Promise<AdmissionResult> {
       'SELECT MAX(admitted_at) AS last_admitted_at FROM queue_entries WHERE queue_session_id = ?', [session.queue_session_id],
     );
     const lastAdmittedAt = recent[0]?.last_admitted_at ? new Date(recent[0].last_admitted_at).getTime() : 0;
-    if (!admissionDue(lastAdmittedAt ? new Date(lastAdmittedAt) : null, Number(session.admission_interval_sec))) {
+    if (!admissionAllowed(
+      lastAdmittedAt ? new Date(lastAdmittedAt) : null,
+      Number(session.admission_interval_sec),
+      bypassInterval,
+    )) {
       throw new QueueApiError(429, 'admission_interval_not_elapsed');
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
@@ -626,6 +649,7 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 export {
+  admissionAllowed,
   admissionBatchSize,
   admissionDue,
   availableAdmissionSlots,
