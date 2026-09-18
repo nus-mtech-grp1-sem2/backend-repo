@@ -115,6 +115,42 @@ app.get('/customers/me/tickets', async (req, res) => {
   });
 });
 
+// -----------------------------------------------------------------------
+// GET /events/:eventId/checkin-stats — OR-09: lets an event's organiser
+// see check-in progress on event day without asking door staff. `VOID`
+// tickets (refunded/cancelled) don't count as sold.
+// -----------------------------------------------------------------------
+
+async function isEventOrganiser(eventId: number, sub: string): Promise<boolean> {
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    "SELECT membership_id FROM event_inventory.event_team_memberships " +
+      "WHERE event_id = ? AND user_sub = ? AND role = 'ORGANISER' AND invite_status = 'ACCEPTED' LIMIT 1",
+    [eventId, sub],
+  );
+  return rows.length > 0;
+}
+
+interface CheckinStatsRow extends mysql.RowDataPacket {
+  tickets_sold: number;
+  checked_in: number;
+}
+
+app.get('/events/:eventId/checkin-stats', async (req, res) => {
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const [rows] = await database.query<CheckinStatsRow[]>(
+    "SELECT COUNT(*) AS tickets_sold, SUM(status = 'CHECKED_IN') AS checked_in " +
+      "FROM tickets WHERE event_id = ? AND status <> 'VOID'",
+    [eventId],
+  );
+  const row = rows[0]!;
+  res.json({ eventId, ticketsSold: Number(row.tickets_sold), checkedIn: Number(row.checked_in) });
+});
+
 // Guarded so importing this module from tests (NODE_ENV=test) doesn't also
 // bind the real port — tests start their own ephemeral listener via `app`.
 if (process.env.NODE_ENV !== 'test') {

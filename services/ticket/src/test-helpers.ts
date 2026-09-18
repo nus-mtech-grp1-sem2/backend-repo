@@ -55,16 +55,27 @@ function uniqueSuffix(): string {
 
 export interface EventFixture {
   readonly eventId: number;
+  readonly organiserSub: string;
 }
 
+/** Also grants `organiserSub` an ACCEPTED ORGANISER membership on the event,
+ * so tests can authenticate as someone allowed through organiser-gated
+ * routes (e.g. check-in stats) without a separate setup call. */
 export async function createEventFixture(): Promise<EventFixture> {
   const suffix = uniqueSuffix();
+  const organiserSub = `tdd-organiser-${suffix}`;
   const [eventResult] = await eventInventoryPool.execute<mysql.ResultSetHeader>(
     "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
       "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 'TIER1_GA', 'PUBLISHED')",
-    [`tdd-organiser-${suffix}`, `TDD-TEST-EVENT-${suffix}`],
+    [organiserSub, `TDD-TEST-EVENT-${suffix}`],
   );
-  return { eventId: eventResult.insertId };
+  const eventId = eventResult.insertId;
+  await eventInventoryPool.execute(
+    "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) " +
+      "VALUES (?, ?, ?, 'ORGANISER', 'ACCEPTED', ?)",
+    [eventId, organiserSub, `${organiserSub}@test.example`, organiserSub],
+  );
+  return { eventId, organiserSub };
 }
 
 export interface TicketFixtureInput {
@@ -98,5 +109,6 @@ export async function createTicketFixture(input: TicketFixtureInput): Promise<nu
 /** Deletes a fixture event and everything hanging off it, respecting FKs. */
 export async function destroyFixture(eventId: number): Promise<void> {
   await ticketingPool.execute('DELETE FROM tickets WHERE event_id = ?', [eventId]);
+  await eventInventoryPool.execute('DELETE FROM event_team_memberships WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM events WHERE event_id = ?', [eventId]);
 }
