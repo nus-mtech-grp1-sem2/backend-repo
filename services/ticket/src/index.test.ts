@@ -7,6 +7,7 @@ import {
   createQrToken,
   parseOrderPaid,
   parseSearchQuery,
+  reconcilePaidOrders,
   verifyScannerSession,
 } from './index.js';
 
@@ -101,5 +102,36 @@ describe('CU-07 ticket issuance primitives', () => {
     assert.equal(Buffer.from(second, 'base64url').length, 32);
     assert.notEqual(first, second);
     assert.match(first, /^[A-Za-z0-9_-]+$/);
+  });
+
+  it('reconciles every paid order that is missing tickets', async () => {
+    const issuedOrderIds: number[] = [];
+    const result = await reconcilePaidOrders(
+      25,
+      async (limit) => {
+        assert.equal(limit, 25);
+        return [20, 3];
+      },
+      async (orderId) => {
+        issuedOrderIds.push(orderId);
+        return { issued: orderId === 20 ? 1 : 2, alreadyIssued: false };
+      },
+    );
+
+    assert.deepEqual(issuedOrderIds, [20, 3]);
+    assert.deepEqual(result, { matchedOrders: 2, issuedTickets: 3, failedOrders: 0 });
+  });
+
+  it('continues reconciling after one order fails', async () => {
+    const result = await reconcilePaidOrders(
+      50,
+      async () => [20, 3],
+      async (orderId) => {
+        if (orderId === 20) throw new Error('temporary_failure');
+        return { issued: 2, alreadyIssued: false };
+      },
+    );
+
+    assert.deepEqual(result, { matchedOrders: 2, issuedTickets: 2, failedOrders: 1 });
   });
 });
