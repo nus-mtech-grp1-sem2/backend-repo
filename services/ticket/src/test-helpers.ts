@@ -37,6 +37,11 @@ export const checkoutPool = mysql.createPool({
   database: process.env.DB_NAME_CHECKOUT ?? '',
 });
 
+export const queuePool = mysql.createPool({
+  ...poolOptions,
+  database: process.env.DB_NAME_QUEUE ?? '',
+});
+
 /** A fake Cognito verifier for `__setVerifierForTests`: any token of the form
  * `test-token:<sub>` authenticates as that `sub`; anything else is rejected,
  * the same as a real bad/expired token would be. */
@@ -112,6 +117,55 @@ export async function createOrderFixture(input: OrderFixtureInput): Promise<numb
   return result.insertId;
 }
 
+export interface InventoryItemFixtureInput {
+  readonly eventId: number;
+  readonly totalQty: number;
+  readonly reservedQty?: number;
+  readonly soldQty?: number;
+  readonly priceCents?: number;
+}
+
+/** Inserts an inventory item directly into `event_inventory.inventory_items`,
+ * so dashboard-style tests have real remaining-stock numbers to assert on. */
+export async function createInventoryItemFixture(input: InventoryItemFixtureInput): Promise<number> {
+  const [result] = await eventInventoryPool.execute<mysql.ResultSetHeader>(
+    `INSERT INTO inventory_items (event_id, name, total_qty, reserved_qty, sold_qty, price_cents)
+     VALUES (?, 'TDD Tier', ?, ?, ?, ?)`,
+    [input.eventId, input.totalQty, input.reservedQty ?? 0, input.soldQty ?? 0, input.priceCents ?? 1000],
+  );
+  return result.insertId;
+}
+
+export interface QueueEntryFixtureInput {
+  readonly eventId: number;
+  readonly customerSub: string;
+  readonly status?: 'WAITING' | 'ADMITTED' | 'IN_CHECKOUT' | 'EXPIRED' | 'LEFT';
+}
+
+/** Inserts a queue session (if the event doesn't have one yet) and a queue
+ * entry directly into the `queue` schema, bypassing the queue service (not
+ * yet implemented). */
+export async function createQueueEntryFixture(input: QueueEntryFixtureInput): Promise<number> {
+  const [sessionRows] = await queuePool.query<mysql.RowDataPacket[]>(
+    'SELECT queue_session_id FROM queue_sessions WHERE event_id = ? LIMIT 1',
+    [input.eventId],
+  );
+  let queueSessionId = sessionRows[0]?.queue_session_id as number | undefined;
+  if (!queueSessionId) {
+    const [sessionResult] = await queuePool.execute<mysql.ResultSetHeader>(
+      "INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status) " +
+        "VALUES (?, NOW(), 50, 30, 'OPEN')",
+      [input.eventId],
+    );
+    queueSessionId = sessionResult.insertId;
+  }
+  const [entryResult] = await queuePool.execute<mysql.ResultSetHeader>(
+    'INSERT INTO queue_entries (queue_session_id, customer_sub, position, status) VALUES (?, ?, ?, ?)',
+    [queueSessionId, input.customerSub, (counter += 1), input.status ?? 'WAITING'],
+  );
+  return entryResult.insertId;
+}
+
 export interface TicketFixtureInput {
   readonly eventId: number;
   readonly customerSub: string;
@@ -146,8 +200,17 @@ export async function createTicketFixture(input: TicketFixtureInput): Promise<nu
 
 /** Deletes a fixture event and everything hanging off it, respecting FKs. */
 export async function destroyFixture(eventId: number): Promise<void> {
+  const [sessionRows] = await queuePool.query<mysql.RowDataPacket[]>(
+    'SELECT queue_session_id FROM queue_sessions WHERE event_id = ?',
+    [eventId],
+  );
+  for (const row of sessionRows) {
+    await queuePool.execute('DELETE FROM queue_entries WHERE queue_session_id = ?', [row.queue_session_id]);
+  }
+  await queuePool.execute('DELETE FROM queue_sessions WHERE event_id = ?', [eventId]);
   await ticketingPool.execute('DELETE FROM tickets WHERE event_id = ?', [eventId]);
   await checkoutPool.execute('DELETE FROM orders WHERE event_id = ?', [eventId]);
+  await eventInventoryPool.execute('DELETE FROM inventory_items WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM event_team_memberships WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM events WHERE event_id = ?', [eventId]);
 }

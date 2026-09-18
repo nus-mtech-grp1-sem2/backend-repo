@@ -207,6 +207,54 @@ app.get('/events/:eventId/attendees', async (req, res) => {
   });
 });
 
+// -----------------------------------------------------------------------
+// GET /events/:eventId/orders/summary — OR-07: the live numbers half of an
+// organiser's on-sale dashboard (paired with the Event & Inventory
+// Service's GET /events/{eventId} for the static event details). Pulls
+// together revenue and paid-order count from Checkout, remaining stock
+// from Event & Inventory, and waiting-room size from Queue — all in one
+// call so the frontend isn't stitching together three separate requests.
+// -----------------------------------------------------------------------
+
+interface OrdersSummaryRow extends mysql.RowDataPacket {
+  orders_paid: number;
+  revenue_cents: number;
+}
+
+app.get('/events/:eventId/orders/summary', async (req, res) => {
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const [orderRows] = await database.query<OrdersSummaryRow[]>(
+    "SELECT COUNT(*) AS orders_paid, COALESCE(SUM(total_amount_cents), 0) AS revenue_cents " +
+      "FROM checkout.orders WHERE event_id = ? AND status = 'PAID'",
+    [eventId],
+  );
+  const [inventoryRows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) AS remaining ' +
+      'FROM event_inventory.inventory_items WHERE event_id = ?',
+    [eventId],
+  );
+  const [queueRows] = await database.query<mysql.RowDataPacket[]>(
+    "SELECT COUNT(*) AS queue_length FROM queue.queue_entries qe " +
+      'JOIN queue.queue_sessions qs ON qs.queue_session_id = qe.queue_session_id ' +
+      "WHERE qs.event_id = ? AND qe.status = 'WAITING'",
+    [eventId],
+  );
+
+  const orderRow = orderRows[0]!;
+  res.json({
+    eventId,
+    ordersPaid: Number(orderRow.orders_paid),
+    revenueCents: Number(orderRow.revenue_cents),
+    remainingInventory: Number(inventoryRows[0]!.remaining),
+    queueLength: Number(queueRows[0]!.queue_length),
+  });
+});
+
 // Guarded so importing this module from tests (NODE_ENV=test) doesn't also
 // bind the real port — tests start their own ephemeral listener via `app`.
 if (process.env.NODE_ENV !== 'test') {
