@@ -6,6 +6,7 @@ import {
   isEventTeamPurchase,
   parseCreateOrder,
   positiveInteger,
+  requestQueueRefill,
   requestTicketIssuance,
 } from './index.js';
 
@@ -85,5 +86,46 @@ describe('local ticket issuance fallback', () => {
 
   it('stays disabled when no local ticket service is configured', async () => {
     assert.equal(await requestTicketIssuance(17, '', ''), false);
+  });
+});
+
+describe('immediate queue refill', () => {
+  it('calls the secured internal queue endpoint after a slot is released', async () => {
+    let requestedUrl = '';
+    let requestedToken = '';
+    let requestedMethod = '';
+    const refilled = await requestQueueRefill(
+      23,
+      'http://queue:3003/',
+      'internal-token',
+      async (input, init) => {
+        requestedUrl = String(input);
+        requestedToken = new Headers(init?.headers).get('x-internal-token') ?? '';
+        requestedMethod = init?.method ?? '';
+        return new Response(JSON.stringify({ admitted: 1 }), { status: 200 });
+      },
+    );
+
+    assert.equal(refilled, true);
+    assert.equal(requestedUrl, 'http://queue:3003/events/23/queue/admit-next');
+    assert.equal(requestedToken, 'internal-token');
+    assert.equal(requestedMethod, 'POST');
+  });
+
+  it('stays disabled unless both the queue URL and internal token are configured', async () => {
+    assert.equal(await requestQueueRefill(23, '', 'internal-token'), false);
+    assert.equal(await requestQueueRefill(23, 'http://queue:3003', ''), false);
+  });
+
+  it('rejects a failed refill so the caller can log and use the scheduler fallback', async () => {
+    await assert.rejects(
+      requestQueueRefill(
+        23,
+        'http://queue:3003',
+        'internal-token',
+        async () => new Response(null, { status: 503 }),
+      ),
+      /queue_refill_failed:503/,
+    );
   });
 });

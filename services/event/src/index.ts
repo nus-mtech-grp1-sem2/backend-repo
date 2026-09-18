@@ -218,8 +218,17 @@ async function listEvents(_req: express.Request, res: express.Response) {
 
   try {
     const [rows] = await database.query(
-      "SELECT event_id, title AS event_name, tier AS event_type, starts_at AS event_start_datetime, total_seats, " +
-        "NULL AS event_end_datetime, status FROM events WHERE status = 'PUBLISHED' ORDER BY starts_at ASC",
+      `SELECT e.event_id, e.title AS event_name, e.tier AS event_type,
+        e.starts_at AS event_start_datetime, e.total_seats,
+        NULL AS event_end_datetime, e.status,
+        CASE WHEN e.tier = 'TIER2_SEATED'
+          THEN (SELECT COUNT(*) FROM seats s WHERE s.event_id = e.event_id AND s.status = 'AVAILABLE')
+          ELSE (SELECT COALESCE(SUM(i.total_qty - i.reserved_qty - i.sold_qty), 0)
+            FROM inventory_items i WHERE i.event_id = e.event_id)
+        END AS remaining_qty
+       FROM events e
+       WHERE e.status = 'PUBLISHED'
+       ORDER BY e.starts_at ASC`,
     );
     res.json({ events: rows });
   } catch (error) {
@@ -269,7 +278,28 @@ app.get('/events/manage', async (req, res) => {
   const caller = await requireAuthenticated(req, res);
   if (!caller) return;
   const [events] = await database.query(
-    "SELECT events.event_id, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.available_buyers, events.tier, events.status, inventory.price_cents, COALESCE(inventory.remaining_qty, 0) AS remaining_qty, COALESCE(inventory.total_qty, 0) AS inventory_total_qty FROM events INNER JOIN event_team_memberships ON event_team_memberships.event_id = events.event_id LEFT JOIN (SELECT event_id, MIN(price_cents) AS price_cents, SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty, SUM(total_qty) AS total_qty FROM inventory_items GROUP BY event_id) AS inventory ON inventory.event_id = events.event_id WHERE event_team_memberships.user_sub = ? AND event_team_memberships.role = 'ORGANISER' AND event_team_memberships.invite_status = 'ACCEPTED' ORDER BY events.starts_at ASC",
+    `SELECT events.event_id, events.title, events.description, events.venue,
+      events.starts_at, events.total_seats, events.available_buyers, events.tier,
+      events.status, inventory.price_cents,
+      CASE WHEN events.tier = 'TIER2_SEATED'
+        THEN (SELECT COUNT(*) FROM seats s
+          WHERE s.event_id = events.event_id AND s.status = 'AVAILABLE')
+        ELSE COALESCE(inventory.remaining_qty, 0)
+      END AS remaining_qty,
+      COALESCE(inventory.total_qty, 0) AS inventory_total_qty
+     FROM events
+     INNER JOIN event_team_memberships
+       ON event_team_memberships.event_id = events.event_id
+     LEFT JOIN (
+       SELECT event_id, MIN(price_cents) AS price_cents,
+         SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty,
+         SUM(total_qty) AS total_qty
+       FROM inventory_items GROUP BY event_id
+     ) AS inventory ON inventory.event_id = events.event_id
+     WHERE event_team_memberships.user_sub = ?
+       AND event_team_memberships.role = 'ORGANISER'
+       AND event_team_memberships.invite_status = 'ACCEPTED'
+     ORDER BY events.starts_at ASC`,
     [caller.sub],
   );
   res.json({ events });
@@ -280,7 +310,22 @@ app.get('/events/:eventId', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   const [rows] = await database.query<mysql.RowDataPacket[]>(
-    "SELECT events.event_id, events.organiser_sub, events.title, events.description, events.venue, events.starts_at, events.total_seats, events.available_buyers, events.tier, events.status, inventory_items.price_cents FROM events LEFT JOIN inventory_items ON inventory_items.event_id = events.event_id AND inventory_items.name = 'General Admission' WHERE events.event_id = ? LIMIT 1",
+    `SELECT events.event_id, events.organiser_sub, events.title, events.description,
+      events.venue, events.starts_at, events.total_seats, events.available_buyers,
+      events.tier, events.status, inventory_items.price_cents,
+      CASE WHEN events.tier = 'TIER2_SEATED'
+        THEN (SELECT COUNT(*) FROM seats s
+          WHERE s.event_id = events.event_id AND s.status = 'AVAILABLE')
+        ELSE COALESCE(
+          inventory_items.total_qty - inventory_items.reserved_qty - inventory_items.sold_qty,
+          0
+        )
+      END AS remaining_qty
+     FROM events
+     LEFT JOIN inventory_items
+       ON inventory_items.event_id = events.event_id
+       AND inventory_items.name = 'General Admission'
+     WHERE events.event_id = ? LIMIT 1`,
     [eventId],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });

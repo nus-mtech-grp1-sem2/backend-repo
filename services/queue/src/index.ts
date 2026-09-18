@@ -628,7 +628,9 @@ app.post('/events/:eventId/queue/admit-next', async (req, res) => {
     return res.status(403).json({ error: 'event_organiser_required' });
   }
   try {
-    return res.json(await admitNextBatch(eventId));
+    // Internal callers use this endpoint when an active buyer releases a slot,
+    // so refill immediately instead of waiting for the normal admission cadence.
+    return res.json(await admitNextBatch(eventId, internalRequest));
   } catch (error) {
     if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
     console.error('queue admission failed', error);

@@ -87,14 +87,23 @@ locals {
           contains(["order", "ticket"], name) ? {
             ORDER_EVENTS_QUEUE_URL = aws_sqs_queue.order_events.url
           } : {},
+          name == "order" ? {
+            QUEUE_SERVICE_URL       = "http://queue:3003"
+            QUEUE_REFILL_TIMEOUT_MS = "1000"
+          } : {},
           name == "queue" ? {
             CUSTOMER_ADMITTED_QUEUE_URL = aws_sqs_queue.customer_admitted.url
           } : {}
         )
-        secret_env = contains(keys(local.service_db_name), name) ? {
-          DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
-          DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
-        } : {}
+        secret_env = merge(
+          contains(keys(local.service_db_name), name) ? {
+            DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
+            DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
+          } : {},
+          contains(["order", "queue"], name) ? {
+            INTERNAL_API_TOKEN = "${aws_secretsmanager_secret.mysql.arn}:INTERNAL_API_TOKEN::"
+          } : {}
+        )
       }
     }
   )

@@ -8,6 +8,11 @@ resource "random_password" "mysql_app" {
   special = false
 }
 
+resource "random_password" "internal_api_token" {
+  length  = 32
+  special = false
+}
+
 resource "aws_secretsmanager_secret" "mysql" {
   name = "${local.name_prefix}/mysql"
 
@@ -23,5 +28,6 @@ resource "aws_secretsmanager_secret_version" "mysql" {
     MYSQL_DATABASE      = "onestage"
     MYSQL_USER          = "onestage_app"
     MYSQL_PASSWORD      = random_password.mysql_app.result
+    INTERNAL_API_TOKEN  = random_password.internal_api_token.result
   })
 }

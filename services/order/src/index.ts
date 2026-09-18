@@ -11,6 +11,12 @@ const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
 const TICKET_SERVICE_URL = process.env.TICKET_SERVICE_URL ?? '';
 const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
+const QUEUE_SERVICE_URL = process.env.QUEUE_SERVICE_URL ?? '';
+const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN ?? '';
+const QUEUE_REFILL_TIMEOUT_MS = Math.min(
+  Math.max(Number(process.env.QUEUE_REFILL_TIMEOUT_MS) || 1_000, 100),
+  5_000,
+);
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
@@ -358,6 +364,36 @@ export async function requestTicketIssuance(
   return true;
 }
 
+export async function requestQueueRefill(
+  eventId: number,
+  queueServiceUrl = QUEUE_SERVICE_URL,
+  internalApiToken = INTERNAL_API_TOKEN,
+  requester: typeof fetch = fetch,
+  timeoutMs = QUEUE_REFILL_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!queueServiceUrl || !internalApiToken) return false;
+  const response = await requester(
+    `${queueServiceUrl.replace(/\/$/, '')}/events/${eventId}/queue/admit-next`,
+    {
+      method: 'POST',
+      headers: { 'x-internal-token': internalApiToken },
+      signal: AbortSignal.timeout(timeoutMs),
+    },
+  );
+  if (!response.ok) throw new Error(`queue_refill_failed:${response.status}`);
+  return true;
+}
+
+async function refillReleasedQueueSlot(eventId: number): Promise<void> {
+  try {
+    await requestQueueRefill(eventId);
+  } catch (error) {
+    // The queue scheduler is the fallback, so payment remains successful if
+    // this low-latency notification is unavailable.
+    console.error('immediate queue refill failed', { eventId, error });
+  }
+}
+
 app.post('/orders/:orderId/payment', async (req, res) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
@@ -376,7 +412,7 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     if (!order) { await connection.rollback(); return res.status(404).json({ error: 'order_not_found' }); }
     if (order.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'order_owner_required' }); }
     if (order.status === 'PAID') {
-      await connection.execute(
+      const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
         `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
          SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
          WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
@@ -384,6 +420,7 @@ app.post('/orders/:orderId/payment', async (req, res) => {
       );
       await connection.commit();
       const paid = await loadOrder(orderId);
+      if (queueRelease.affectedRows > 0) await refillReleasedQueueSlot(Number(order.event_id));
       await publishOrderPaid(paid!);
       return res.json({ order: paid });
     }
@@ -405,15 +442,20 @@ app.post('/orders/:orderId/payment', async (req, res) => {
         await connection.execute("UPDATE event_inventory.seats SET status = 'AVAILABLE', hold_id = NULL WHERE hold_id = ? AND status = 'HELD'", [order.hold_id]);
       }
       await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'RELEASED' WHERE hold_id = ?", [order.hold_id]);
+      let releasedQueueSlot = false;
       if (failedHold) {
-        await connection.execute(
+        const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
           `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
            SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
            WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
           [failedHold.event_id, failedHold.customer_sub],
         );
+        releasedQueueSlot = queueRelease.affectedRows > 0;
       }
       await connection.commit();
+      if (releasedQueueSlot && failedHold) {
+        await refillReleasedQueueSlot(Number(failedHold.event_id));
+      }
       return res.status(402).json({ error: 'payment_failed' });
     }
     const [holds] = await connection.query<mysql.RowDataPacket[]>(
@@ -438,7 +480,7 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'CONFIRMED' WHERE hold_id = ?", [hold.hold_id]);
     await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'CAPTURED', ?)", [orderId, token, order.total_amount_cents]);
     await connection.execute("UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId]);
-    await connection.execute(
+    const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
       `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
        SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
        WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
@@ -446,6 +488,7 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     );
     await connection.commit();
     const paid = await loadOrder(orderId);
+    if (queueRelease.affectedRows > 0) await refillReleasedQueueSlot(Number(order.event_id));
     await publishOrderPaid(paid!);
     return res.json({ order: paid });
   } catch (error) {
