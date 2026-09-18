@@ -10,7 +10,10 @@
     "down": "docker compose -f infrastructure/docker-compose.yml --env-file .env down",
     "logs": "docker compose -f infrastructure/docker-compose.yml --env-file .env logs -f",
     "db:aws-ip": "powershell -ExecutionPolicy Bypass -File scripts/mysql-public-ip.ps1",
-    "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif,auth -c cyan,magenta,yellow,green,blue,red,white \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\" \"npm run dev -w services/auth\""
+    "dev:local": "cross-env HOST=0.0.0.0 concurrently -k -n event,inven,queue,order,ticket,notif,auth -c cyan,magenta,yellow,green,blue,red,white \"npm run dev -w services/event\" \"npm run dev -w services/inventory\" \"npm run dev -w services/queue\" \"npm run dev -w services/order\" \"npm run dev -w services/ticket\" \"npm run dev -w services/notification\" \"npm run dev -w services/auth\"",
+    "dev:authorization": "npm run dev -w services/authorization",
+    "test:authorization": "npm test -w services/authorization",
+    "test:authorization-client": "npm test -w services/authorization-client"
   },
   "repository": {
     "type": "git",
@@ -32,7 +35,9 @@
     "services/order",
     "services/ticket",
     "services/notification",
-    "services/auth"
+    "services/auth",
+    "services/authorization",
+    "services/authorization-client"
   ],
   "devDependencies": {
     "@types/express": "^5.0.6",

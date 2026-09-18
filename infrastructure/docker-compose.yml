@@ -192,6 +192,23 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
 
+  authorization:
+    <<: *service
+    profiles: [authorization]
+    environment:
+      SERVICE: authorization
+      PORT: 3008
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${AUTHORIZATION_DB_USER:-authorization_reader}
+      DB_PASSWORD: ${AUTHORIZATION_DB_PASSWORD:-}
+      DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      AUTHORIZATION_SERVICE_TOKEN: ${AUTHORIZATION_SERVICE_TOKEN:-}
+    ports:
+      - "127.0.0.1:3008:3008"
+
   kong:
     image: kong:3.9
     container_name: kong-gateway

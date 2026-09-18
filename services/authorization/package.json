@@ -1,0 +1,13 @@
+{
+  "name": "authorization",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "aws-jwt-verify": "^5.1.1"
+  }
+}
