@@ -10,10 +10,24 @@ const PORT = Number(process.env.PORT ?? 3001);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const configured = USER_POOL_ID.length > 0 && CLIENT_ID.length > 0;
-const verifier = configured
+let verifier = configured
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
-const cognito = new CognitoIdentityProviderClient({});
+let cognito: Pick<CognitoIdentityProviderClient, 'send'> = new CognitoIdentityProviderClient({});
+
+/**
+ * Test-only seams: swap the Cognito JWT verifier and the Cognito Identity
+ * Provider client for fakes so tests can authenticate as a known `sub` and
+ * control what user lookups return, without a real Cognito user pool.
+ * Never called outside test code — production always uses the real clients
+ * built above from real Cognito env vars.
+ */
+export function __setVerifierForTests(fake: typeof verifier): void {
+  verifier = fake;
+}
+export function __setCognitoForTests(fake: typeof cognito): void {
+  cognito = fake;
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -25,9 +39,12 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: SERVICE });
 });
 
+// docker-compose sets DB_NAME to this service's schema directly; running
+// outside docker (dev:local, tests) only has the per-schema DB_NAME_* vars
+// from the root .env, so fall back to that — same pattern as services/ticket.
 const databaseConfigured = Boolean(
   process.env.DB_HOST &&
-  process.env.DB_NAME &&
+  (process.env.DB_NAME || process.env.DB_NAME_EVENT_INVENTORY) &&
   process.env.DB_USER &&
   process.env.DB_PASSWORD,
 );
@@ -35,7 +52,7 @@ const databaseConfigured = Boolean(
 const database = mysql.createPool({
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),
-  database: process.env.DB_NAME ?? '',
+  database: process.env.DB_NAME ?? process.env.DB_NAME_EVENT_INVENTORY ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
   connectionLimit: 4,
@@ -358,15 +375,33 @@ app.get('/events/:eventId/users', async (req, res) => {
   }
 });
 
+/** Looks up a member's display name from Cognito by their `sub` (stored as
+ * `user_sub`, which is also their Cognito Username for this user pool).
+ * Falls back to an empty name — never fails the whole roster over one bad
+ * lookup (e.g. a deleted Cognito user still on the roster). */
+async function lookUpMemberName(userSub: string): Promise<string> {
+  if (!configured) return '';
+  try {
+    const user = await cognito.send(new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: userSub }));
+    return attribute(user.UserAttributes, 'name');
+  } catch (error) {
+    console.error(`failed to look up Cognito name for ${userSub}`, error);
+    return '';
+  }
+}
+
 app.get('/events/:eventId/team-members', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!(await requireEventOrganiser(req, res, eventId))) return;
-  const [members] = await database.query(
+  const [members] = await database.query<mysql.RowDataPacket[]>(
     "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? ORDER BY role, user_email",
     [eventId],
   );
-  res.json({ members });
+  const withNames = await Promise.all(
+    members.map(async (member) => ({ ...member, name: await lookUpMemberName(String(member.user_sub)) })),
+  );
+  res.json({ members: withNames });
 });
 
 app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
@@ -480,6 +515,12 @@ app.get('/team-invitations', async (req, res) => {
   res.json({ invitations });
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
-});
+// Guarded so importing this module from tests (NODE_ENV=test) doesn't also
+// bind the real port — tests start their own ephemeral listener via `app`.
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, HOST, () => {
+    console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
+  });
+}
+
+export { app, database };
