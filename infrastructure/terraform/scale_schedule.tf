@@ -1,11 +1,14 @@
-# Nightly low-traffic window: force every ECS service's desired count to 0
-# at 02:00 SGT, then back up to its normal floor (1) at 06:00 SGT. This is a
-# deliberately narrow window rather than a full scale-to-zero shutdown — the
-# team wants services reachable for most of the day (dev/demo tracking), but
-# still reclaims some idle-hour compute cost overnight instead of paying for
-# 24/7 uptime on all 9 services. Once every service is at 0, the capacity
-# provider's own managed scaling (autoscaling_capacity.tf, target_capacity=100)
-# naturally drains the ASG to 0 too — no separate ASG-zeroing schedule needed.
+# Weekday low-traffic window: force every ECS service's desired count to 0
+# at 02:00 SGT on Mon-Fri, then back up to its normal floor (1) at 18:00 SGT
+# on Mon-Fri. Saturday and Sunday are left alone entirely (no schedule fires),
+# so once the Friday 18:00 scale-up brings services back, they stay up through
+# the whole weekend until the next Monday 02:00 scale-down. This matches how
+# the team actually works this project — evenings and weekends, not weekday
+# daytime — so weekday daytime is the highest-value window to reclaim cost
+# from, not just a few overnight hours. Once every service is at 0, the
+# capacity provider's own managed scaling (autoscaling_capacity.tf,
+# target_capacity=100) naturally drains the ASG to 0 too — no separate
+# ASG-zeroing schedule needed.
 
 data "aws_iam_policy_document" "scheduler_trust" {
   statement {
@@ -46,7 +49,7 @@ resource "aws_scheduler_schedule" "scale_to_zero" {
   for_each = var.create_services ? toset(concat(keys(local.services), ["mysql"])) : []
 
   name                         = "${local.name_prefix}-scale-to-zero-${each.value}"
-  schedule_expression          = "cron(0 2 * * ? *)" # 02:00 daily — start of the low-traffic window
+  schedule_expression          = "cron(0 2 ? * MON-FRI *)" # 02:00 Mon-Fri — start of the weekday low-traffic window
   schedule_expression_timezone = "Asia/Singapore"
 
   flexible_time_window {
@@ -69,7 +72,7 @@ resource "aws_scheduler_schedule" "scale_up" {
   for_each = var.create_services ? local.services : {}
 
   name                         = "${local.name_prefix}-scale-up-${each.key}"
-  schedule_expression          = "cron(0 6 * * ? *)" # 06:00 daily — end of the low-traffic window
+  schedule_expression          = "cron(0 18 ? * MON-FRI *)" # 18:00 Mon-Fri — end of the weekday low-traffic window
   schedule_expression_timezone = "Asia/Singapore"
 
   flexible_time_window {
@@ -92,7 +95,7 @@ resource "aws_scheduler_schedule" "scale_up_mysql" {
   count = var.create_services ? 1 : 0
 
   name                         = "${local.name_prefix}-scale-up-mysql"
-  schedule_expression          = "cron(0 6 * * ? *)" # 06:00 daily — end of the low-traffic window
+  schedule_expression          = "cron(0 18 ? * MON-FRI *)" # 18:00 Mon-Fri — end of the weekday low-traffic window
   schedule_expression_timezone = "Asia/Singapore"
 
   flexible_time_window {
