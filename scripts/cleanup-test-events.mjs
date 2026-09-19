@@ -8,8 +8,7 @@ const configured = Boolean(
 );
 
 if (!configured) {
-  console.error('Test-event cleanup skipped: database variables are not configured.');
-  process.exitCode = 1;
+  console.log('Test-event cleanup skipped: database variables are not configured.');
 } else {
   const connection = await mysql.createConnection({
     host: process.env.DB_HOST,

@@ -32,12 +32,12 @@ async function caller(req: express.Request, res: express.Response): Promise<Call
   catch { res.status(401).json({ error: 'unauthenticated' }); return null; }
 }
 
-function id(value: unknown): number | null {
+export function positiveId(value: unknown): number | null {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-function nonNegativeInteger(value: unknown): number | null {
+export function nonNegativeInteger(value: unknown): number | null {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
@@ -49,7 +49,7 @@ async function organiser(sub: string, eventId: number): Promise<boolean> {
 }
 
 app.get('/events/:eventId/seats', async (req, res) => {
-  const eventId = id(req.params.eventId);
+  const eventId = positiveId(req.params.eventId);
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   const [seats] = await database.query('SELECT seat_id, seat_label, status FROM seats WHERE event_id = ? ORDER BY seat_id', [eventId]);
@@ -57,10 +57,10 @@ app.get('/events/:eventId/seats', async (req, res) => {
 });
 
 app.put('/events/:eventId/inventory', async (req, res) => {
-  const eventId = id(req.params.eventId);
+  const eventId = positiveId(req.params.eventId);
   const user = await caller(req, res);
   if (!user || !eventId) return res.status(user ? 400 : 401).json({ error: 'invalid_inventory_request' });
-  const totalQty = id(req.body?.totalQty);
+  const totalQty = positiveId(req.body?.totalQty);
   const priceCents = nonNegativeInteger(req.body?.priceCents);
   if (!totalQty || priceCents === null || !(await organiser(user.sub, eventId))) return res.status(400).json({ error: 'invalid_inventory_request' });
   const [existing] = await database.query<mysql.RowDataPacket[]>("SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1", [eventId]);
@@ -73,11 +73,11 @@ app.put('/events/:eventId/inventory', async (req, res) => {
 });
 
 app.post('/events/:eventId/inventory/hold', async (req, res) => {
-  const eventId = id(req.params.eventId);
+  const eventId = positiveId(req.params.eventId);
   const user = await caller(req, res);
   if (!user || !eventId) return res.status(user ? 400 : 401).json({ error: 'invalid_hold_request' });
-  const seatIds = Array.isArray(req.body?.seatIds) ? req.body.seatIds.map(id) : [];
-  const quantity = id(req.body?.quantity) ?? (seatIds.length || null);
+  const seatIds = Array.isArray(req.body?.seatIds) ? req.body.seatIds.map(positiveId) : [];
+  const quantity = positiveId(req.body?.quantity) ?? (seatIds.length || null);
   if (!quantity || (seatIds.length > 0 && seatIds.some((seatId): seatId is number => seatId === null))) return res.status(422).json({ error: 'invalid_hold_request' });
   const connection = await database.getConnection();
   try {
@@ -99,7 +99,7 @@ app.post('/events/:eventId/inventory/hold', async (req, res) => {
 });
 
 async function finishHold(req: express.Request, res: express.Response, status: 'RELEASED' | 'CONFIRMED') {
-  const holdId = id(req.params.holdId); const user = await caller(req, res);
+  const holdId = positiveId(req.params.holdId); const user = await caller(req, res);
   if (!user || !holdId) return res.status(user ? 400 : 401).json({ error: 'invalid_hold' });
   const connection = await database.getConnection();
   try {
