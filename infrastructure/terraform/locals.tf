@@ -102,6 +102,9 @@ locals {
           } : {},
           contains(["order", "queue"], name) ? {
             INTERNAL_API_TOKEN = "${aws_secretsmanager_secret.mysql.arn}:INTERNAL_API_TOKEN::"
+          } : {},
+          name == "ticket" ? {
+            SCANNER_SESSION_SECRET = "${aws_secretsmanager_secret.mysql.arn}:SCANNER_SESSION_SECRET::"
           } : {}
         )
       }
