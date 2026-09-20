@@ -1,65 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it, mock } from 'node:test';
 
-// Safety: nothing in this file may ever reach a real database or AWS. The pool
-// and the token verifier are replaced with fakes below, and the environment
-// points at hosts that cannot resolve.
-process.env.NODE_ENV = 'test';
-process.env.DB_HOST = 'db.invalid';
-process.env.DB_PORT = '1';
-process.env.DB_NAME = 'ticketing';
-process.env.DB_USER = 'test';
-process.env.DB_PASSWORD = 'test';
-process.env.COGNITO_USER_POOL_ID = 'ap-southeast-1_test';
-process.env.COGNITO_CLIENT_ID = 'test-client';
+import { installOfflineServices, startServer, type TestServer } from '../../test-support/offline-services.js';
 
-interface Call {
-  readonly sql: string;
-  readonly params: readonly unknown[];
-}
-
-const calls: Call[] = [];
-let rules: { pattern: RegExp; response: unknown }[] = [];
-
-/** Script the fake database: the first rule whose pattern matches a statement answers it. */
-function on(pattern: RegExp, response: unknown): void {
-  rules.push({ pattern, response });
-}
-
-function run(sql: string, params: readonly unknown[] = []): [unknown, unknown[]] {
-  const statement = sql.replace(/\s+/g, ' ').trim();
-  calls.push({ sql: statement, params });
-  const rule = rules.find((candidate) => candidate.pattern.test(statement));
-  if (!rule) throw new Error(`Unscripted SQL: ${statement}`);
-  if (rule.response instanceof Error) throw rule.response;
-  return [rule.response, []];
-}
-
-mock.module('mysql2/promise', {
-  defaultExport: {
-    createPool: () => ({
-      query: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-      execute: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-      getConnection: async () => {
-        throw new Error('no connection expected');
-      },
-    }),
-  },
+// Nothing here can reach a real database or AWS: see test-support/offline-services.ts.
+const db = installOfflineServices(mock, {
+  env: { DB_NAME: 'ticketing' },
+  claims: (token) => ({ sub: token, email: `${token}@example.com` }),
 });
-
-// A bearer token is its own subject; "bad" fails verification.
-mock.module('aws-jwt-verify', {
-  namedExports: {
-    CognitoJwtVerifier: {
-      create: () => ({
-        verify: async (token: string) => {
-          if (token === 'bad') throw new Error('invalid token');
-          return { sub: token, email: `${token}@example.com` };
-        },
-      }),
-    },
-  },
-});
+const { calls, on } = db;
 
 const { app, confirmationEmailStatus } = await import('./index.js');
 
@@ -83,18 +32,16 @@ describe('confirmationEmailStatus', () => {
 });
 
 describe('GET /customers/me/orders/:orderId/confirmation', () => {
-  let server: ReturnType<typeof app.listen>;
+  let server: TestServer;
   let base = '';
 
   before(async () => {
-    server = app.listen(0);
-    await new Promise<void>((resolve) => server.once('listening', resolve));
-    base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    server = await startServer(app);
+    base = server.base;
   });
   after(() => server.close());
   beforeEach(() => {
-    calls.length = 0;
-    rules = [];
+    db.reset();
   });
 
   const ORDER_OWNED = /FROM checkout\.orders WHERE order_id = \? AND customer_sub = \?/;

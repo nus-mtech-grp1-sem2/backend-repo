@@ -1,72 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it, mock } from 'node:test';
 
-// Safety: nothing in this file may ever reach a real database or AWS. The pool,
-// the token verifier and the Cognito client are all replaced with fakes below,
-// and the environment points at hosts that cannot resolve.
-process.env.DB_HOST = 'db.invalid';
-process.env.DB_PORT = '1';
-process.env.DB_NAME = 'event_inventory';
-process.env.DB_USER = 'test';
-process.env.DB_PASSWORD = 'test';
-process.env.COGNITO_USER_POOL_ID = 'ap-southeast-1_test';
-process.env.COGNITO_CLIENT_ID = 'test-client';
+import { installOfflineServices, startServer, type TestServer } from '../../test-support/offline-services.js';
 
-interface Call {
-  readonly sql: string;
-  readonly params: readonly unknown[];
-}
-type Response = unknown;
-
-const calls: Call[] = [];
-let rules: { pattern: RegExp; response: Response }[] = [];
-
-/** Script the fake database: the first rule whose pattern matches a statement answers it. */
-function on(pattern: RegExp, response: Response): void {
-  rules.push({ pattern, response });
-}
-
-function run(sql: string, params: readonly unknown[] = []): [unknown, unknown[]] {
-  const statement = sql.replace(/\s+/g, ' ').trim();
-  calls.push({ sql: statement, params });
-  const rule = rules.find((candidate) => candidate.pattern.test(statement));
-  if (!rule) throw new Error(`Unscripted SQL: ${statement}`);
-  if (rule.response instanceof Error) throw rule.response;
-  return [rule.response, []];
-}
-
-const connection = {
-  beginTransaction: async () => void calls.push({ sql: 'BEGIN', params: [] }),
-  commit: async () => void calls.push({ sql: 'COMMIT', params: [] }),
-  rollback: async () => void calls.push({ sql: 'ROLLBACK', params: [] }),
-  release: () => undefined,
-  query: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-  execute: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-};
-
-mock.module('mysql2/promise', {
-  defaultExport: {
-    createPool: () => ({
-      query: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-      execute: async (sql: string, params?: readonly unknown[]) => run(sql, params),
-      getConnection: async () => connection,
-    }),
-  },
+// Nothing here can reach a real database or AWS: see test-support/offline-services.ts.
+const db = installOfflineServices(mock, {
+  env: { DB_NAME: 'event_inventory' },
+  claims: (token) => ({ sub: token }),
 });
-
-// A bearer token is its own subject; "bad" fails verification.
-mock.module('aws-jwt-verify', {
-  namedExports: {
-    CognitoJwtVerifier: {
-      create: () => ({
-        verify: async (token: string) => {
-          if (token === 'bad') throw new Error('invalid token');
-          return { sub: token };
-        },
-      }),
-    },
-  },
-});
+const { calls, on } = db;
 
 class ListUsersCommand {
   constructor(readonly input: Record<string, unknown>) {}
@@ -198,18 +140,16 @@ describe('parseEventInput', () => {
 });
 
 describe('organiser endpoints', () => {
-  let server: ReturnType<typeof app.listen>;
+  let server: TestServer;
   let base = '';
 
   before(async () => {
-    server = app.listen(0);
-    await new Promise<void>((resolve) => server.once('listening', resolve));
-    base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    server = await startServer(app);
+    base = server.base;
   });
   after(() => server.close());
   beforeEach(() => {
-    calls.length = 0;
-    rules = [];
+    db.reset();
     cognitoSend.mock.resetCalls();
     cognitoSend.mock.mockImplementation(async () => ({}));
   });
@@ -531,7 +471,7 @@ describe('organiser endpoints', () => {
 
       assert.equal((await request('GET', '/events/zero/team-members', { token: 'alice' })).status, 400);
 
-      rules = [];
+      db.clearRules();
       isNotOrganiser();
       assert.equal((await request('GET', '/events/5/team-members', { token: 'mallory' })).status, 403);
     });
@@ -554,7 +494,7 @@ describe('organiser endpoints', () => {
         on(/SELECT organiser_sub FROM events/, []);
         assert.equal((await request('DELETE', '/events/5/team-members/bob', { token: 'alice' })).status, 404);
 
-        rules = [];
+        db.clearRules();
         scriptTeam('alice', null);
         assert.deepEqual(await request('DELETE', '/events/5/team-members/bob', { token: 'alice' }), {
           status: 404,
@@ -568,8 +508,7 @@ describe('organiser endpoints', () => {
         assert.deepEqual(refused, { status: 403, body: { error: 'event_owner_required' } });
         assert.equal(removed(), false);
 
-        calls.length = 0;
-        rules = [];
+        db.reset();
         scriptTeam('owner', 'ORGANISER');
         const allowed = await request('DELETE', '/events/5/team-members/carol', { token: 'owner' });
         assert.equal(allowed.status, 204);
@@ -581,8 +520,7 @@ describe('organiser endpoints', () => {
         isOrganiser();
         assert.equal((await request('DELETE', '/events/5/team-members/bob', { token: 'alice' })).status, 204);
 
-        calls.length = 0;
-        rules = [];
+        db.reset();
         scriptTeam('owner', 'HELPER');
         isNotOrganiser();
         const refused = await request('DELETE', '/events/5/team-members/bob', { token: 'mallory' });
@@ -672,7 +610,7 @@ describe('organiser endpoints', () => {
       on(/SELECT organiser_sub FROM events/, []);
       assert.equal((await invite({ email: 'b@x.com', role: 'HELPER' })).status, 404);
 
-      rules = [];
+      db.clearRules();
       scriptInvite();
       cognitoSend.mock.mockImplementation(async () => ({ Users: [] }));
       assert.deepEqual(await invite({ email: 'b@x.com', role: 'HELPER' }), {
