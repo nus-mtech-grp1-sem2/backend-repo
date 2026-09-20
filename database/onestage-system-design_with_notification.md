@@ -79,7 +79,7 @@ graph TB
 
 **Authorization rides on one small table, not another service.** Cognito authenticates every request, but Organiser/Helper are per-event roles that don't map onto global Cognito groups. `event_team_memberships` in the Event & Inventory schema is the single source of truth: creating an event auto-inserts its creator as an accepted `ORGANISER`; an invitation creates a `PENDING` membership for the invitee's Cognito `sub`, with `granted_by_sub` set to the event owner's `organiser_sub`. Every organiser-or-helper-scoped endpoint in any service checks membership synchronously. Every other endpoint just requires a valid Cognito JWT — any signed-in user is a Customer by default.
 
-**The confirmation email is its own service, called synchronously but idempotently.** After Ticket Issuance consumes `OrderPaid` and creates the ticket rows, it calls the Notification Service's `POST /notifications/order-confirmation` to render the QR codes and send the Gmail-based confirmation email, rather than sending mail itself. That call is synchronous so the caller gets back a definite `SENT`/`FAILED` outcome, but it's idempotent on `order_id` — a unique key on `email_notifications` — so a retried call after a timeout can never double-email a customer; it just returns the already-`SENT` record. A delivery failure is recorded as `FAILED` and returned with a 201, not thrown back as an error: the order is already paid and the tickets already exist, so a bad SMTP credential degrades to "no confirmation email" instead of blocking or reversing the sale.
+**The confirmation email is its own service, one email per ticket, idempotent per ticket.** After Ticket Issuance creates the ticket rows for a paid order, it calls the Notification Service's `POST /notifications/order-confirmation` with the order's tickets, rather than sending mail itself. The Notification Service sends one email per ticket — each carrying only that ticket's QR code — and records one `email_notifications` row per ticket, so a booking of three tickets is three emails and three rows. Ticket Issuance does not wait on that call: sending mail takes seconds and must not slow the payment path, and the Notification Service records each ticket's `SENT`/`FAILED` outcome itself. It's idempotent on `ticket_id` — a unique key on `email_notifications` — so a retried call can never double-email a customer: tickets already `SENT` are skipped, and only tickets that are missing or `FAILED` are (re)sent. A delivery failure is recorded as `FAILED` and returned with a 201, not thrown back as an error: the order is already paid and the tickets already exist, so a bad SMTP credential degrades to "no confirmation email" instead of blocking or reversing the sale.
 
 **What's deliberately left out.** Cognito's own login/token-refresh flow, network firewalls and WAF rules, a service mesh, and rate limiting beyond the waiting room's own admission control are all out of scope. IDs below are plain auto-increment `BIGINT`s rather than UUIDs, and every "email" field is a denormalized snapshot taken from the Cognito JWT at write time, so no service has to call another just to render a name.
 
@@ -646,7 +646,7 @@ classDiagram
 
 ## Notification Service — `notification` schema
 
-Sends the post-purchase confirmation email (event details, order total, and a QR code per ticket) once Ticket Issuance has created the tickets for a paid order. It owns no inventory or money state — just the record of what was sent, to whom, and whether it succeeded — and delivers over Gmail SMTP via nodemailer.
+Sends one confirmation email per issued ticket (event name, location, date/time, and that ticket's QR code) once Ticket Issuance has created the tickets for a paid order. It owns no inventory or money state — just the record of what was sent, to whom, and whether it succeeded — and delivers over Gmail SMTP via nodemailer.
 
 ### Data model
 
@@ -654,7 +654,8 @@ Sends the post-purchase confirmation email (event details, order total, and a QR
 erDiagram
     EMAIL_NOTIFICATIONS {
         bigint notification_id PK
-        bigint order_id "logical ref -> checkout.orders, no FK, unique"
+        bigint order_id "logical ref -> checkout.orders, no FK, indexed"
+        bigint ticket_id "logical ref -> ticketing.tickets, no FK, unique, nullable"
         bigint event_id "logical ref -> event_inventory.events, no FK"
         varchar customer_sub "Cognito sub"
         varchar customer_email
@@ -667,7 +668,7 @@ erDiagram
     }
 ```
 
-`order_id` carries a unique key, not just an index — it's what makes the send idempotent. A second call for the same order updates the existing row (`ON DUPLICATE KEY UPDATE`) instead of inserting a duplicate.
+`ticket_id` carries a unique key, not just an index — it's what makes the send idempotent. A second call for the same ticket updates the existing row (`ON DUPLICATE KEY UPDATE`) instead of inserting a duplicate, while `order_id` is a plain index so one order can hold several rows. `ticket_id` is nullable only for rows written before per-ticket emails; MySQL allows any number of `NULL`s under a unique key. Apply `08-email-notifications-per-ticket.sql` to move an existing database to this shape.
 
 ### Domain model
 
@@ -676,6 +677,7 @@ classDiagram
     class EmailNotification {
         +Long notificationId
         +Long orderId
+        +Long ticketId
         +Long eventId
         +String customerSub
         +String customerEmail
@@ -698,8 +700,8 @@ classDiagram
     }
     class NotificationService {
         <<service>>
-        +sendOrderConfirmation(dto) EmailNotification
-        +getNotification(orderId) EmailNotification
+        +sendOrderConfirmation(dto) List~EmailNotification~
+        +getNotifications(orderId) List~EmailNotification~
     }
 
     NotificationService ..> EmailNotification : manages
@@ -709,12 +711,12 @@ classDiagram
 
 | Method | Path | Description | Caller |
 |---|---|---|---|
-| POST | `/notifications/order-confirmation` | Render QR codes and send the booking confirmation email; idempotent on `orderId` — returns the existing record unchanged if already `SENT` | Ticket Issuance & Validation Service |
-| GET | `/notifications/{orderId}` | Look up the send outcome (status, error, timestamps) for an order's confirmation email, for support/ops diagnosis | Not yet called by another service — read-only diagnostic route |
+| POST | `/notifications/order-confirmation` | Send one confirmation email per ticket in the order and record one `email_notifications` row per ticket; idempotent on `ticketId` — tickets already `SENT` are skipped. Responds `{ orderId, notifications: [...] }`: 201 if any email was attempted, 200 if every ticket was already `SENT` | Ticket Issuance & Validation Service |
+| GET | `/notifications/{orderId}` | Look up the send outcome (status, error, timestamps) of every ticket email for an order, for support/ops diagnosis; 404 if none | Not yet called by another service — read-only diagnostic route |
 
 ### Schema installation
 
-Run `06-add-notification-schema.sql` once, in addition to `02-init-create-tables-index.sql`; it creates the `notification` database and the `email_notifications` table (`CREATE ... IF NOT EXISTS`, so it's safe to re-run). Afterward, re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new schema too.
+Run `06-add-notification-schema.sql` once, in addition to `02-init-create-tables-index.sql`; it creates the `notification` database and the `email_notifications` table (`CREATE ... IF NOT EXISTS`, so it's safe to re-run). Afterward, re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new schema too. On a database created before per-ticket emails, also run `08-email-notifications-per-ticket.sql` once (it checks `information_schema` first, so it's safe to re-run); it adds `ticket_id`, makes it the unique key, and demotes `order_id` to a plain index. The Notification Service needs it: its per-ticket queries fail with `Unknown column 'ticket_id'` until it has been applied.
 
 ---
 
@@ -751,10 +753,9 @@ sequenceDiagram
     CPS->>SQS: publish OrderPaid  (async — decouples issuance)
     SQS-->>TIV: deliver OrderPaid
     TIV->>TIV: issue ticket(s), generate QR tokens
-    TIV->>NS: POST /notifications/order-confirmation (sync, idempotent on orderId)
-    NS->>NS: render QR images, send via Gmail SMTP
-    NS-->>TIV: notification record (SENT or FAILED)
-    NS-->>C: confirmation email with QR codes (async delivery)
+    TIV->>NS: POST /notifications/order-confirmation (not awaited, idempotent per ticketId)
+    NS->>NS: per ticket: render QR image, send via Gmail SMTP, insert email_notifications row
+    NS-->>C: one confirmation email per ticket, each with its QR code (async delivery)
 ```
 
 A Tier 1 purchase runs the same path with the Waiting Room steps skipped entirely — `POST /inventory/hold` succeeds immediately since there's no queue to admit from.

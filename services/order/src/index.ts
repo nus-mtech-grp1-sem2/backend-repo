@@ -155,6 +155,20 @@ export function isEventTeamPurchase(
   return String(eventOrganiserSub ?? '') === customerSub || acceptedMembershipCount > 0;
 }
 
+/**
+ * Why tickets for an event cannot be bought right now, or null when they can.
+ * Events carry a start time but no end time, so one that has started is
+ * completed and never on sale, whatever its status. `has_started` is computed
+ * by MySQL against UTC_TIMESTAMP(), the same reading of the stored start time
+ * that the event API and the web app use.
+ */
+export function saleBlockReason(
+  event: Readonly<Record<string, unknown>>,
+): 'event_not_on_sale' | 'event_completed' | null {
+  if (event['status'] !== 'PUBLISHED') return 'event_not_on_sale';
+  return Number(event['has_started']) === 1 ? 'event_completed' : null;
+}
+
 async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
   const [orders] = await database.query<mysql.RowDataPacket[]>(
     `SELECT order_id, event_id, customer_sub, customer_email, hold_id, status, total_amount_cents, currency, created_at, paid_at
@@ -226,7 +240,8 @@ app.post('/orders', async (req, res) => {
       eventId = Number(hold.event_id);
     }
     const [events] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT event_id, organiser_sub, tier, status FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+      `SELECT event_id, organiser_sub, tier, status, starts_at < UTC_TIMESTAMP() AS has_started
+       FROM event_inventory.events WHERE event_id = ? LIMIT 1`, [eventId],
     );
     const event = events[0];
     if (!event) { await connection.rollback(); return res.status(404).json({ error: 'event_not_found' }); }
@@ -240,7 +255,8 @@ app.post('/orders', async (req, res) => {
       await connection.rollback();
       return res.status(403).json({ error: 'event_team_cannot_purchase' });
     }
-    if (event.status !== 'PUBLISHED') { await connection.rollback(); return res.status(409).json({ error: 'event_not_on_sale' }); }
+    const saleBlock = saleBlockReason(event);
+    if (saleBlock) { await connection.rollback(); return res.status(409).json({ error: saleBlock }); }
 
     if (event.tier === 'TIER2_SEATED' && !input.holdId) {
       if (!input.admissionToken) { await connection.rollback(); return res.status(403).json({ error: 'queue_admission_required' }); }

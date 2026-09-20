@@ -112,6 +112,8 @@ function parseEventInput(input: EventInput): { title: string; description: strin
   if (!title || title.length > 255 || !venue || venue.length > 255 || !Number.isSafeInteger(totalSeats) || totalSeats < 1 || totalSeats > 1_000_000 || !tier || Number.isNaN(Date.parse(startsAt))) return null;
   if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > totalSeats)) return null;
   if (priceCents !== null && (!Number.isSafeInteger(priceCents) || priceCents < 0 || priceCents > 100_000_000)) return null;
+  // parsePriceCents answers null for both "no price" and "invalid price"; a price that was given but does not parse is invalid.
+  if (input.price !== undefined && input.price !== null && priceCents === null) return null;
   return { title, description, venue, startsAt, totalSeats, availableBuyers, tier, priceCents };
 }
 
@@ -609,6 +611,10 @@ app.get('/team-invitations', async (req, res) => {
   res.json({ invitations });
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, HOST, () => {
+    console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
+  });
+}
+
+export { app, parseEventInput, parsePriceCents, validEventId };

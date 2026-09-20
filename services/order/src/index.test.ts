@@ -8,6 +8,7 @@ import {
   positiveInteger,
   requestQueueRefill,
   requestTicketIssuance,
+  saleBlockReason,
 } from './index.js';
 
 describe('order input validation', () => {
@@ -43,6 +44,23 @@ describe('event-team purchase restriction', () => {
 
   it('allows a customer who is not on the event team', () => {
     assert.equal(isEventTeamPurchase('owner-sub', 0, 'customer-sub'), false);
+  });
+});
+
+describe('sale window', () => {
+  it('is on sale only while the event is published and has not started', () => {
+    assert.equal(saleBlockReason({ status: 'PUBLISHED', has_started: 0 }), null);
+    assert.equal(saleBlockReason({ status: 'PUBLISHED', has_started: 1 }), 'event_completed');
+  });
+
+  it('treats an event that is not published as not on sale, even after it has started', () => {
+    assert.equal(saleBlockReason({ status: 'DRAFT', has_started: 0 }), 'event_not_on_sale');
+    assert.equal(saleBlockReason({ status: 'CANCELLED', has_started: 1 }), 'event_not_on_sale');
+  });
+
+  it('does not treat a missing start flag as completed', () => {
+    assert.equal(saleBlockReason({ status: 'PUBLISHED', has_started: null }), null);
+    assert.equal(saleBlockReason({ status: 'PUBLISHED', has_started: undefined }), null);
   });
 });
 

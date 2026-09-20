@@ -89,6 +89,52 @@ function positiveInteger(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+/**
+ * Events carry a start time but no end time, so one that has started is
+ * completed: nobody can queue for it or be admitted to buy. `has_started` is
+ * computed by MySQL against UTC_TIMESTAMP(), the same reading of the stored
+ * start time that the event API and the web app use.
+ */
+function eventHasStarted(event: Readonly<Record<string, unknown>> | undefined): boolean {
+  return Number(event?.['has_started']) === 1;
+}
+
+/** Admission is only possible while an event is published and has not started. */
+function assertEventOnSale<T extends Readonly<Record<string, unknown>>>(
+  event: T | undefined,
+): asserts event is T {
+  if (!event || event['status'] !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
+  if (eventHasStarted(event)) throw new QueueApiError(409, 'event_completed');
+}
+
+/**
+ * Opens a waiting room whose scheduled time has come, then says why it still
+ * cannot be joined, or null when it is open.
+ */
+async function joinBlockReason(
+  connection: mysql.PoolConnection,
+  session: mysql.RowDataPacket,
+): Promise<'queue_drained' | 'queue_not_open' | null> {
+  if (session.status === 'CLOSED' && new Date(session.opens_at).getTime() <= Date.now()) {
+    await connection.execute("UPDATE queue_sessions SET status = 'OPEN' WHERE queue_session_id = ?", [session.queue_session_id]);
+    session.status = 'OPEN';
+  }
+  if (session.status === 'OPEN') return null;
+  return session.status === 'DRAINED' ? 'queue_drained' : 'queue_not_open';
+}
+
+/**
+ * A customer who is waiting, admitted or in checkout keeps their place when they
+ * join again, unless their admission token has expired.
+ */
+function keepsQueuePlace(entry: QueueEntryRow): boolean {
+  const tokenExpired =
+    ['ADMITTED', 'IN_CHECKOUT'].includes(entry.status) &&
+    entry.token_expires_at &&
+    new Date(entry.token_expires_at).getTime() <= Date.now();
+  return !tokenExpired && ['WAITING', 'ADMITTED', 'IN_CHECKOUT'].includes(entry.status);
+}
+
 const TOKEN_TTL_SEC = positiveInteger(process.env.ADMISSION_TOKEN_TTL_SEC) ?? 600;
 const AUTO_ADMISSION_ENABLED = process.env.AUTO_ADMISSION_ENABLED !== 'false';
 const ADMISSION_SCHEDULER_POLL_MS = Math.min(
@@ -327,27 +373,26 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    );
+    if (eventHasStarted(events[0])) { await connection.rollback(); return res.status(409).json({ error: 'event_completed' }); }
     const [sessions] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
     const session = sessions[0];
     if (!session) { await connection.rollback(); return res.status(404).json({ error: 'queue_not_configured' }); }
-    if (session.status === 'CLOSED' && new Date(session.opens_at).getTime() <= Date.now()) {
-      await connection.execute("UPDATE queue_sessions SET status = 'OPEN' WHERE queue_session_id = ?", [session.queue_session_id]);
-      session.status = 'OPEN';
-    }
-    if (session.status !== 'OPEN') {
+    const notJoinable = await joinBlockReason(connection, session);
+    if (notJoinable) {
       await connection.rollback();
-      return res.status(409).json({ error: session.status === 'DRAINED' ? 'queue_drained' : 'queue_not_open' });
+      return res.status(409).json({ error: notJoinable });
     }
     const [existingRows] = await connection.query<QueueEntryRow[]>(
       'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_session_id = ? AND customer_sub = ? LIMIT 1 FOR UPDATE',
       [session.queue_session_id, caller.sub],
     );
     let entry = existingRows[0];
-    const tokenExpired = entry && ['ADMITTED', 'IN_CHECKOUT'].includes(entry.status) &&
-      entry.token_expires_at && new Date(entry.token_expires_at).getTime() <= Date.now();
-    if (entry && !tokenExpired && ['WAITING', 'ADMITTED', 'IN_CHECKOUT'].includes(entry.status)) {
+    if (entry && keepsQueuePlace(entry)) {
       await connection.commit();
       return res.json(queueEntryResponse(entry));
     }
@@ -483,6 +528,7 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
       `SELECT e.status, e.tier, e.total_seats, e.available_buyers,
+        e.starts_at < UTC_TIMESTAMP() AS has_started,
         CASE WHEN e.tier = 'TIER2_SEATED'
           THEN (SELECT COUNT(*) FROM event_inventory.seats WHERE event_id = e.event_id AND status = 'AVAILABLE')
           ELSE (SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) FROM event_inventory.inventory_items WHERE event_id = e.event_id)
@@ -490,7 +536,7 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
        FROM event_inventory.events e WHERE e.event_id = ? LIMIT 1`, [eventId],
     );
     const event = availabilityRows[0];
-    if (!event || event.status !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
+    assertEventOnSale(event);
     const availableTickets = Number(event.available_qty ?? 0);
     if (availableTickets <= 0) {
       await connection.execute("UPDATE queue_sessions SET status = 'DRAINED' WHERE queue_session_id = ?", [session.queue_session_id]);
@@ -657,7 +703,10 @@ export {
   availableAdmissionSlots,
   app,
   buyerCapacity,
+  assertEventOnSale,
   customerAdmittedEvent,
+  eventHasStarted,
+  keepsQueuePlace,
   parseConfig,
   positiveInteger,
   publishCustomerAdmitted,

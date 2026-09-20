@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { after, describe, it } from 'node:test';
+import { after, describe, it, mock } from 'node:test';
 
 import {
   app,
   checkinInput,
   createQrToken,
+  notifyOrderConfirmed,
   parseOrderPaid,
   parseSearchQuery,
   reconcilePaidOrders,
@@ -133,5 +134,101 @@ describe('CU-07 ticket issuance primitives', () => {
     );
 
     assert.deepEqual(result, { matchedOrders: 2, issuedTickets: 2, failedOrders: 1 });
+  });
+});
+
+describe('booking confirmation email hook', () => {
+  const payload = {
+    orderId: 42,
+    eventId: 7,
+    customerSub: 'customer-sub',
+    customerEmail: 'buyer@example.com',
+    event: { title: 'Event NUS', venue: 'NUS ISS', startsAt: '2026-09-16T16:23:00.000Z' },
+    order: { totalAmountCents: 5000, currency: 'SGD' },
+    tickets: [{ ticketId: 1, qrToken: 'qr-token', description: 'General Admission', seatLabel: null }],
+  };
+
+  it('posts the order confirmation to the notification service', async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const requester = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ orderId: 42, notifications: [{ ticketId: 1, status: 'SENT' }] }), { status: 201 });
+    }) as typeof fetch;
+
+    const sent = await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006/', requester);
+
+    assert.equal(sent, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, 'http://notification:3006/notifications/order-confirmation');
+    assert.equal(calls[0]?.init.method, 'POST');
+    assert.deepEqual(JSON.parse(String(calls[0]?.init.body)), payload);
+  });
+
+  it('logs each ticket whose email failed, but still counts the request as accepted', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    try {
+      const requester = (async () =>
+        new Response(
+          JSON.stringify({
+            orderId: 42,
+            notifications: [
+              { ticketId: 1, status: 'SENT' },
+              { ticketId: 2, status: 'FAILED', errorMessage: 'smtp exploded' },
+            ],
+          }),
+          { status: 201 },
+        )) as typeof fetch;
+
+      assert.equal(await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006', requester), true);
+      assert.equal(logged.mock.callCount(), 1);
+      assert.deepEqual(logged.mock.calls[0]?.arguments[1], { orderId: 42, ticketId: 2, reason: 'smtp exploded' });
+    } finally {
+      logged.mock.restore();
+    }
+  });
+
+  it('does nothing when no notification service is configured', async () => {
+    let loaded = false;
+    const sent = await notifyOrderConfirmed(
+      42,
+      async () => {
+        loaded = true;
+        return payload;
+      },
+      '',
+    );
+
+    assert.equal(sent, false);
+    assert.equal(loaded, false);
+  });
+
+  it('skips the email when the order has no paid tickets to send', async () => {
+    let requested = false;
+    const requester = (async () => {
+      requested = true;
+      return new Response('{}', { status: 201 });
+    }) as typeof fetch;
+
+    assert.equal(await notifyOrderConfirmed(42, async () => null, 'http://notification:3006', requester), false);
+    assert.equal(requested, false);
+  });
+
+  it('never throws, so a failed email cannot undo a paid order', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    try {
+      const serverError = (async () => new Response('{}', { status: 500 })) as typeof fetch;
+      const unreachable = (async () => {
+        throw new Error('connect ECONNREFUSED');
+      }) as typeof fetch;
+
+      assert.equal(await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006', serverError), false);
+      assert.equal(await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006', unreachable), false);
+      assert.equal(
+        await notifyOrderConfirmed(42, async () => { throw new Error('db down'); }, 'http://notification:3006'),
+        false,
+      );
+    } finally {
+      logged.mock.restore();
+    }
   });
 });
