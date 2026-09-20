@@ -27,7 +27,14 @@ try {
   if (testFiles.length === 0) {
     console.log('No event-service unit tests found.');
   } else {
-    testExitCode = await run(process.execPath, ['--import', 'tsx', '--test', ...testFiles]);
+    // The organiser endpoint tests replace the database and Cognito with fakes via module mocking.
+    testExitCode = await run(process.execPath, [
+      '--import',
+      'tsx',
+      '--experimental-test-module-mocks',
+      '--test',
+      ...testFiles,
+    ]);
   }
 } finally {
   const cleanupExitCode = await run(process.execPath, [
