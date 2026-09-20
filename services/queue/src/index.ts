@@ -89,6 +89,16 @@ function positiveInteger(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+/**
+ * Events carry a start time but no end time, so one that has started is
+ * completed: nobody can queue for it or be admitted to buy. `has_started` is
+ * computed by MySQL against UTC_TIMESTAMP(), the same reading of the stored
+ * start time that the event API and the web app use.
+ */
+function eventHasStarted(event: Readonly<Record<string, unknown>> | undefined): boolean {
+  return Number(event?.['has_started']) === 1;
+}
+
 const TOKEN_TTL_SEC = positiveInteger(process.env.ADMISSION_TOKEN_TTL_SEC) ?? 600;
 const AUTO_ADMISSION_ENABLED = process.env.AUTO_ADMISSION_ENABLED !== 'false';
 const ADMISSION_SCHEDULER_POLL_MS = Math.min(
@@ -327,6 +337,10 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    );
+    if (eventHasStarted(events[0])) { await connection.rollback(); return res.status(409).json({ error: 'event_completed' }); }
     const [sessions] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
@@ -483,6 +497,7 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
     }
     const [availabilityRows] = await connection.query<mysql.RowDataPacket[]>(
       `SELECT e.status, e.tier, e.total_seats, e.available_buyers,
+        e.starts_at < UTC_TIMESTAMP() AS has_started,
         CASE WHEN e.tier = 'TIER2_SEATED'
           THEN (SELECT COUNT(*) FROM event_inventory.seats WHERE event_id = e.event_id AND status = 'AVAILABLE')
           ELSE (SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) FROM event_inventory.inventory_items WHERE event_id = e.event_id)
@@ -491,6 +506,7 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
     );
     const event = availabilityRows[0];
     if (!event || event.status !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
+    if (eventHasStarted(event)) throw new QueueApiError(409, 'event_completed');
     const availableTickets = Number(event.available_qty ?? 0);
     if (availableTickets <= 0) {
       await connection.execute("UPDATE queue_sessions SET status = 'DRAINED' WHERE queue_session_id = ?", [session.queue_session_id]);
@@ -658,6 +674,7 @@ export {
   app,
   buyerCapacity,
   customerAdmittedEvent,
+  eventHasStarted,
   parseConfig,
   positiveInteger,
   publishCustomerAdmitted,
