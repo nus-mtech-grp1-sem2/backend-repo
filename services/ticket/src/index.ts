@@ -766,6 +766,60 @@ app.get('/customers/me/tickets', async (req, res) => {
   return res.json({ tickets });
 });
 
+export type ConfirmationEmailStatus = 'SENT' | 'FAILED' | 'PENDING';
+
+/**
+ * Where an order's per-ticket confirmation emails have got to: SENT once every
+ * issued ticket has been emailed, FAILED once every ticket has been attempted
+ * and at least one failed, otherwise PENDING (nothing issued or sent yet, or
+ * emails still going out).
+ */
+export function confirmationEmailStatus(total: number, sent: number, failed: number): ConfirmationEmailStatus {
+  if (total <= 0) return 'PENDING';
+  if (sent >= total) return 'SENT';
+  if (failed > 0 && sent + failed >= total) return 'FAILED';
+  return 'PENDING';
+}
+
+/** Whether the signed-in customer's confirmation emails for an order have gone out, so the app can say so. */
+app.get('/customers/me/orders/:orderId/confirmation', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!(await requireConfigured(res))) return;
+  const orderId = parseTicketId(req.params.orderId);
+  if (!orderId) return res.status(422).json({ error: 'invalid_order' });
+  try {
+    // Only the customer's own order is answered; anything else looks the same as a missing order.
+    const [orders] = await database.query<mysql.RowDataPacket[]>(
+      'SELECT order_id FROM checkout.orders WHERE order_id = ? AND customer_sub = ? LIMIT 1',
+      [orderId, caller.sub],
+    );
+    if (!orders[0]) return res.status(404).json({ error: 'order_not_found' });
+    const [tickets] = await database.query<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) AS total FROM ticketing.tickets WHERE order_id = ? AND status <> 'VOID'",
+      [orderId],
+    );
+    const [emails] = await database.query<mysql.RowDataPacket[]>(
+      'SELECT status, COUNT(*) AS count FROM notification.email_notifications WHERE order_id = ? AND customer_sub = ? GROUP BY status',
+      [orderId, caller.sub],
+    );
+    const countOf = (status: string) => Number(emails.find((row) => row.status === status)?.count ?? 0);
+    const total = Number(tickets[0]?.total ?? 0);
+    const sent = countOf('SENT');
+    const failed = countOf('FAILED');
+    return res.set('Cache-Control', 'no-store').json({
+      orderId,
+      status: confirmationEmailStatus(total, sent, failed),
+      total,
+      sent,
+      failed,
+    });
+  } catch (error) {
+    console.error('confirmation email status lookup failed', error);
+    return res.status(502).json({ error: 'confirmation_status_failed' });
+  }
+});
+
 app.get('/tickets/search', async (req, res) => {
   const session = await requireScannerSession(req, res);
   if (!session) return;
