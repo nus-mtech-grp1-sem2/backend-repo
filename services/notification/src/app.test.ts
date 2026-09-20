@@ -1,22 +1,33 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
 
-const findByOrderIdMock = vi.hoisted(() => vi.fn());
+const findByTicketIdMock = vi.hoisted(() => vi.fn());
+const listByOrderIdMock = vi.hoisted(() => vi.fn());
 const upsertOutcomeMock = vi.hoisted(() => vi.fn());
-const sendOrderConfirmationMock = vi.hoisted(() => vi.fn());
+const sendTicketConfirmationMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./notificationRepository.js", () => ({
-  findByOrderId: findByOrderIdMock,
+  findByTicketId: findByTicketIdMock,
+  listByOrderId: listByOrderIdMock,
   upsertOutcome: upsertOutcomeMock,
 }));
 
 vi.mock("./email.js", () => ({
   EmailService: vi.fn().mockImplementation(() => ({
-    sendOrderConfirmation: sendOrderConfirmationMock,
+    sendTicketConfirmation: sendTicketConfirmationMock,
   })),
+  ticketConfirmationSubject: (orderId: number, ticketNumber: number, total: number) =>
+    `subject order ${orderId} ticket ${ticketNumber}/${total}`,
 }));
 
 const { createApp } = await import("./app.js");
+
+const ticket = (ticketId: number) => ({
+  ticketId,
+  qrToken: `token-${ticketId}`,
+  description: "General Admission",
+  seatLabel: null,
+});
 
 const validPayload = {
   orderId: 123,
@@ -25,19 +36,30 @@ const validPayload = {
   customerEmail: "buyer@example.com",
   event: { title: "Concert Night", venue: "Esplanade", startsAt: "2026-10-01T19:00:00Z" },
   order: { totalAmountCents: 5000, currency: "SGD" },
-  tickets: [
-    { ticketId: 1, qrToken: "abc123", description: "General Admission", seatLabel: null },
-  ],
+  tickets: [ticket(1)],
 };
+const twoTickets = { ...validPayload, tickets: [ticket(1), ticket(2)] };
+
+const record = (ticketId: number, status: string) => ({
+  notificationId: ticketId,
+  orderId: 123,
+  ticketId,
+  status,
+});
 
 const app = createApp();
 
 describe("notification service app", () => {
   beforeEach(() => {
-    findByOrderIdMock.mockReset();
+    findByTicketIdMock.mockReset();
+    listByOrderIdMock.mockReset();
     upsertOutcomeMock.mockReset();
-    sendOrderConfirmationMock.mockReset();
-    sendOrderConfirmationMock.mockResolvedValue(undefined);
+    sendTicketConfirmationMock.mockReset();
+    findByTicketIdMock.mockResolvedValue(null);
+    sendTicketConfirmationMock.mockResolvedValue(undefined);
+    upsertOutcomeMock.mockImplementation(async (input: { ticketId: number; status: string }) =>
+      record(input.ticketId, input.status),
+    );
   });
 
   it("GET /health reports the service is up", async () => {
@@ -50,63 +72,117 @@ describe("notification service app", () => {
     it("rejects an invalid payload without touching the repository or email", async () => {
       const res = await request(app).post("/notifications/order-confirmation").send({});
       expect(res.status).toBe(400);
-      expect(sendOrderConfirmationMock).not.toHaveBeenCalled();
+      expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
       expect(upsertOutcomeMock).not.toHaveBeenCalled();
     });
 
-    it("sends the email and persists a SENT record on a first attempt", async () => {
-      findByOrderIdMock.mockResolvedValue(null);
-      const sentRecord = { notificationId: 1, orderId: 123, status: "SENT" };
-      upsertOutcomeMock.mockResolvedValue(sentRecord);
-
+    it("sends the email and inserts a SENT row for a single ticket", async () => {
       const res = await request(app)
         .post("/notifications/order-confirmation")
         .send(validPayload);
 
-      expect(sendOrderConfirmationMock).toHaveBeenCalledTimes(1);
-      expect(upsertOutcomeMock).toHaveBeenCalledWith(
-        expect.objectContaining({ orderId: 123, status: "SENT", errorMessage: null }),
+      expect(sendTicketConfirmationMock).toHaveBeenCalledTimes(1);
+      expect(upsertOutcomeMock).toHaveBeenCalledWith({
+        orderId: 123,
+        ticketId: 1,
+        eventId: 45,
+        customerSub: "cognito-sub-1",
+        customerEmail: "buyer@example.com",
+        status: "SENT",
+        subject: "subject order 123 ticket 1/1",
+        errorMessage: null,
+      });
+      expect(res.status).toBe(201);
+      expect(res.body).toEqual({ orderId: 123, notifications: [record(1, "SENT")] });
+    });
+
+    it("sends one email and inserts one row per ticket", async () => {
+      const res = await request(app)
+        .post("/notifications/order-confirmation")
+        .send(twoTickets);
+
+      expect(sendTicketConfirmationMock).toHaveBeenCalledTimes(2);
+      expect(sendTicketConfirmationMock).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ orderId: 123 }),
+        expect.objectContaining({ ticketId: 1 }),
+        1,
+        2,
+      );
+      expect(sendTicketConfirmationMock).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ orderId: 123 }),
+        expect.objectContaining({ ticketId: 2 }),
+        2,
+        2,
+      );
+      expect(upsertOutcomeMock).toHaveBeenCalledTimes(2);
+      expect(upsertOutcomeMock).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ ticketId: 2, subject: "subject order 123 ticket 2/2" }),
       );
       expect(res.status).toBe(201);
-      expect(res.body).toEqual(sentRecord);
+      expect(res.body.notifications).toEqual([record(1, "SENT"), record(2, "SENT")]);
     });
 
-    it("is idempotent: a booking already SENT is not re-emailed", async () => {
-      const existing = { notificationId: 1, orderId: 123, status: "SENT" };
-      findByOrderIdMock.mockResolvedValue(existing);
+    it("is idempotent: tickets already SENT are not re-emailed", async () => {
+      findByTicketIdMock.mockImplementation(async (ticketId: number) => record(ticketId, "SENT"));
 
       const res = await request(app)
         .post("/notifications/order-confirmation")
-        .send(validPayload);
+        .send(twoTickets);
 
-      expect(sendOrderConfirmationMock).not.toHaveBeenCalled();
+      expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
       expect(upsertOutcomeMock).not.toHaveBeenCalled();
       expect(res.status).toBe(200);
-      expect(res.body).toEqual(existing);
+      expect(res.body.notifications).toEqual([record(1, "SENT"), record(2, "SENT")]);
     });
 
-    it("retries a previously FAILED order instead of treating it as already sent", async () => {
-      findByOrderIdMock.mockResolvedValue({ notificationId: 1, orderId: 123, status: "FAILED" });
-      upsertOutcomeMock.mockResolvedValue({ notificationId: 1, orderId: 123, status: "SENT" });
+    it("emails only the tickets that have not been sent yet", async () => {
+      findByTicketIdMock.mockImplementation(async (ticketId: number) =>
+        ticketId === 1 ? record(1, "SENT") : null,
+      );
+
+      const res = await request(app)
+        .post("/notifications/order-confirmation")
+        .send(twoTickets);
+
+      expect(sendTicketConfirmationMock).toHaveBeenCalledTimes(1);
+      expect(sendTicketConfirmationMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ ticketId: 2 }),
+        2,
+        2,
+      );
+      expect(res.status).toBe(201);
+      expect(res.body.notifications).toEqual([record(1, "SENT"), record(2, "SENT")]);
+    });
+
+    it("retries a previously FAILED ticket instead of treating it as already sent", async () => {
+      findByTicketIdMock.mockResolvedValue(record(1, "FAILED"));
 
       await request(app).post("/notifications/order-confirmation").send(validPayload);
 
-      expect(sendOrderConfirmationMock).toHaveBeenCalledTimes(1);
+      expect(sendTicketConfirmationMock).toHaveBeenCalledTimes(1);
     });
 
-    it("records a FAILED outcome, but still responds 201, when sending throws", async () => {
-      findByOrderIdMock.mockResolvedValue(null);
-      sendOrderConfirmationMock.mockRejectedValue(new Error("smtp exploded"));
-      upsertOutcomeMock.mockResolvedValue({ notificationId: 1, orderId: 123, status: "FAILED" });
+    it("records FAILED but still emails the other tickets when one send throws", async () => {
+      sendTicketConfirmationMock.mockRejectedValueOnce(new Error("smtp exploded"));
 
       const res = await request(app)
         .post("/notifications/order-confirmation")
-        .send(validPayload);
+        .send(twoTickets);
 
-      expect(upsertOutcomeMock).toHaveBeenCalledWith(
-        expect.objectContaining({ status: "FAILED", errorMessage: "smtp exploded" }),
+      expect(upsertOutcomeMock).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ ticketId: 1, status: "FAILED", errorMessage: "smtp exploded" }),
+      );
+      expect(upsertOutcomeMock).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ ticketId: 2, status: "SENT", errorMessage: null }),
       );
       expect(res.status).toBe(201);
+      expect(res.body.notifications).toEqual([record(1, "FAILED"), record(2, "SENT")]);
     });
   });
 
@@ -114,21 +190,21 @@ describe("notification service app", () => {
     it("rejects a non-integer orderId", async () => {
       const res = await request(app).get("/notifications/abc");
       expect(res.status).toBe(400);
-      expect(findByOrderIdMock).not.toHaveBeenCalled();
+      expect(listByOrderIdMock).not.toHaveBeenCalled();
     });
 
     it("returns 404 when no notification exists for the order", async () => {
-      findByOrderIdMock.mockResolvedValue(null);
+      listByOrderIdMock.mockResolvedValue([]);
       const res = await request(app).get("/notifications/999");
       expect(res.status).toBe(404);
     });
 
-    it("returns the record when found", async () => {
-      const record = { notificationId: 1, orderId: 123, status: "SENT" };
-      findByOrderIdMock.mockResolvedValue(record);
+    it("returns every ticket's record for the order", async () => {
+      const records = [record(1, "SENT"), record(2, "FAILED")];
+      listByOrderIdMock.mockResolvedValue(records);
       const res = await request(app).get("/notifications/123");
       expect(res.status).toBe(200);
-      expect(res.body).toEqual(record);
+      expect(res.body).toEqual({ orderId: 123, notifications: records });
     });
   });
 });

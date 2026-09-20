@@ -17,6 +17,12 @@ const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
 const SCANNER_SESSION_SECRET = process.env.SCANNER_SESSION_SECRET ?? '';
 const SCANNER_SESSION_TTL_MIN = Number(process.env.SCANNER_SESSION_TTL_MIN ?? 480);
 const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
+const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL ?? '';
+// The notification service sends one email per ticket, one after another, before it replies.
+const NOTIFICATION_TIMEOUT_MS = Math.max(
+  1_000,
+  Number(process.env.NOTIFICATION_TIMEOUT_MS ?? 60_000) || 60_000,
+);
 const TICKET_RECONCILIATION_INTERVAL_MS = Math.max(
   10_000,
   Number(process.env.TICKET_RECONCILIATION_INTERVAL_MS ?? 60_000) || 60_000,
@@ -276,8 +282,10 @@ async function consumeOrderPaidEvents(): Promise<void> {
         } catch {
           event = null;
         }
-        if (event) await issueTickets(event);
-        else console.error('discarding invalid OrderPaid message', { messageId: message.MessageId });
+        if (event) {
+          await issueTickets(event);
+          void notifyOrderConfirmed(event.orderId);
+        } else console.error('discarding invalid OrderPaid message', { messageId: message.MessageId });
         await sqs.send(new DeleteMessageCommand({
           QueueUrl: ORDER_EVENTS_QUEUE_URL,
           ReceiptHandle: message.ReceiptHandle,
@@ -414,6 +422,119 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
   }
 }
 
+interface OrderConfirmationPayload {
+  readonly orderId: number;
+  readonly eventId: number;
+  readonly customerSub: string;
+  readonly customerEmail: string;
+  readonly event: { readonly title: string; readonly venue: string; readonly startsAt: string };
+  readonly order: { readonly totalAmountCents: number; readonly currency: string };
+  readonly tickets: readonly {
+    readonly ticketId: number;
+    readonly qrToken: string;
+    readonly description: string;
+    readonly seatLabel: string | null;
+  }[];
+}
+
+/**
+ * Everything the confirmation email needs for one paid order. The event start
+ * is read through this service's own pool, exactly as the My Events endpoint
+ * does, so the email shows the same time the customer sees in the app.
+ */
+export async function loadOrderConfirmation(orderId: number): Promise<OrderConfirmationPayload | null> {
+  const [orders] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.total_amount_cents, o.currency,
+            e.title, e.venue, e.starts_at
+       FROM checkout.orders o
+       INNER JOIN event_inventory.events e ON e.event_id = o.event_id
+      WHERE o.order_id = ? AND o.status = 'PAID' LIMIT 1`,
+    [orderId],
+  );
+  const order = orders[0];
+  if (!order) return null;
+  const [tickets] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT t.ticket_id, t.qr_token, oi.description, s.seat_label
+       FROM ticketing.tickets t
+       LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
+       LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+      WHERE t.order_id = ? AND t.status <> 'VOID'
+      ORDER BY t.ticket_id`,
+    [orderId],
+  );
+  if (tickets.length === 0) return null;
+  return {
+    orderId: Number(order.order_id),
+    eventId: Number(order.event_id),
+    customerSub: String(order.customer_sub),
+    customerEmail: String(order.customer_email),
+    event: {
+      title: String(order.title),
+      venue: String(order.venue ?? ''),
+      startsAt: order.starts_at instanceof Date ? order.starts_at.toISOString() : String(order.starts_at),
+    },
+    order: { totalAmountCents: Number(order.total_amount_cents), currency: String(order.currency) },
+    tickets: tickets.map((ticket) => ({
+      ticketId: Number(ticket.ticket_id),
+      qrToken: String(ticket.qr_token),
+      description: String(ticket.description ?? 'Ticket'),
+      seatLabel: ticket.seat_label === null || ticket.seat_label === undefined ? null : String(ticket.seat_label),
+    })),
+  };
+}
+
+/**
+ * Asks the notification service to email the customer their tickets, one
+ * email per ticket. The order is already paid and its tickets exist, so this
+ * never throws: a failure is logged and the sale is untouched. The
+ * notification service is idempotent per ticket, so repeating this for the
+ * same order cannot double-email. Resolves true when the request was
+ * accepted; the notification service records each ticket's delivery outcome
+ * (SENT or FAILED) in its email_notifications table itself.
+ */
+export async function notifyOrderConfirmed(
+  orderId: number,
+  load: (orderId: number) => Promise<OrderConfirmationPayload | null> = loadOrderConfirmation,
+  notificationUrl = NOTIFICATION_SERVICE_URL,
+  requester: typeof fetch = fetch,
+  timeoutMs = NOTIFICATION_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!notificationUrl) return false;
+  try {
+    const payload = await load(orderId);
+    if (!payload) return false;
+    const response = await requester(`${notificationUrl.replace(/\/$/, '')}/notifications/order-confirmation`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) throw new Error(`notification_request_failed:${response.status}`);
+    const result = (await response.json().catch(() => null)) as
+      { notifications?: { ticketId?: number | null; status?: string; errorMessage?: string | null }[] } | null;
+    for (const notification of result?.notifications ?? []) {
+      if (notification.status === 'FAILED') {
+        console.error('ticket confirmation email was not delivered', {
+          orderId,
+          ticketId: notification.ticketId,
+          reason: notification.errorMessage,
+        });
+      }
+    }
+    return true;
+  } catch (error) {
+    console.error('order confirmation email request failed', { orderId, error });
+    return false;
+  }
+}
+
+async function issueTicketsAndNotify(orderId: number): Promise<{ issued: number; alreadyIssued: boolean }> {
+  const result = await issueTicketsForOrder(orderId);
+  // Not awaited: sending mail takes seconds and must not slow the caller down.
+  void notifyOrderConfirmed(orderId);
+  return result;
+}
+
 async function findPaidOrdersMissingTickets(limit: number): Promise<readonly number[]> {
   const [rows] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id, MIN(o.paid_at) AS paid_at
@@ -443,7 +564,7 @@ interface ReconciliationResult {
 export async function reconcilePaidOrders(
   limit = 50,
   findMissing: (limit: number) => Promise<readonly number[]> = findPaidOrdersMissingTickets,
-  issue: (orderId: number) => Promise<{ issued: number; alreadyIssued: boolean }> = issueTicketsForOrder,
+  issue: (orderId: number) => Promise<{ issued: number; alreadyIssued: boolean }> = issueTicketsAndNotify,
 ): Promise<ReconciliationResult> {
   const orderIds = await findMissing(limit);
   let issuedTickets = 0;
@@ -483,7 +604,7 @@ app.post('/internal/orders/:orderId/issue-tickets', async (req, res) => {
   const orderId = parseTicketId(req.params.orderId);
   if (!orderId) return res.status(422).json({ error: 'invalid_order' });
   try {
-    const result = await issueTicketsForOrder(orderId);
+    const result = await issueTicketsAndNotify(orderId);
     return res.status(200).json(result);
   } catch (error) {
     if (error instanceof Error && error.message === 'order_not_found') return res.status(404).json({ error: error.message });

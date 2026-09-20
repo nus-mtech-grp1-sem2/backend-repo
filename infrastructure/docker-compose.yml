@@ -147,6 +147,8 @@ services:
       DB_SSL: ${DB_SSL:-false}
       SCANNER_SESSION_SECRET: ${SCANNER_SESSION_SECRET:?SCANNER_SESSION_SECRET not set in variables.env}
       TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
+      # Booking confirmation emails (QR codes) are sent by the notification service.
+      NOTIFICATION_SERVICE_URL: ${NOTIFICATION_SERVICE_URL:-http://notification:3006}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
       ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}

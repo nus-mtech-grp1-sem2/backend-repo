@@ -1,19 +1,53 @@
 import nodemailer, { type Transporter } from "nodemailer";
 import QRCode from "qrcode";
-import type { OrderConfirmationRequest } from "./types.js";
+import type { OrderConfirmationRequest, OrderConfirmationTicket } from "./types.js";
 
 const SENDER_NAME = "OneStage";
 
-function formatCents(amountCents: number, currency: string): string {
-  return `${currency} ${(amountCents / 100).toFixed(2)}`;
+/** Formats an event start like the customer's My Events page: "Thu 17 Sep 2026, 12:23 AM" (Singapore time). */
+export function formatStartsAt(startsAt: string): string {
+  const date = new Date(startsAt);
+  if (Number.isNaN(date.getTime())) return startsAt;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Singapore",
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).formatToParts(date);
+  const part = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((candidate) => candidate.type === type)?.value ?? "";
+  return (
+    `${part("weekday")} ${part("day")} ${part("month")} ${part("year")}, ` +
+    `${part("hour")}:${part("minute")} ${part("dayPeriod").toUpperCase()}`
+  );
 }
 
-function formatStartsAt(startsAt: string): string {
-  return new Date(startsAt).toLocaleString("en-SG", {
-    dateStyle: "full",
-    timeStyle: "short",
-    timeZone: "Asia/Singapore",
-  });
+/** Subject of one ticket's email. Also what is stored in email_notifications.subject. */
+export function ticketConfirmationSubject(
+  orderId: number,
+  ticketNumber: number,
+  totalTickets: number,
+): string {
+  const subject = `Your OneStage booking is confirmed — Order #${orderId}`;
+  return totalTickets > 1 ? `${subject}, Ticket ${ticketNumber} of ${totalTickets}` : subject;
+}
+
+/** Tells apart the separate emails of one booking; a lone general-admission ticket needs no caption. */
+function ticketCaption(
+  ticket: OrderConfirmationTicket,
+  ticketNumber: number,
+  totalTickets: number,
+): string {
+  return [
+    totalTickets > 1 ? `Ticket ${ticketNumber} of ${totalTickets}` : "",
+    ticket.seatLabel ? `Seat ${ticket.seatLabel}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function escapeHtml(value: string): string {
@@ -24,46 +58,40 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function renderOrderConfirmationHtml(
+function renderTicketConfirmationHtml(
   payload: OrderConfirmationRequest,
-  ticketCids: string[],
+  ticket: OrderConfirmationTicket,
+  ticketNumber: number,
+  totalTickets: number,
+  qrCid: string,
 ): string {
-  const ticketRows = payload.tickets
-    .map((ticket, i) => {
-      const seatLine = ticket.seatLabel
-        ? `<div style="color:#555;font-size:13px;">Seat ${escapeHtml(ticket.seatLabel)}</div>`
-        : "";
-      return `
-        <tr>
-          <td style="padding:16px 0;border-top:1px solid #e5e5e5;">
-            <div style="font-weight:600;">${escapeHtml(ticket.description)}</div>
-            ${seatLine}
-            <div style="color:#888;font-size:12px;">Ticket #${ticket.ticketId}</div>
-          </td>
-          <td style="padding:16px 0;border-top:1px solid #e5e5e5;text-align:right;">
-            <img src="cid:${ticketCids[i]}" width="140" height="140" alt="QR code for ticket ${ticket.ticketId}" />
-          </td>
-        </tr>`;
-    })
-    .join("");
+  const caption = ticketCaption(ticket, ticketNumber, totalTickets);
+  const captionHtml = caption
+    ? `<div style="color:#555;font-size:13px;">${escapeHtml(caption)}</div>`
+    : "";
 
   return `
-    <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#111;">
-      <h1 style="font-size:20px;">Your booking is confirmed</h1>
-      <p>Thanks for your purchase — here's your ticket for:</p>
-      <div style="background:#f7f7f7;border-radius:8px;padding:16px;margin:16px 0;">
-        <div style="font-weight:600;font-size:16px;">${escapeHtml(payload.event.title)}</div>
-        <div style="color:#555;">${escapeHtml(payload.event.venue)}</div>
-        <div style="color:#555;">${formatStartsAt(payload.event.startsAt)}</div>
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#111;font-size:15px;line-height:1.6;">
+      <div>Event Name: ${escapeHtml(payload.event.title)}</div>
+      <div>Location: ${escapeHtml(payload.event.venue)}</div>
+      <div>Date/Time: ${escapeHtml(formatStartsAt(payload.event.startsAt))}</div>
+      <div style="margin-top:24px;">QR Code:</div>
+      <div style="margin:12px 0;">
+        <img src="cid:${qrCid}" width="200" height="200" alt="QR code for ticket ${ticket.ticketId}" />
+        ${captionHtml}
       </div>
-      <table style="width:100%;border-collapse:collapse;">${ticketRows}</table>
-      <p style="margin-top:24px;color:#555;">
-        Order #${payload.orderId} &middot; Total paid ${formatCents(payload.order.totalAmountCents, payload.order.currency)}
-      </p>
-      <p style="color:#888;font-size:12px;">
-        Show the QR code above at the door for check-in. See you there!
-      </p>
     </div>`;
+}
+
+function renderTicketConfirmationText(payload: OrderConfirmationRequest): string {
+  return [
+    `Event Name: ${payload.event.title}`,
+    `Location: ${payload.event.venue}`,
+    `Date/Time: ${formatStartsAt(payload.event.startsAt)}`,
+    "",
+    "QR Code:",
+    "(attached as an image)",
+  ].join("\n");
 }
 
 export class EmailService {
@@ -83,26 +111,29 @@ export class EmailService {
     });
   }
 
-  async sendOrderConfirmation(payload: OrderConfirmationRequest): Promise<void> {
-    const attachments = await Promise.all(
-      payload.tickets.map(async (ticket, i) => ({
-        filename: `ticket-${ticket.ticketId}-qr.png`,
-        content: await QRCode.toBuffer(ticket.qrToken, { width: 300, margin: 1 }),
-        cid: `qr-${payload.orderId}-${i}`,
-      })),
-    );
-
-    const html = renderOrderConfirmationHtml(
-      payload,
-      attachments.map((a) => a.cid),
-    );
+  /**
+   * Sends one email for one ticket. A booking of several tickets is several
+   * emails, each carrying only that ticket's QR code; ticketNumber is 1-based.
+   */
+  async sendTicketConfirmation(
+    payload: OrderConfirmationRequest,
+    ticket: OrderConfirmationTicket,
+    ticketNumber: number,
+    totalTickets: number,
+  ): Promise<void> {
+    const qr = {
+      filename: `ticket-${ticket.ticketId}-qr.png`,
+      content: await QRCode.toBuffer(ticket.qrToken, { width: 300, margin: 1 }),
+      cid: `qr-${payload.orderId}-${ticket.ticketId}`,
+    };
 
     await this.transporter.sendMail({
       from: `"${SENDER_NAME}" <${this.fromAddress}>`,
       to: payload.customerEmail,
-      subject: `Your OneStage booking is confirmed — Order #${payload.orderId}`,
-      html,
-      attachments,
+      subject: ticketConfirmationSubject(payload.orderId, ticketNumber, totalTickets),
+      text: renderTicketConfirmationText(payload),
+      html: renderTicketConfirmationHtml(payload, ticket, ticketNumber, totalTickets, qr.cid),
+      attachments: [qr],
     });
   }
 }

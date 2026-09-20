@@ -13,6 +13,8 @@ services:
       - ../database/02-init-create-tables-index.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
       - ../database/06-ticket-checkin-attempts.sql:/docker-entrypoint-initdb.d/06-ticket-checkin-attempts.sql:ro
       - ../database/07-add-customer-name.sql:/docker-entrypoint-initdb.d/07-add-customer-name.sql:ro
+      - ../database/08-email-notifications-per-ticket.sql:/docker-entrypoint-initdb.d/08-email-notifications-per-ticket.sql:ro
+      - ../database/06-add-notification-schema.sql:/docker-entrypoint-initdb.d/05-add-notification-schema.sql:ro
     networks:
       - backend
     healthcheck:
@@ -83,6 +85,18 @@ services:
       DB_SSL: "false"
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+
+  notification:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: notification
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
 
 volumes:
   mysql-data:
