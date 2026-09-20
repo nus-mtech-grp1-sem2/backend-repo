@@ -70,7 +70,7 @@ mock.module('aws-jwt-verify', {
   },
 });
 
-const { app, eventHasStarted } = await import('./index.js');
+const { app, assertEventOnSale, eventHasStarted, keepsQueuePlace } = await import('./index.js');
 
 describe('eventHasStarted', () => {
   it('is true only when MySQL reports the start time as passed', () => {
@@ -82,6 +82,66 @@ describe('eventHasStarted', () => {
     assert.equal(eventHasStarted({}), false);
     assert.equal(eventHasStarted({ has_started: null }), false);
     assert.equal(eventHasStarted(undefined), false);
+  });
+});
+
+describe('assertEventOnSale', () => {
+  // TypeScript only lets an assertion function be called through an explicitly typed name.
+  const assertOnSale: (event: Record<string, unknown> | undefined) => void = assertEventOnSale;
+  const codeOf = (event: Record<string, unknown> | undefined) => {
+    try {
+      assertOnSale(event);
+      return null;
+    } catch (error) {
+      return (error as { status: number; code: string }).status === 409
+        ? (error as { code: string }).code
+        : 'unexpected';
+    }
+  };
+
+  it('passes a published event that has not started', () => {
+    assert.equal(codeOf({ status: 'PUBLISHED', has_started: 0 }), null);
+  });
+
+  it('refuses a missing or unpublished event as not on sale', () => {
+    assert.equal(codeOf(undefined), 'event_not_on_sale');
+    assert.equal(codeOf({ status: 'DRAFT', has_started: 0 }), 'event_not_on_sale');
+    assert.equal(codeOf({ status: 'CANCELLED', has_started: 1 }), 'event_not_on_sale');
+  });
+
+  it('refuses a published event that has started as completed', () => {
+    assert.equal(codeOf({ status: 'PUBLISHED', has_started: 1 }), 'event_completed');
+  });
+});
+
+describe('keepsQueuePlace', () => {
+  const entry = (status: string, expiresInMs: number | null) =>
+    ({
+      queue_entry_id: 1,
+      position: 3,
+      status,
+      admission_token: null,
+      token_expires_at: expiresInMs === null ? null : new Date(Date.now() + expiresInMs),
+    }) as Parameters<typeof keepsQueuePlace>[0];
+
+  it('keeps the place of someone waiting, whatever the token field says', () => {
+    assert.equal(keepsQueuePlace(entry('WAITING', null)), true);
+  });
+
+  it('keeps the place of an admitted or in-checkout customer whose token is still valid', () => {
+    assert.equal(keepsQueuePlace(entry('ADMITTED', 60_000)), true);
+    assert.equal(keepsQueuePlace(entry('IN_CHECKOUT', 60_000)), true);
+    assert.equal(keepsQueuePlace(entry('ADMITTED', null)), true);
+  });
+
+  it('does not keep the place of an admitted or in-checkout customer whose token has expired', () => {
+    assert.equal(keepsQueuePlace(entry('ADMITTED', -1_000)), false);
+    assert.equal(keepsQueuePlace(entry('IN_CHECKOUT', -1_000)), false);
+  });
+
+  it('does not keep the place of someone who expired or left', () => {
+    assert.equal(keepsQueuePlace(entry('EXPIRED', null)), false);
+    assert.equal(keepsQueuePlace(entry('LEFT', 60_000)), false);
   });
 });
 
@@ -145,6 +205,85 @@ describe('waiting room for a completed event', () => {
 
       assert.equal(response.status, 201);
       assert.equal(writes().length, 1);
+    });
+
+    const openUpcomingQueue = (entries: unknown[]) => {
+      on(EVENT_QUERY, [{ has_started: 0 }]);
+      on(/FROM queue_sessions WHERE event_id = \?/, [
+        { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN' },
+      ]);
+      on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, entries);
+    };
+
+    const scriptSession = (status: string, opensInMs: number) => {
+      on(EVENT_QUERY, [{ has_started: 0 }]);
+      on(/FROM queue_sessions WHERE event_id = \?/, [
+        { queue_session_id: 1, opens_at: new Date(Date.now() + opensInMs), status },
+      ]);
+      on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, []);
+      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 1 }]);
+      on(/INSERT INTO queue_entries/, { insertId: 9 });
+      on(/UPDATE queue_sessions SET status = 'OPEN'/, {});
+    };
+
+    it('refuses to join a waiting room that is closed and not yet due to open', async () => {
+      scriptSession('CLOSED', 60_000);
+
+      const response = await join();
+
+      assert.deepEqual(response, { status: 409, body: { error: 'queue_not_open' } });
+      assert.ok(rolledBack());
+      assert.deepEqual(writes(), []);
+    });
+
+    it('opens a closed waiting room whose scheduled time has come, then lets the customer join', async () => {
+      scriptSession('CLOSED', -1_000);
+
+      const response = await join();
+
+      assert.equal(response.status, 201);
+      assert.match(writes()[0]?.sql ?? '', /UPDATE queue_sessions SET status = 'OPEN'/);
+      assert.equal(writes().length, 2, 'the session is opened, then the customer is queued');
+    });
+
+    it('reports a drained waiting room as sold out, and any other state as not open', async () => {
+      scriptSession('DRAINED', -60_000);
+      assert.deepEqual(await join(), { status: 409, body: { error: 'queue_drained' } });
+
+      rules = [];
+      scriptSession('PAUSED', -60_000);
+      assert.deepEqual(await join(), { status: 409, body: { error: 'queue_not_open' } });
+    });
+
+    it("returns a customer's existing place without changing the queue", async () => {
+      openUpcomingQueue([
+        { queue_entry_id: 9, position: 4, status: 'WAITING', admission_token: null, token_expires_at: null },
+      ]);
+
+      const response = await join();
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(writes(), []);
+      assert.ok(calls.some((call) => call.sql === 'COMMIT'));
+    });
+
+    it('puts an admitted customer whose token expired back at the end of the queue', async () => {
+      openUpcomingQueue([
+        {
+          queue_entry_id: 9,
+          position: 1,
+          status: 'ADMITTED',
+          admission_token: 'old-token',
+          token_expires_at: new Date(Date.now() - 1_000),
+        },
+      ]);
+      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 7 }]);
+      on(/UPDATE queue_entries SET position = \?/, {});
+
+      const response = await join();
+
+      assert.equal(response.status, 201);
+      assert.deepEqual(writes().map((call) => call.params), [[7, 9]]);
     });
 
     it('rejects an unauthenticated join before looking at the event', async () => {
