@@ -2,6 +2,8 @@ import express from 'express';
 import mysql from 'mysql2/promise';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { consumePayments, enqueuePayment, type PaymentResult } from './payment-queue.js';
 
 const SERVICE = 'order';
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -9,6 +11,7 @@ const PORT = Number(process.env.PORT ?? 3004);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const ORDER_EVENTS_QUEUE_URL = process.env.ORDER_EVENTS_QUEUE_URL ?? '';
+const PAYMENT_REQUESTS_QUEUE_URL = process.env.PAYMENT_REQUESTS_QUEUE_URL ?? '';
 const TICKET_SERVICE_URL = process.env.TICKET_SERVICE_URL ?? '';
 const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
 const QUEUE_SERVICE_URL = process.env.QUEUE_SERVICE_URL ?? '';
@@ -20,7 +23,7 @@ const QUEUE_REFILL_TIMEOUT_MS = Math.min(
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
-const sqs = new SQSClient({});
+const sqs = new SQSClient({ requestHandler: { connectionTimeout: 3_000, requestTimeout: 25_000 }, maxAttempts: 2 });
 const databaseConfigured = Boolean(
   process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER && process.env.DB_PASSWORD,
 );
@@ -354,6 +357,7 @@ async function publishOrderPaid(order: NonNullable<Awaited<ReturnType<typeof loa
   }
   await sqs.send(new SendMessageCommand({
     QueueUrl: ORDER_EVENTS_QUEUE_URL,
+    DelaySeconds: 10,
     MessageBody: JSON.stringify({
       type: 'OrderPaid', version: 1, occurredAt: new Date().toISOString(),
       orderId: Number(order.order_id), eventId: Number(order.event_id), customerSub: order.customer_sub,
@@ -418,29 +422,67 @@ app.post('/orders/:orderId/payment', async (req, res) => {
   const paymentToken = ((req.body ?? {}) as PaymentInput).paymentToken;
   const token = typeof paymentToken === 'string' ? paymentToken.trim() : '';
   if (!orderId || !token || token.length > 255) return res.status(400).json({ error: 'invalid_payment' });
+  const result = await processPayment(orderId, caller.sub, token);
+  return res.status(result.status).json(result.body);
+});
+
+// Additive endpoint: legacy /payment clients retain their synchronous contract.
+// Only the fixed mock token is accepted; card details never enter a queue or database.
+app.post('/orders/:orderId/payment-requests', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const orderId = positiveInteger(req.params.orderId);
+  if (!orderId || ((req.body ?? {}) as PaymentInput).paymentToken !== 'simulated') {
+    return res.status(400).json({ error: 'invalid_payment' });
+  }
+  const order = await loadOrder(orderId);
+  if (!order) return res.status(404).json({ error: 'order_not_found' });
+  if (order.customer_sub !== caller.sub) return res.status(403).json({ error: 'order_owner_required' });
+  if (!['PENDING', 'PAID'].includes(order.status)) return res.status(409).json({ error: 'order_not_payable' });
+  if (!PAYMENT_REQUESTS_QUEUE_URL) {
+    // Explicit local-development fallback, never used when a queue is configured but unavailable.
+    await delay(7_000);
+    const result = await processPayment(orderId, caller.sub, 'simulated');
+    return res.status(result.status).json(result.body);
+  }
+  try {
+    await enqueuePayment(sqs, PAYMENT_REQUESTS_QUEUE_URL, { orderId, customerSub: caller.sub });
+    return res.status(202).json({ order, paymentStatus: 'PROCESSING' });
+  } catch {
+    // A lost acknowledgement can mean SQS accepted it. The client checks status before retrying.
+    console.error('payment enqueue failed', { orderId });
+    return res.status(503).json({ error: 'payment_queue_unavailable' });
+  }
+});
+
+export async function processPayment(orderId: number, customerSub: string, token: string): Promise<PaymentResult> {
   const connection = await database.getConnection();
+  let committed = false;
   try {
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT order_id, event_id, customer_sub, hold_id, total_amount_cents, status FROM orders WHERE order_id = ? LIMIT 1 FOR UPDATE', [orderId],
     );
     const order = orders[0];
-    if (!order) { await connection.rollback(); return res.status(404).json({ error: 'order_not_found' }); }
-    if (order.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'order_owner_required' }); }
+    if (!order) { await connection.rollback(); return { status: 404, body: { error: 'order_not_found' } }; }
+    if (order.customer_sub !== customerSub) { await connection.rollback(); return { status: 403, body: { error: 'order_owner_required' } }; }
     if (order.status === 'PAID') {
       const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
         `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
          SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-         WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
-        [order.event_id, order.customer_sub],
+         WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
+           AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
+        [order.event_id, order.customer_sub, order.hold_id],
       );
       await connection.commit();
+      committed = true;
       const paid = await loadOrder(orderId);
       if (queueRelease.affectedRows > 0) await refillReleasedQueueSlot(Number(order.event_id));
       await publishOrderPaid(paid!);
-      return res.json({ order: paid });
+      return { status: 200, body: { order: paid } };
     }
-    if (order.status !== 'PENDING') { await connection.rollback(); return res.status(409).json({ error: 'order_not_payable' }); }
+    if (order.status !== 'PENDING') { await connection.rollback(); return { status: 409, body: { error: 'order_not_payable' } }; }
     if (/^(fail|declin)/i.test(token)) {
       await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'FAILED', ?)", [orderId, token, order.total_amount_cents]);
       await connection.execute("UPDATE orders SET status = 'FAILED' WHERE order_id = ?", [orderId]);
@@ -463,23 +505,49 @@ app.post('/orders/:orderId/payment', async (req, res) => {
         const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
           `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
            SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-           WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
-          [failedHold.event_id, failedHold.customer_sub],
+           WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
+             AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
+          [failedHold.event_id, failedHold.customer_sub, order.hold_id],
         );
         releasedQueueSlot = queueRelease.affectedRows > 0;
       }
       await connection.commit();
+      committed = true;
       if (releasedQueueSlot && failedHold) {
         await refillReleasedQueueSlot(Number(failedHold.event_id));
       }
-      return res.status(402).json({ error: 'payment_failed' });
+      return { status: 402, body: { error: 'payment_failed' } };
     }
     const [holds] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT hold_id, inventory_item_id, quantity, status, expires_at FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1 FOR UPDATE', [order.hold_id],
     );
     const hold = holds[0];
     if (!hold || hold.status !== 'ACTIVE' || new Date(hold.expires_at).getTime() <= Date.now()) {
-      await connection.rollback(); return res.status(409).json({ error: 'hold_not_active' });
+      // Release only an active hold, under the same row lock, so retries cannot release twice.
+      if (hold?.status === 'ACTIVE') {
+        if (hold.inventory_item_id) {
+          const [released] = await connection.execute<mysql.ResultSetHeader>(
+            'UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty - ?, version = version + 1 WHERE inventory_item_id = ? AND reserved_qty >= ?',
+            [hold.quantity, hold.inventory_item_id, hold.quantity],
+          );
+          if (released.affectedRows !== 1) throw new Error('reserved_inventory_mismatch');
+        } else {
+          await connection.execute("UPDATE event_inventory.seats SET status = 'AVAILABLE', hold_id = NULL WHERE hold_id = ? AND status = 'HELD'", [order.hold_id]);
+        }
+        await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'RELEASED' WHERE hold_id = ?", [order.hold_id]);
+      }
+      const [releasedQueue] = await connection.execute<mysql.ResultSetHeader>(
+        `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+         SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
+         WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
+           AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
+        [order.event_id, order.customer_sub, order.hold_id],
+      );
+      await connection.execute("UPDATE orders SET status = 'FAILED' WHERE order_id = ? AND status = 'PENDING'", [orderId]);
+      await connection.commit();
+      committed = true;
+      if (releasedQueue.affectedRows > 0) await refillReleasedQueueSlot(Number(order.event_id));
+      return { status: 409, body: { error: 'hold_not_active' } };
     }
     if (hold.inventory_item_id) {
       const [inventoryUpdate] = await connection.execute<mysql.ResultSetHeader>(
@@ -499,20 +567,22 @@ app.post('/orders/:orderId/payment', async (req, res) => {
     const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
       `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
        SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-       WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'`,
-      [order.event_id, order.customer_sub],
+       WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
+         AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
+      [order.event_id, order.customer_sub, order.hold_id],
     );
     await connection.commit();
+    committed = true;
     const paid = await loadOrder(orderId);
     if (queueRelease.affectedRows > 0) await refillReleasedQueueSlot(Number(order.event_id));
     await publishOrderPaid(paid!);
-    return res.json({ order: paid });
+    return { status: 200, body: { order: paid } };
   } catch (error) {
-    await connection.rollback();
+    if (!committed) await connection.rollback();
     console.error('payment processing failed', error);
-    return res.status(502).json({ error: 'payment_processing_failed' });
+    return { status: 502, body: { error: 'payment_processing_failed' } };
   } finally { connection.release(); }
-});
+}
 
 app.get('/orders/:orderId', async (req, res) => {
   const caller = await requireCaller(req, res);
@@ -593,6 +663,18 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
 });
 
-if (process.env.NODE_ENV !== 'test') app.listen(PORT, HOST, () => console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`));
+if (process.env.NODE_ENV !== 'test') {
+  const server = app.listen(PORT, HOST, () => console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`));
+  const shutdown = new AbortController();
+  const worker = PAYMENT_REQUESTS_QUEUE_URL && databaseConfigured
+    ? consumePayments(sqs, PAYMENT_REQUESTS_QUEUE_URL, (request) => processPayment(request.orderId, request.customerSub, 'simulated'), shutdown.signal)
+    : Promise.resolve();
+  const stop = () => {
+    shutdown.abort();
+    server.close(() => { void worker.finally(() => database.end()); });
+  };
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
+}
 
 export { app, parseCreateOrder, positiveInteger };

@@ -105,6 +105,11 @@ describe('local ticket issuance fallback', () => {
   it('stays disabled when no local ticket service is configured', async () => {
     assert.equal(await requestTicketIssuance(17, '', ''), false);
   });
+
+  it('accepts deferred issuance without delaying or undoing payment confirmation', async () => {
+    assert.equal(await requestTicketIssuance(17, 'http://ticket:3005', 'offline-secret', async () =>
+      new Response(JSON.stringify({ issued: 0, status: 'PENDING' }), { status: 202 })), true);
+  });
 });
 
 describe('immediate queue refill', () => {
