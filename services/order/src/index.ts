@@ -21,6 +21,7 @@ const QUEUE_REFILL_TIMEOUT_MS = Math.min(
   5_000,
 );
 export const RESERVATION_TIMEOUT_MINUTES = 3;
+export const DATABASE_TIMEZONE = 'Z';
 const RESERVATION_SWEEP_INTERVAL_MS = Math.min(
   Math.max(Number(process.env.RESERVATION_SWEEP_INTERVAL_MS) || 1_000, 250),
   60_000,
@@ -38,6 +39,7 @@ const database = mysql.createPool({
   database: process.env.DB_NAME ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
+  timezone: DATABASE_TIMEZONE,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT ?? 8),
   connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10_000),
   ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
@@ -54,6 +56,7 @@ interface CreateOrderInput {
   readonly customerEmail?: unknown;
 }
 interface PaymentInput { readonly paymentToken?: unknown }
+interface CancellationInput { readonly reason?: unknown }
 interface OrderItem {
   readonly inventoryItemId: number;
   readonly seatId: number | null;
@@ -707,6 +710,10 @@ app.post('/orders/:orderId/cancel', async (req, res) => {
   if (!requireDatabase(res)) return;
   const orderId = positiveInteger(req.params.orderId);
   if (!orderId) return res.status(400).json({ error: 'invalid_order' });
+  const input = (req.body ?? {}) as CancellationInput;
+  if (input.reason !== undefined && input.reason !== 'expired') {
+    return res.status(400).json({ error: 'invalid_cancellation_reason' });
+  }
 
   const connection = await database.getConnection();
   let refillEventId: number | null = null;
@@ -728,6 +735,10 @@ app.post('/orders/:orderId/cancel', async (req, res) => {
       return res.status(409).json({ error: 'reservation_not_cancellable' });
     }
     const expired = new Date(reservation.expires_at).getTime() <= Date.now();
+    if (input.reason === 'expired' && !expired) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'reservation_not_expired' });
+    }
     if (await releaseReservation(connection, reservation, expired ? 'EXPIRED' : 'RELEASED')) {
       refillEventId = Number(reservation.event_id);
     }

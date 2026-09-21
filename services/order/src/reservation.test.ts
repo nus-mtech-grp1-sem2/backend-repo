@@ -8,7 +8,7 @@ const db = installOfflineServices(mock, {
   claims: (token) => ({ sub: token, email: `${token}@example.com` }),
 });
 const { calls, on } = db;
-const { app, RESERVATION_TIMEOUT_MINUTES } = await import('./index.js');
+const { app, DATABASE_TIMEZONE, RESERVATION_TIMEOUT_MINUTES } = await import('./index.js');
 
 describe('reservation cancellation and expiry', () => {
   let server: TestServer;
@@ -45,14 +45,35 @@ describe('reservation cancellation and expiry', () => {
     on(/UPDATE `queue`\.queue_entries/, { affectedRows: 0 });
   };
 
-  const cancel = (token = 'alice') =>
+  const cancel = (token = 'alice', reason?: 'expired') =>
     fetch(`${base}/orders/42/cancel`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(reason ? { reason } : {}),
     });
 
   it('uses a three-minute reservation window', () => {
     assert.equal(RESERVATION_TIMEOUT_MINUTES, 3);
+    assert.equal(DATABASE_TIMEZONE, 'Z');
+  });
+
+  it('does not release a live reservation when a client reports an early timeout', async () => {
+    on(/WHERE o\.order_id = \? LIMIT 1 FOR UPDATE/, [reservation()]);
+
+    const response = await cancel('alice', 'expired');
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: 'reservation_not_expired' });
+    assert.equal(calls.some((call) => call.sql.includes("orders SET status = 'CANCELLED'")), false);
+  });
+
+  it('releases a reservation after the database expiry time', async () => {
+    scriptRelease(reservation({ expires_at: new Date(Date.now() - 1_000) }));
+
+    const response = await cancel('alice', 'expired');
+
+    assert.equal(response.status, 204);
+    assert.ok(calls.some((call) => call.sql.includes('inventory_holds SET status = ?') && call.params[0] === 'EXPIRED'));
   });
 
   it('cancels a GA reservation and returns its quantity to inventory', async () => {

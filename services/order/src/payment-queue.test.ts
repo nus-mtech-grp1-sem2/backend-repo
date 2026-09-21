@@ -73,6 +73,8 @@ describe('asynchronous mock payments', () => {
   it('rejects terminal orders and never falls back to capture when SQS is down', async () => {
     const order = scriptOrder('FAILED');
     assert.equal((await submit()).status, 409);
+    order.status = 'CANCELLED';
+    assert.equal((await submit()).status, 409);
     order.status = 'PENDING'; sendFails = true;
     assert.equal((await submit()).status, 503);
     assert.equal(db.calls.some((call) => /INSERT INTO payments/.test(call.sql)), false);
