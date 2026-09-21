@@ -30,6 +30,14 @@ output "customer_admitted_queue_url" {
   value = aws_sqs_queue.customer_admitted.url
 }
 
+output "payment_requests_queue_url" {
+  value = aws_sqs_queue.payment_requests.url
+}
+
+output "payment_requests_dlq_url" {
+  value = aws_sqs_queue.payment_requests_dlq.url
+}
+
 output "github_deploy_backend_role_arn" {
   value = aws_iam_role.github_deploy_backend.arn
 }

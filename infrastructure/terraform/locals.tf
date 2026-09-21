@@ -95,8 +95,9 @@ locals {
             NOTIFICATION_SERVICE_URL = "http://notification:${var.node_services["notification"]}"
           } : {},
           name == "order" ? {
-            QUEUE_SERVICE_URL       = "http://queue:3003"
-            QUEUE_REFILL_TIMEOUT_MS = "1000"
+            PAYMENT_REQUESTS_QUEUE_URL = aws_sqs_queue.payment_requests.url
+            QUEUE_SERVICE_URL          = "http://queue:3003"
+            QUEUE_REFILL_TIMEOUT_MS    = "1000"
           } : {},
           name == "queue" ? {
             CUSTOMER_ADMITTED_QUEUE_URL = aws_sqs_queue.customer_admitted.url
