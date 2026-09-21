@@ -20,6 +20,11 @@ const QUEUE_REFILL_TIMEOUT_MS = Math.min(
   Math.max(Number(process.env.QUEUE_REFILL_TIMEOUT_MS) || 1_000, 100),
   5_000,
 );
+export const RESERVATION_TIMEOUT_MINUTES = 3;
+const RESERVATION_SWEEP_INTERVAL_MS = Math.min(
+  Math.max(Number(process.env.RESERVATION_SWEEP_INTERVAL_MS) || 1_000, 250),
+  60_000,
+);
 const verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
@@ -77,8 +82,20 @@ interface LoadedOrder {
   readonly currency: string;
   readonly created_at: Date;
   readonly paid_at: Date | null;
+  readonly reservation_expires_at: Date;
   readonly items: mysql.RowDataPacket[];
   readonly payments: mysql.RowDataPacket[];
+}
+interface ReservationRow extends mysql.RowDataPacket {
+  readonly order_id: number;
+  readonly event_id: number;
+  readonly customer_sub: string;
+  readonly order_status: string;
+  readonly hold_id: number;
+  readonly inventory_item_id: number | null;
+  readonly quantity: number;
+  readonly hold_status: string;
+  readonly expires_at: Date;
 }
 
 const app = express();
@@ -174,8 +191,12 @@ export function saleBlockReason(
 
 async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
   const [orders] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT order_id, event_id, customer_sub, customer_email, hold_id, status, total_amount_cents, currency, created_at, paid_at
-     FROM orders WHERE order_id = ? LIMIT 1`, [orderId],
+    `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.hold_id, o.status,
+       o.total_amount_cents, o.currency, o.created_at, o.paid_at,
+       h.expires_at AS reservation_expires_at
+     FROM orders o
+     INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
+     WHERE o.order_id = ? LIMIT 1`, [orderId],
   );
   if (!orders[0]) return null;
   const [items] = await database.query<mysql.RowDataPacket[]>(
@@ -186,6 +207,81 @@ async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
     'SELECT payment_id, status, amount_cents, processed_at FROM payments WHERE order_id = ? ORDER BY payment_id', [orderId],
   );
   return { ...orders[0], items, payments } as LoadedOrder;
+}
+
+async function releaseReservation(
+  connection: mysql.PoolConnection,
+  reservation: ReservationRow,
+  holdStatus: 'EXPIRED' | 'RELEASED',
+): Promise<boolean> {
+  if (reservation.inventory_item_id) {
+    const [inventoryRelease] = await connection.execute<mysql.ResultSetHeader>(
+      `UPDATE event_inventory.inventory_items
+       SET reserved_qty = reserved_qty - ?, version = version + 1
+       WHERE inventory_item_id = ? AND reserved_qty >= ?`,
+      [reservation.quantity, reservation.inventory_item_id, reservation.quantity],
+    );
+    if (inventoryRelease.affectedRows !== 1) throw new Error('reserved_inventory_mismatch');
+  } else {
+    await connection.execute(
+      "UPDATE event_inventory.seats SET status = 'AVAILABLE', hold_id = NULL WHERE hold_id = ? AND status = 'HELD'",
+      [reservation.hold_id],
+    );
+  }
+  const [holdRelease] = await connection.execute<mysql.ResultSetHeader>(
+    "UPDATE event_inventory.inventory_holds SET status = ? WHERE hold_id = ? AND status = 'ACTIVE'",
+    [holdStatus, reservation.hold_id],
+  );
+  if (holdRelease.affectedRows !== 1) throw new Error('reservation_already_released');
+  await connection.execute(
+    "UPDATE orders SET status = 'CANCELLED' WHERE order_id = ? AND status = 'PENDING'",
+    [reservation.order_id],
+  );
+  const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
+    `UPDATE \`queue\`.queue_entries e
+     INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+     SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
+     WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
+       AND e.token_expires_at = ?`,
+    [reservation.event_id, reservation.customer_sub, reservation.expires_at],
+  );
+  return queueRelease.affectedRows > 0;
+}
+
+async function expireReservations(filters: {
+  readonly eventId?: number;
+  readonly orderId?: number;
+  readonly customerSub?: string;
+} = {}): Promise<number> {
+  const connection = await database.getConnection();
+  const clauses = ["o.status = 'PENDING'", "h.status = 'ACTIVE'", 'h.expires_at <= CURRENT_TIMESTAMP'];
+  const params: unknown[] = [];
+  if (filters.eventId) { clauses.push('o.event_id = ?'); params.push(filters.eventId); }
+  if (filters.orderId) { clauses.push('o.order_id = ?'); params.push(filters.orderId); }
+  if (filters.customerSub) { clauses.push('o.customer_sub = ?'); params.push(filters.customerSub); }
+  const queueEvents = new Set<number>();
+  try {
+    await connection.beginTransaction();
+    const [reservations] = await connection.query<ReservationRow[]>(
+      `SELECT o.order_id, o.event_id, o.customer_sub, o.status AS order_status,
+         h.hold_id, h.inventory_item_id, h.quantity, h.status AS hold_status, h.expires_at
+       FROM orders o
+       INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY o.order_id FOR UPDATE`, params,
+    );
+    for (const reservation of reservations) {
+      if (await releaseReservation(connection, reservation, 'EXPIRED')) {
+        queueEvents.add(Number(reservation.event_id));
+      }
+    }
+    await connection.commit();
+    for (const eventId of queueEvents) await refillReleasedQueueSlot(eventId);
+    return reservations.length;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally { connection.release(); }
 }
 
 async function itemsForHold(connection: mysql.PoolConnection, hold: HoldData): Promise<OrderItem[]> {
@@ -217,6 +313,7 @@ app.post('/orders', async (req, res) => {
   if (!input) return res.status(400).json({ error: 'invalid_order' });
   const customerEmail = caller.email || input.customerEmail;
   if (!customerEmail) return res.status(400).json({ error: 'customer_email_required' });
+  if (input.eventId) await expireReservations({ eventId: input.eventId });
 
   const connection = await database.getConnection();
   try {
@@ -240,6 +337,11 @@ app.post('/orders', async (req, res) => {
       if (hold.status !== 'ACTIVE' || !hold.expires_at || new Date(hold.expires_at).getTime() <= Date.now()) {
         await connection.rollback(); return res.status(409).json({ error: 'hold_not_active' });
       }
+      await connection.execute(
+        `UPDATE event_inventory.inventory_holds
+         SET expires_at = LEAST(expires_at, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ${RESERVATION_TIMEOUT_MINUTES} MINUTE))
+         WHERE hold_id = ?`, [holdId],
+      );
       eventId = Number(hold.event_id);
     }
     const [events] = await connection.query<mysql.RowDataPacket[]>(
@@ -285,7 +387,7 @@ app.post('/orders', async (req, res) => {
         }
         const [insert] = await connection.execute<mysql.ResultSetHeader>(
           `INSERT INTO event_inventory.inventory_holds (event_id, customer_sub, quantity, expires_at)
-           VALUES (?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))`, [eventId, caller.sub, input.quantity],
+           VALUES (?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ${RESERVATION_TIMEOUT_MINUTES} MINUTE))`, [eventId, caller.sub, input.quantity],
         );
         holdId = insert.insertId;
         await connection.execute(
@@ -309,7 +411,7 @@ app.post('/orders', async (req, res) => {
         );
         const [insert] = await connection.execute<mysql.ResultSetHeader>(
           `INSERT INTO event_inventory.inventory_holds (event_id, inventory_item_id, customer_sub, quantity, expires_at)
-           VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))`,
+           VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ${RESERVATION_TIMEOUT_MINUTES} MINUTE))`,
           [eventId, item.inventory_item_id, caller.sub, input.quantity],
         );
         holdId = insert.insertId;
@@ -590,6 +692,7 @@ app.get('/orders/:orderId', async (req, res) => {
   if (!requireDatabase(res)) return;
   const orderId = positiveInteger(req.params.orderId);
   if (!orderId) return res.status(400).json({ error: 'invalid_order' });
+  await expireReservations({ orderId });
   const order = await loadOrder(orderId);
   if (!order) return res.status(404).json({ error: 'order_not_found' });
   if (order.customer_sub !== caller.sub && !(await hasEventRole(Number(order.event_id), caller.sub, ['ORGANISER']))) {
@@ -598,17 +701,60 @@ app.get('/orders/:orderId', async (req, res) => {
   return res.json({ order });
 });
 
+app.post('/orders/:orderId/cancel', async (req, res) => {
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  if (!requireDatabase(res)) return;
+  const orderId = positiveInteger(req.params.orderId);
+  if (!orderId) return res.status(400).json({ error: 'invalid_order' });
+
+  const connection = await database.getConnection();
+  let refillEventId: number | null = null;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query<ReservationRow[]>(
+      `SELECT o.order_id, o.event_id, o.customer_sub, o.status AS order_status,
+         h.hold_id, h.inventory_item_id, h.quantity, h.status AS hold_status, h.expires_at
+       FROM orders o
+       INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
+       WHERE o.order_id = ? LIMIT 1 FOR UPDATE`, [orderId],
+    );
+    const reservation = rows[0];
+    if (!reservation) { await connection.rollback(); return res.status(404).json({ error: 'order_not_found' }); }
+    if (reservation.customer_sub !== caller.sub) { await connection.rollback(); return res.status(403).json({ error: 'order_owner_required' }); }
+    if (reservation.order_status === 'CANCELLED') { await connection.commit(); return res.status(204).end(); }
+    if (reservation.order_status !== 'PENDING' || reservation.hold_status !== 'ACTIVE') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'reservation_not_cancellable' });
+    }
+    const expired = new Date(reservation.expires_at).getTime() <= Date.now();
+    if (await releaseReservation(connection, reservation, expired ? 'EXPIRED' : 'RELEASED')) {
+      refillEventId = Number(reservation.event_id);
+    }
+    await connection.commit();
+    if (refillEventId !== null) await refillReleasedQueueSlot(refillEventId);
+    return res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('reservation cancellation failed', { orderId, error });
+    return res.status(502).json({ error: 'reservation_cancel_failed' });
+  } finally { connection.release(); }
+});
+
 app.get('/customers/me/orders', async (req, res) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
   if (!requireDatabase(res)) return;
+  await expireReservations({ customerSub: caller.sub });
   const [orders] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
       o.total_amount_cents, o.currency, o.created_at, o.paid_at,
+      h.expires_at AS reservation_expires_at,
       e.title AS event_title, e.venue, e.starts_at,
       COALESCE(SUM(i.quantity), 0) AS ticket_count
      FROM orders o
      INNER JOIN event_inventory.events e ON e.event_id = o.event_id
+     INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
      LEFT JOIN order_items i ON i.order_id = o.order_id
      WHERE o.customer_sub = ?
        AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
@@ -618,7 +764,7 @@ app.get('/customers/me/orders', async (req, res) => {
            AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
        )
      GROUP BY o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
-       o.total_amount_cents, o.currency, o.created_at, o.paid_at,
+       o.total_amount_cents, o.currency, o.created_at, o.paid_at, h.expires_at,
        e.title, e.venue, e.starts_at
      ORDER BY o.created_at DESC`, [caller.sub, caller.sub],
   );
@@ -666,11 +812,18 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 if (process.env.NODE_ENV !== 'test') {
   const server = app.listen(PORT, HOST, () => console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`));
   const shutdown = new AbortController();
+  const reservationSweep = databaseConfigured
+    ? setInterval(() => {
+        void expireReservations().catch((error) => console.error('reservation expiry sweep failed', { error }));
+      }, RESERVATION_SWEEP_INTERVAL_MS)
+    : undefined;
+  reservationSweep?.unref();
   const worker = PAYMENT_REQUESTS_QUEUE_URL && databaseConfigured
     ? consumePayments(sqs, PAYMENT_REQUESTS_QUEUE_URL, (request) => processPayment(request.orderId, request.customerSub, 'simulated'), shutdown.signal)
     : Promise.resolve();
   const stop = () => {
     shutdown.abort();
+    clearInterval(reservationSweep);
     server.close(() => { void worker.finally(() => database.end()); });
   };
   process.once('SIGTERM', stop);

@@ -76,7 +76,9 @@ app.post('/events/:eventId/inventory/hold', async (req, res) => {
   const eventId = positiveId(req.params.eventId);
   const user = await caller(req, res);
   if (!user || !eventId) return res.status(user ? 400 : 401).json({ error: 'invalid_hold_request' });
-  const seatIds = Array.isArray(req.body?.seatIds) ? req.body.seatIds.map(positiveId) : [];
+  const seatIds: (number | null)[] = Array.isArray(req.body?.seatIds)
+    ? (req.body.seatIds as unknown[]).map(positiveId)
+    : [];
   const quantity = positiveId(req.body?.quantity) ?? (seatIds.length || null);
   if (!quantity || (seatIds.length > 0 && seatIds.some((seatId): seatId is number => seatId === null))) return res.status(422).json({ error: 'invalid_hold_request' });
   const connection = await database.getConnection();
@@ -90,10 +92,10 @@ app.post('/events/:eventId/inventory/hold', async (req, res) => {
       if (seats.length !== seatIds.length) { await connection.rollback(); return res.status(409).json({ error: 'seat_unavailable' }); }
     }
     await connection.execute('UPDATE inventory_items SET reserved_qty = reserved_qty + ? WHERE inventory_item_id = ?', [quantity, item.inventory_item_id]);
-    const [hold] = await connection.execute<mysql.ResultSetHeader>(`INSERT INTO inventory_holds (event_id, inventory_item_id, customer_sub, quantity, status, expires_at) VALUES (?, ?, ?, ?, 'ACTIVE', DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 15 MINUTE))`, [eventId, item.inventory_item_id, user.sub, quantity]);
+    const [hold] = await connection.execute<mysql.ResultSetHeader>(`INSERT INTO inventory_holds (event_id, inventory_item_id, customer_sub, quantity, status, expires_at) VALUES (?, ?, ?, ?, 'ACTIVE', DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 3 MINUTE))`, [eventId, item.inventory_item_id, user.sub, quantity]);
     if (seatIds.length > 0) await connection.query(`UPDATE seats SET status = 'HELD', hold_id = ? WHERE seat_id IN (${seatIds.map(() => '?').join(',')})`, [hold.insertId, ...seatIds]);
     await connection.commit();
-    return res.status(201).json({ holdId: hold.insertId, eventId, quantity, expiresAt: new Date(Date.now() + 900000).toISOString() });
+    return res.status(201).json({ holdId: hold.insertId, eventId, quantity, expiresAt: new Date(Date.now() + 180_000).toISOString() });
   } catch (error) { await connection.rollback(); console.error('inventory hold failed', error); return res.status(502).json({ error: 'hold_failed' }); }
   finally { connection.release(); }
 });

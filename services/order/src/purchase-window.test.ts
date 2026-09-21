@@ -27,6 +27,7 @@ describe('POST /orders sale window', () => {
 
   const EVENT_QUERY = /FROM event_inventory\.events WHERE event_id = \? LIMIT 1/;
   const scriptEvent = (overrides: Record<string, unknown> = {}) => {
+    on(/h\.expires_at <= CURRENT_TIMESTAMP.*o\.event_id = \?/, []);
     on(EVENT_QUERY, [
       { event_id: 5, organiser_sub: 'organiser', tier: 'TIER1_GA', status: 'PUBLISHED', has_started: 0, ...overrides },
     ]);
@@ -85,6 +86,7 @@ describe('POST /orders sale window', () => {
         order_id: null,
       },
     ]);
+    on(/UPDATE event_inventory\.inventory_holds SET expires_at/, { affectedRows: 1 });
     scriptEvent({ has_started: 1 });
 
     const response = await placeOrder({ holdId: 41 });
