@@ -111,6 +111,12 @@ resource "aws_security_group" "ecs_tasks" {
   }
 
   tags = { Name = "${local.name_prefix}-ecs-tasks-sg" }
+
+  # Rules on this group are also managed by hand (MySQL 3306 allow-list, narrowed
+  # egress). Don't let an apply that updates the ECS services reconcile them.
+  lifecycle {
+    ignore_changes = [ingress, egress]
+  }
 }
 
 resource "aws_security_group" "efs" {
