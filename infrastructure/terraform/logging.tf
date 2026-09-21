@@ -97,7 +97,7 @@ resource "aws_s3_bucket_policy" "access_logs" {
 
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/vpc/${local.name_prefix}/flow-logs"
-  retention_in_days = 7 # matches the ECS service log group convention
+  retention_in_days = 90 # investigation window; storage cost at this log volume is negligible either way
 }
 
 data "aws_iam_policy_document" "vpc_flow_logs_trust" {
