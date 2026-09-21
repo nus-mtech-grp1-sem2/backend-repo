@@ -10,15 +10,28 @@ const configured = Boolean(
 if (!configured) {
   console.log('Test-event cleanup skipped: database variables are not configured.');
 } else {
-  const connection = await mysql.createConnection({
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT ?? 3306),
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME_EVENT_INVENTORY ?? 'event_inventory',
-    connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10_000),
-    ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
-  });
+  let connection;
+  try {
+    connection = await mysql.createConnection({
+      host: process.env.DB_HOST,
+      port: Number(process.env.DB_PORT ?? 3306),
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME_EVENT_INVENTORY ?? 'event_inventory',
+      connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10_000),
+      ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
+    });
+  } catch (error) {
+    console.log(
+      'Test-event cleanup skipped: database is unavailable.',
+      error instanceof Error ? error.message : String(error),
+    );
+    process.exitCode = 0;
+  }
+
+  if (!connection) {
+    process.exitCode = 0;
+  } else {
 
   try {
     await connection.beginTransaction();
@@ -177,5 +190,6 @@ if (!configured) {
     process.exitCode = 1;
   } finally {
     await connection.end();
+  }
   }
 }
