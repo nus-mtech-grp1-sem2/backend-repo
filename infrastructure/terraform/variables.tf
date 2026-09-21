@@ -67,6 +67,18 @@ variable "create_services" {
   default     = false
 }
 
+variable "grafana_aws_account_id" {
+  description = "AWS account ID Grafana Cloud uses to assume the CloudWatch read-only role -- shown on the CloudWatch data source's 'Grafana Assume Role' setup page once the data source exists. Empty until then, which gates grafana.tf's role off."
+  type        = string
+  default     = ""
+}
+
+variable "grafana_external_id" {
+  description = "External ID Grafana Cloud generates for this stack's CloudWatch data source (same setup page as grafana_aws_account_id)."
+  type        = string
+  default     = ""
+}
+
 variable "node_services" {
   description = "The 7 backend microservices sharing the onestage-backend image, keyed by name -> container port."
   type        = map(number)
