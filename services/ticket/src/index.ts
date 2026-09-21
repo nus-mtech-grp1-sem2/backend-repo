@@ -2,6 +2,7 @@ import express from 'express';
 import mysql from 'mysql2/promise';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import {
+  ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
   ReceiveMessageCommand,
   SQSClient,
@@ -46,6 +47,25 @@ const database = mysql.createPool({
   ...(process.env.DB_SSL === 'false' ? {} : { ssl: { rejectUnauthorized: false } }),
 });
 const sqs = new SQSClient({});
+const TICKET_ISSUANCE_DELAY_MS = 10_000;
+
+export class TicketIssuanceDeferred extends Error {
+  constructor(readonly retryAfterMs: number) { super('ticket_issuance_pending'); }
+}
+
+/** Use the persisted payment time and database clock, never message delivery time. */
+async function requireIssuanceReady(orderId: number): Promise<void> {
+  const [orders] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT status, TIMESTAMPDIFF(MICROSECOND, paid_at, CURRENT_TIMESTAMP(3)) / 1000 AS paid_age_ms
+     FROM checkout.orders WHERE order_id = ? LIMIT 1`, [orderId],
+  );
+  const order = orders[0];
+  if (!order) throw new Error('order_not_found');
+  if (order.status !== 'PAID') throw new Error('order_not_paid');
+  if (order.paid_age_ms == null || !Number.isFinite(Number(order.paid_age_ms))) throw new Error('invalid_payment_time');
+  const remaining = Math.max(0, TICKET_ISSUANCE_DELAY_MS - Number(order.paid_age_ms));
+  if (remaining > 0) throw new TicketIssuanceDeferred(Math.min(Math.ceil(remaining), TICKET_ISSUANCE_DELAY_MS));
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -215,7 +235,8 @@ export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
   return { type: 'OrderPaid', version: 1, orderId, eventId, customerSub, customerEmail, items };
 }
 
-async function issueTickets(event: OrderPaidEvent): Promise<number> {
+export async function issueTickets(event: OrderPaidEvent): Promise<number> {
+  await requireIssuanceReady(event.orderId);
   const connection = await database.getConnection();
   const lockName = `ticket-order-${event.orderId}`;
   let lockAcquired = false;
@@ -283,7 +304,17 @@ async function consumeOrderPaidEvents(): Promise<void> {
           event = null;
         }
         if (event) {
-          await issueTickets(event);
+          try {
+            await issueTickets(event);
+          } catch (error) {
+            if (!(error instanceof TicketIssuanceDeferred)) throw error;
+            await sqs.send(new ChangeMessageVisibilityCommand({
+              QueueUrl: ORDER_EVENTS_QUEUE_URL,
+              ReceiptHandle: message.ReceiptHandle,
+              VisibilityTimeout: Math.max(1, Math.ceil(error.retryAfterMs / 1000)),
+            }));
+            continue; // Keep the message: acknowledgement and email happen only after issuance.
+          }
           void notifyOrderConfirmed(event.orderId);
         } else console.error('discarding invalid OrderPaid message', { messageId: message.MessageId });
         await sqs.send(new DeleteMessageCommand({
@@ -368,6 +399,7 @@ export async function closeTicketDatabase(): Promise<void> {
 }
 
 export async function issueTicketsForOrder(orderId: number): Promise<{ issued: number; alreadyIssued: boolean }> {
+  await requireIssuanceReady(orderId);
   const connection = await database.getConnection();
   const lockName = `ticket-order-${orderId}`;
   let lockAcquired = false;
@@ -546,11 +578,12 @@ async function findPaidOrdersMissingTickets(limit: number): Promise<readonly num
           GROUP BY order_item_id
        ) issued ON issued.order_item_id = oi.order_item_id
       WHERE o.status = 'PAID'
+        AND TIMESTAMPDIFF(MICROSECOND, o.paid_at, CURRENT_TIMESTAMP(3)) >= ?
         AND COALESCE(issued.issued_count, 0) < oi.quantity
       GROUP BY o.order_id
       ORDER BY paid_at ASC
       LIMIT ?`,
-    [limit],
+    [TICKET_ISSUANCE_DELAY_MS * 1000, limit],
   );
   return rows.map((row) => Number(row.order_id)).filter((orderId) => Number.isSafeInteger(orderId) && orderId > 0);
 }
@@ -597,6 +630,22 @@ async function runPaidOrderReconciliation(): Promise<void> {
   }
 }
 
+// Local fallback returns immediately so payment can finish before ticket issuance.
+// The persisted PAID order plus reconciliation recovers this work after a restart.
+const deferredIssuance = new Map<number, ReturnType<typeof setTimeout>>();
+function scheduleDeferredIssuance(orderId: number, waitMs: number): void {
+  if (deferredIssuance.has(orderId)) return;
+  const timer = setTimeout(() => {
+    deferredIssuance.delete(orderId);
+    void issueTicketsAndNotify(orderId).catch((error: unknown) => {
+      if (error instanceof TicketIssuanceDeferred) scheduleDeferredIssuance(orderId, error.retryAfterMs);
+      else console.error('deferred ticket issuance failed; reconciliation will retry', { orderId });
+    });
+  }, waitMs);
+  timer.unref();
+  deferredIssuance.set(orderId, timer);
+}
+
 app.post('/internal/orders/:orderId/issue-tickets', async (req, res) => {
   if (!TICKET_INTERNAL_SHARED_SECRET || req.header('x-ticket-internal-secret') !== TICKET_INTERNAL_SHARED_SECRET) {
     return res.status(403).json({ error: 'internal_access_denied' });
@@ -607,6 +656,10 @@ app.post('/internal/orders/:orderId/issue-tickets', async (req, res) => {
     const result = await issueTicketsAndNotify(orderId);
     return res.status(200).json(result);
   } catch (error) {
+    if (error instanceof TicketIssuanceDeferred) {
+      scheduleDeferredIssuance(orderId, error.retryAfterMs);
+      return res.status(202).json({ issued: 0, alreadyIssued: false, status: 'PENDING', retryAfterMs: error.retryAfterMs });
+    }
     if (error instanceof Error && error.message === 'order_not_found') return res.status(404).json({ error: error.message });
     if (error instanceof Error && error.message === 'order_not_paid') return res.status(409).json({ error: error.message });
     console.error('ticket issuance failed', error);

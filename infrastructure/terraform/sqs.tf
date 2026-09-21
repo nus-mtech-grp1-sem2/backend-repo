@@ -1,10 +1,53 @@
 # Checkout publishes paid orders here; ticket issuance consumes them asynchronously.
 resource "aws_sqs_queue" "order_events" {
   name                       = "${local.name_prefix}-order-events"
+  delay_seconds              = 10
   message_retention_seconds  = 345600
   visibility_timeout_seconds = 60
   receive_wait_time_seconds  = 20
   sqs_managed_sse_enabled    = true
+}
+
+# Payment commands are consumed by order-service, never by the ticket consumer.
+resource "aws_sqs_queue" "payment_requests_dlq" {
+  name                      = "${local.name_prefix}-payment-requests-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+}
+
+resource "aws_sqs_queue" "payment_requests" {
+  name                       = "${local.name_prefix}-payment-requests"
+  delay_seconds              = 7
+  message_retention_seconds  = 345600
+  visibility_timeout_seconds = 60
+  receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.payment_requests_dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+resource "aws_sqs_queue_redrive_allow_policy" "payment_requests" {
+  queue_url = aws_sqs_queue.payment_requests_dlq.id
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.payment_requests.arn]
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "payment_requests_dlq" {
+  alarm_name          = "${local.name_prefix}-payment-requests-dlq-not-empty"
+  alarm_description   = "Payment processing needs investigation; inspect order-service logs before redriving."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions          = { QueueName = aws_sqs_queue.payment_requests_dlq.name }
 }
 
 # Queue admission events from every ticketed event share this queue. Consumers
@@ -43,6 +86,12 @@ resource "aws_iam_role" "order_task" {
 }
 
 data "aws_iam_policy_document" "order_sqs" {
+  statement {
+    sid       = "ProcessMockPayments"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage"]
+    resources = [aws_sqs_queue.payment_requests.arn]
+  }
   statement {
     sid       = "PublishOrderPaid"
     effect    = "Allow"
