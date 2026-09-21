@@ -97,4 +97,7 @@ resource "aws_iam_role_policy" "grafana_cloudwatch" {
 output "grafana_cloudwatch_role_arn" {
   description = "Paste into Grafana Cloud's CloudWatch data source > Assume Role ARN field."
   value       = local.grafana_cloudwatch_enabled ? aws_iam_role.grafana_cloudwatch[0].arn : null
+  # The ARN itself isn't sensitive, but it's derived from a condition on
+  # grafana_external_id (marked sensitive in variables.tf), which taints it.
+  sensitive = true
 }

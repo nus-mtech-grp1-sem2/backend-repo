@@ -68,15 +68,16 @@ variable "create_services" {
 }
 
 variable "grafana_aws_account_id" {
-  description = "AWS account ID Grafana Cloud uses to assume the CloudWatch read-only role -- shown on the CloudWatch data source's 'Grafana Assume Role' setup page once the data source exists. Empty until then, which gates grafana.tf's role off."
+  description = "AWS account ID Grafana Cloud uses to assume the CloudWatch read-only role -- shown on the CloudWatch data source's 'Grafana Assume Role' setup page. Not a secret (it's just Grafana's own AWS account, common to every customer's data source); the external ID below is what actually scopes access to this stack."
   type        = string
-  default     = ""
+  default     = "008923505280"
 }
 
 variable "grafana_external_id" {
-  description = "External ID Grafana Cloud generates for this stack's CloudWatch data source (same setup page as grafana_aws_account_id)."
+  description = "External ID Grafana Cloud generated for this stack's CloudWatch data source (same setup page as grafana_aws_account_id). Not committed here -- set via grafana.auto.tfvars (gitignored, see grafana.auto.tfvars.example) or -var. AWS's own guidance is to not broadcast external IDs even though the actual security boundary is the trusted account ID, not this value's secrecy."
   type        = string
   default     = ""
+  sensitive   = true
 }
 
 variable "node_services" {

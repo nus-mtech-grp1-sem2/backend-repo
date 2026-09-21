@@ -31,6 +31,14 @@ tfplan*
 .terraform/
 # .terraform.lock.hcl IS committed (pins provider versions)
 
+# terraform.tfvars itself IS committed (persists create_services=true, see
+# that file's own comment for why). *.auto.tfvars is for values that
+# shouldn't be broadcast, like the Grafana Cloud external ID -- never commit
+# those.
+*.auto.tfvars
+*.auto.tfvars.json
+!*.auto.tfvars.example
+
 # Local Docker overrides (docker-compose.yml itself IS committed)
 docker-compose.override.yml
 
