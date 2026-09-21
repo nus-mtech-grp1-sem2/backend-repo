@@ -65,6 +65,14 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
+  # Bucket ACL/ownership prerequisites for CloudFront's log delivery live in
+  # logging.tf, next to the bucket itself.
+  logging_config {
+    bucket          = aws_s3_bucket.access_logs.bucket_domain_name
+    prefix          = "cloudfront/"
+    include_cookies = false
+  }
+
   viewer_certificate {
     cloudfront_default_certificate = true
   }

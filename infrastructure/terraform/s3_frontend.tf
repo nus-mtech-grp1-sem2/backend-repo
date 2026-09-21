@@ -30,6 +30,13 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "frontend" {
   }
 }
 
+# Destination bucket + its policy grant for this live in logging.tf.
+resource "aws_s3_bucket_logging" "frontend" {
+  bucket        = aws_s3_bucket.frontend.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "s3-frontend/"
+}
+
 resource "aws_cloudfront_origin_access_control" "frontend" {
   name                              = "${local.name_prefix}-frontend-oac"
   origin_access_control_origin_type = "s3"
