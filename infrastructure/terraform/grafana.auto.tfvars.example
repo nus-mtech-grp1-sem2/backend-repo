@@ -1,0 +1,6 @@
+# Copy to grafana.auto.tfvars (gitignored, auto-loaded by terraform plan/apply
+# with no -var-file flag needed) and fill in the real value.
+# Shown on Grafana Cloud's CloudWatch data source setup page: Connections >
+# Amazon CloudWatch > Authentication > "Grafana Assume Role" > "How to
+# create an IAM role for Grafana to assume".
+grafana_external_id = ""

@@ -66,6 +66,16 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_kong_health" {
 # One SG for every ECS task (Kong, the 7 Node services, MySQL). Ingress from
 # the ALB (Kong's proxy + status ports) and from itself (Service Connect
 # inter-task traffic + MySQL access from the Node services).
+# Look up the existing EFS group to avoid a dependency cycle: its inline
+# ingress references ecs_tasks. This root already targets an existing stack.
+data "aws_security_group" "efs_lookup" {
+  vpc_id = aws_vpc.main.id
+  filter {
+    name   = "group-name"
+    values = ["${local.name_prefix}-efs"]
+  }
+}
+
 resource "aws_security_group" "ecs_tasks" {
   name        = "${local.name_prefix}-ecs-tasks"
   description = "ECS tasks: ingress from ALB (Kong) and from each other (Service Connect)"
@@ -95,22 +105,49 @@ resource "aws_security_group" "ecs_tasks" {
     self        = true
   }
 
-  # Egress intentionally left as allow-all for now (not scoped down alongside
-  # the ALB/EFS SGs in this same change). This SG also carries 12+ MySQL
-  # ingress rules added by hand outside Terraform (see
-  # docs/findings/2026-09-16-mysql-network-exposure-and-scaling-cost.md) —
-  # any apply that touches this resource's inline ingress/egress blocks
-  # reconciles the *entire* rule set against AWS, which would silently delete
-  # those undeclared rules. Don't touch this resource's rules until that
-  # drift is resolved (formalized in Terraform or removed) with the team.
+  # Keep the complete outbound rule set inline. Do not replace a connectivity
+  # rule with an email rule in the console or mix standalone egress resources
+  # with these blocks: Terraform reconciles the entire inline rule set.
   egress {
+    description = "Inter microservice connectivity"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
+    self        = true
+  }
+
+  egress {
+    description = "Secrets Manager, ECR, CloudWatch Logs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description     = "EFS volume mount"
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [data.aws_security_group.efs_lookup.id]
+  }
+
+  egress {
+    description = "SMTPS to Gmail for notification emails"
+    from_port   = 465
+    to_port     = 465
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
   tags = { Name = "${local.name_prefix}-ecs-tasks-sg" }
+
+  # Inbound rules on this group may also be added by hand (e.g. a MySQL 3306
+  # allow-list). Don't let an apply that updates the ECS services reconcile them
+  # away. Outbound rules are declared in full above, so they are not ignored.
+  lifecycle {
+    ignore_changes = [ingress]
+  }
 }
 
 resource "aws_security_group" "efs" {
