@@ -31,7 +31,7 @@ describe('asynchronous mock payments', () => {
   });
   function scriptOrder(status = 'PENDING', seated = false) {
     const order = { order_id: 42, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com', hold_id: 10, status, total_amount_cents: 4000, currency: 'SGD' };
-    db.on(/FROM orders WHERE order_id/, [order]);
+    db.on(/FROM orders .*order_id = \?/, [order]);
     db.on(/FROM order_items/, []);
     db.on(/FROM payments/, []);
     db.on(/FROM event_inventory\.inventory_holds/, [{ hold_id: 10, inventory_item_id: seated ? null : 9, quantity: 2, status: 'ACTIVE', expires_at: new Date(Date.now() + 60_000) }]);
@@ -72,6 +72,8 @@ describe('asynchronous mock payments', () => {
 
   it('rejects terminal orders and never falls back to capture when SQS is down', async () => {
     const order = scriptOrder('FAILED');
+    assert.equal((await submit()).status, 409);
+    order.status = 'CANCELLED';
     assert.equal((await submit()).status, 409);
     order.status = 'PENDING'; sendFails = true;
     assert.equal((await submit()).status, 503);
