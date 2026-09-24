@@ -2,18 +2,20 @@ locals {
   name_prefix = "onestage"
 
   # Schema each service owns in the shared MySQL instance — mirrors
-  # docker-compose.yml's per-service DB_NAME and the one-instance/four-schemas
+  # docker-compose.yml's per-service DB_NAME and the one-instance/five-schemas
   # split documented in database/onestage-system-design.md. `inventory`
   # shares `event_inventory` with `event` because both read/write the same
-  # tables (events, inventory_items, seats, holds). Services left out of this
-  # map (`notification`, `auth`) don't talk to MySQL: auth is Cognito-only,
-  # notification has no persistent state of its own yet.
+  # tables (events, inventory_items, seats, holds). `notification` owns the
+  # `notification` schema (email_notifications, one row per ticket email) and
+  # crashes on start without these settings. `auth` is left out of this map:
+  # it is Cognito-only and doesn't talk to MySQL.
   service_db_name = {
-    event     = "event_inventory"
-    inventory = "event_inventory"
-    queue     = "queue"
-    order     = "checkout"
-    ticket    = "ticketing"
+    event        = "event_inventory"
+    inventory    = "event_inventory"
+    queue        = "queue"
+    order        = "checkout"
+    ticket       = "ticketing"
+    notification = "notification"
   }
 
   # Every service the module.ecs_service for_each drives: Kong (the only
@@ -83,12 +85,43 @@ locals {
             DB_NAME = local.service_db_name[name]
             DB_PORT = "3306"
             DB_SSL  = "false"
+          } : {},
+          contains(["order", "ticket"], name) ? {
+            ORDER_EVENTS_QUEUE_URL = aws_sqs_queue.order_events.url
+          } : {},
+          # Ticket issuance asks the notification service to email each ticket's
+          # QR code (Service Connect alias `notification`).
+          name == "ticket" ? {
+            NOTIFICATION_SERVICE_URL = "http://notification:${var.node_services["notification"]}"
+          } : {},
+          name == "order" ? {
+            PAYMENT_REQUESTS_QUEUE_URL = aws_sqs_queue.payment_requests.url
+            QUEUE_SERVICE_URL          = "http://queue:3003"
+            QUEUE_REFILL_TIMEOUT_MS    = "1000"
+          } : {},
+          name == "queue" ? {
+            CUSTOMER_ADMITTED_QUEUE_URL = aws_sqs_queue.customer_admitted.url
           } : {}
         )
-        secret_env = contains(keys(local.service_db_name), name) ? {
-          DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
-          DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
-        } : {}
+        secret_env = merge(
+          contains(keys(local.service_db_name), name) ? {
+            DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
+            DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
+          } : {},
+          contains(["order", "queue"], name) ? {
+            INTERNAL_API_TOKEN = "${aws_secretsmanager_secret.mysql.arn}:INTERNAL_API_TOKEN::"
+          } : {},
+          name == "ticket" ? {
+            SCANNER_SESSION_SECRET = "${aws_secretsmanager_secret.mysql.arn}:SCANNER_SESSION_SECRET::"
+          } : {},
+          # Gmail sender for booking confirmation emails. These two keys are
+          # added to the secret by hand in the console (see secrets.tf) — the
+          # values never pass through Terraform or its state.
+          name == "notification" ? {
+            SMTP_USER         = "${aws_secretsmanager_secret.mysql.arn}:SMTP_USER::"
+            SMTP_APP_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:SMTP_APP_PASSWORD::"
+          } : {}
+        )
       }
     }
   )

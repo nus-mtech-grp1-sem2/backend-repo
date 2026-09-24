@@ -29,9 +29,13 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: SERVICE });
 });
 
+// docker-compose sets DB_NAME to this service's schema directly; running
+// outside docker (dev:local, tests) only has the per-schema DB_NAME_* vars
+// from the root .env, so fall back to that — same pattern as services/event
+// and services/ticket (ported from origin/main).
 const databaseConfigured = Boolean(
   process.env.DB_HOST &&
-  process.env.DB_NAME &&
+  (process.env.DB_NAME || process.env.DB_NAME_EVENT_INVENTORY) &&
   process.env.DB_USER &&
   process.env.DB_PASSWORD,
 );
@@ -39,7 +43,7 @@ const databaseConfigured = Boolean(
 const database = mysql.createPool({
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),
-  database: process.env.DB_NAME ?? '',
+  database: process.env.DB_NAME ?? process.env.DB_NAME_EVENT_INVENTORY ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
   connectionLimit: 4,
@@ -185,6 +189,18 @@ async function requireEventOrganiser(req: express.Request, res: express.Response
 function validEventId(value: string): number | null {
   const eventId = Number(value);
   return Number.isSafeInteger(eventId) && eventId > 0 ? eventId : null;
+}
+
+/** Same contract as `validEventId`, exported under the more generic name used
+ * for other path/body ids (e.g. a hold id), which aren't event ids. */
+export function positiveId(value: unknown): number | null {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function nonNegativeInteger(value: unknown): number | null {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function parsePriceCents(price: unknown): number | null {
@@ -801,6 +817,75 @@ async function createHold(
   // customer this hold didn't happen and it's safe/expected to try again.
   res.status(409).json({ error: 'hold_contention_exceeded' });
 }
+
+/**
+ * Shared transition for the two ways a hold's life ends: the customer backs
+ * out (RELEASED) or checkout succeeds (CONFIRMED). Only the customer who
+ * placed the hold may transition it — checkout calls this with the same
+ * customer's bearer token it used to create the hold, not a service token.
+ * Ported from origin/main's `finishHold`; the underlying columns
+ * (`inventory_holds.status`, `inventory_items.reserved_qty`/`sold_qty`,
+ * `seats.status`/`hold_id`) are identical between both branches' schemas.
+ */
+async function finishHold(req: express.Request, res: express.Response, status: 'RELEASED' | 'CONFIRMED'): Promise<void> {
+  if (!databaseConfigured) {
+    res.status(503).json({ error: 'database_not_configured' });
+    return;
+  }
+  const holdId = positiveId(req.params.holdId);
+  if (!holdId) {
+    res.status(400).json({ error: 'invalid_hold' });
+    return;
+  }
+  const caller = await requireAuthenticated(req, res);
+  if (!caller) return;
+
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [holds] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT hold_id, inventory_item_id, quantity, status FROM inventory_holds WHERE hold_id = ? AND customer_sub = ? FOR UPDATE',
+      [holdId, caller.sub],
+    );
+    const hold = holds[0];
+    if (!hold) {
+      await connection.rollback();
+      res.status(404).json({ error: 'hold_not_found' });
+      return;
+    }
+    if (hold.status !== 'ACTIVE') {
+      await connection.rollback();
+      res.status(409).json({ error: 'hold_not_active' });
+      return;
+    }
+
+    await connection.execute('UPDATE inventory_holds SET status = ? WHERE hold_id = ?', [status, holdId]);
+    await connection.execute(
+      'UPDATE inventory_items SET reserved_qty = reserved_qty - ?, sold_qty = sold_qty + ? WHERE inventory_item_id = ?',
+      [hold.quantity, status === 'CONFIRMED' ? hold.quantity : 0, hold.inventory_item_id],
+    );
+    await connection.execute(
+      "UPDATE seats SET status = ?, hold_id = NULL WHERE hold_id = ?",
+      [status === 'CONFIRMED' ? 'SOLD' : 'AVAILABLE', holdId],
+    );
+    await connection.commit();
+    res.json({ holdId, status });
+  } catch (error) {
+    await connection.rollback();
+    console.error('inventory hold transition failed', error);
+    res.status(502).json({ error: 'hold_transition_failed' });
+  } finally {
+    connection.release();
+  }
+}
+
+app.post('/holds/:holdId/release', (req, res) => {
+  void finishHold(req, res, 'RELEASED');
+});
+
+app.post('/holds/:holdId/confirm', (req, res) => {
+  void finishHold(req, res, 'CONFIRMED');
+});
 
 async function syncEventTotalSeats(connection: mysql.PoolConnection, eventId: number, tier: EventTier): Promise<void> {
   const query = tier === 'TIER1_GA'

@@ -10,6 +10,7 @@ build/
 .env
 .env.*
 !.env.example
+variables.env
 
 # SQL initialization files with real credentials
 infrastructure/sql/*-init-*.sql
@@ -18,6 +19,10 @@ infrastructure/sql/*-init-*.sql
 infrastructure/sql/generate-admin-password.js
 infrastructure/sql/test-password-verification.js
 
+# Local scripts with a hardcoded credential — never commit these
+create_cognito_users.py
+send-test-email.ts
+
 # Terraform artifacts must never be committed
 *.tfstate
 *.tfstate.*
@@ -25,6 +30,14 @@ infrastructure/sql/test-password-verification.js
 tfplan*
 .terraform/
 # .terraform.lock.hcl IS committed (pins provider versions)
+
+# terraform.tfvars itself IS committed (persists create_services=true, see
+# that file's own comment for why). *.auto.tfvars is for values that
+# shouldn't be broadcast, like the Grafana Cloud external ID -- never commit
+# those.
+*.auto.tfvars
+*.auto.tfvars.json
+!*.auto.tfvars.example
 
 # Local Docker overrides (docker-compose.yml itself IS committed)
 docker-compose.override.yml

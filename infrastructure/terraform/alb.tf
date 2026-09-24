@@ -9,6 +9,8 @@ resource "aws_lb" "main" {
   # the project isn't blocked. Everything stateful (EFS, S3, Secrets, ECR)
   # still has prevent_destroy set separately.
   enable_deletion_protection = false
+
+  drop_invalid_header_fields = true
 }
 
 # Kong is the sole ingress — the 7 Node services are internal-only via

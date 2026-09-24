@@ -51,6 +51,8 @@ services:
       DB_SSL: ${DB_SSL:-false}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      SCANNER_SESSION_TTL_MIN: ${SCANNER_SESSION_TTL_MIN:-480}
+      TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
       AWS_REGION: ${AWS_REGION:-ap-southeast-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
@@ -74,6 +76,9 @@ services:
   queue:
     <<: *service
     container_name: queue-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: queue
       PORT: 3003
@@ -83,10 +88,26 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      ADMISSION_TOKEN_TTL_SEC: ${ADMISSION_TOKEN_TTL_SEC:-600}
+      AUTO_ADMISSION_ENABLED: ${AUTO_ADMISSION_ENABLED:-true}
+      ADMISSION_SCHEDULER_POLL_MS: ${ADMISSION_SCHEDULER_POLL_MS:-1000}
+      CUSTOMER_ADMITTED_QUEUE_URL: ${CUSTOMER_ADMITTED_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   order:
     <<: *service
     container_name: order-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: order
       PORT: 3004
@@ -96,10 +117,28 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}
+      PAYMENT_REQUESTS_QUEUE_URL: ${PAYMENT_REQUESTS_QUEUE_URL:-}
+      QUEUE_SERVICE_URL: ${QUEUE_SERVICE_URL:-http://queue:3003}
+      QUEUE_REFILL_TIMEOUT_MS: ${QUEUE_REFILL_TIMEOUT_MS:-1000}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      TICKET_SERVICE_URL: ${TICKET_SERVICE_URL:-http://ticket:3005}
+      TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   ticket:
     <<: *service
     container_name: ticket-service
+    volumes:
+      - ../services:/app/services
+      - "${AWS_SHARED_CONFIG_DIR:-${USERPROFILE:-${HOME}}/.aws}:/root/.aws:ro"
     environment:
       SERVICE: ticket
       PORT: 3005
@@ -109,8 +148,19 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      SCANNER_SESSION_SECRET: ${SCANNER_SESSION_SECRET:?SCANNER_SESSION_SECRET not set in variables.env}
+      TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
+      # Booking confirmation emails (QR codes) are sent by the notification service.
+      NOTIFICATION_SERVICE_URL: ${NOTIFICATION_SERVICE_URL:-http://notification:3006}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_SDK_LOAD_CONFIG: "1"
 
   notification:
     <<: *service
@@ -118,6 +168,16 @@ services:
     environment:
       SERVICE: notification
       PORT: 3006
+      # The notification service owns the notification schema.
+      DB_HOST: ${DB_HOST:?DB_HOST not set in .env}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME_NOTIFICATION:-notification}
+      DB_USER: ${DB_USER:-onestage}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
+      DB_SSL: ${DB_SSL:-false}
+      # Gmail SMTP sender for booking confirmation emails.
+      SMTP_USER: ${SMTP_USER:-onestagecontacts@gmail.com}
+      SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:?SMTP_APP_PASSWORD not set in .env}
 
   auth:
     <<: *service
