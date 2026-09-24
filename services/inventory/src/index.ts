@@ -204,7 +204,14 @@ export function nonNegativeInteger(value: unknown): number | null {
 }
 
 function parsePriceCents(price: unknown): number | null {
-  const amount = typeof price === 'number' ? price : typeof price === 'string' ? Number(price) : Number.NaN;
+  let amount: number;
+  if (typeof price === 'number') {
+    amount = price;
+  } else if (typeof price === 'string') {
+    amount = Number(price);
+  } else {
+    amount = Number.NaN;
+  }
   if (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000) return null;
   const cents = Math.round(amount * 100);
   return Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
@@ -224,7 +231,7 @@ function rowLabel(index: number): string {
   let label = '';
   while (n > 0) {
     const remainder = (n - 1) % 26;
-    label = String.fromCharCode(65 + remainder) + label;
+    label = String.fromCodePoint(65 + remainder) + label;
     n = Math.floor((n - 1) / 26);
   }
   return label;
@@ -234,7 +241,62 @@ function rowLabel(index: number): string {
  * one) so the seat-map builder has one less field to fill in. */
 function deriveCode(name: string): string | null {
   const code = name.replace(/[^A-Za-z0-9]/g, '').slice(0, 4).toUpperCase();
-  return code.length >= 2 ? code : code.length > 0 ? code.padEnd(2, 'X') : null;
+  if (code.length >= 2) return code;
+  if (code.length > 0) return code.padEnd(2, 'X');
+  return null;
+}
+
+type ZoneFields = Omit<ParsedZone, 'code'> & { readonly code: string };
+
+/** Parses and validates a single zone entry's own fields. Cross-zone checks
+ * (overlap, code uniqueness) are the caller's job once every zone's
+ * rectangle is known. Returns null on any invalid field. */
+function parseZoneEntry(entry: ZoneInput, gridDims: GridDims): ZoneFields | null {
+  const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+  const priceCents = parsePriceCents(entry.price);
+  const code = name ? deriveCode(name) : null;
+  const inventoryItemId = typeof entry.inventoryItemId === 'number' && Number.isSafeInteger(entry.inventoryItemId)
+    ? entry.inventoryItemId
+    : null;
+  const color = parseRequiredColor(entry.color);
+  const { gridRow, gridCol, gridRowSpan, gridColSpan } = entry;
+
+  if (!name || name.length > 255 || !code || priceCents === null || !color) return null;
+  if (typeof gridRow !== 'number' || !Number.isInteger(gridRow) || gridRow < 0) return null;
+  if (typeof gridCol !== 'number' || !Number.isInteger(gridCol) || gridCol < 0) return null;
+  if (typeof gridRowSpan !== 'number' || !Number.isInteger(gridRowSpan) || gridRowSpan < 1) return null;
+  if (typeof gridColSpan !== 'number' || !Number.isInteger(gridColSpan) || gridColSpan < 1) return null;
+  if (gridRow + gridRowSpan > gridDims.gridRows || gridCol + gridColSpan > gridDims.gridCols) return null;
+
+  return { inventoryItemId, name, code, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan };
+}
+
+/** Claims a zone's rectangle on the shared occupancy grid. Returns false
+ * (without fully claiming the rectangle) if any cell is already claimed by
+ * an earlier zone in the same payload. */
+function claimZoneCells(
+  occupied: boolean[][],
+  zone: Pick<ZoneFields, 'gridRow' | 'gridCol' | 'gridRowSpan' | 'gridColSpan'>,
+): boolean {
+  for (let r = zone.gridRow; r < zone.gridRow + zone.gridRowSpan; r += 1) {
+    for (let c = zone.gridCol; c < zone.gridCol + zone.gridColSpan; c += 1) {
+      if (occupied[r]![c]) return false; // overlaps a zone earlier in the payload
+      occupied[r]![c] = true;
+    }
+  }
+  return true;
+}
+
+/** Appends a numeric suffix (2, 3, ...) until the code is unique among the
+ * zones already seen in this payload. */
+function uniqueZoneCode(code: string, seenCodes: ReadonlySet<string>): string {
+  let candidate = code;
+  let suffix = 2;
+  while (seenCodes.has(candidate)) {
+    candidate = `${code}${suffix}`.slice(0, 10);
+    suffix += 1;
+  }
+  return candidate;
 }
 
 /** Each zone is defined by one rectangle (the organiser's single drag
@@ -246,40 +308,15 @@ function parseZones(raw: unknown, gridDims: GridDims): ParsedZone[] | null {
   const zones: ParsedZone[] = [];
   const seenCodes = new Set<string>();
   const occupied: boolean[][] = Array.from({ length: gridDims.gridRows }, () => new Array(gridDims.gridCols).fill(false));
+
   for (const entry of raw as ZoneInput[]) {
-    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
-    const priceCents = parsePriceCents(entry.price);
-    const code = name ? deriveCode(name) : null;
-    const inventoryItemId = typeof entry.inventoryItemId === 'number' && Number.isSafeInteger(entry.inventoryItemId)
-      ? entry.inventoryItemId
-      : null;
-    const color = parseRequiredColor(entry.color);
-    const { gridRow, gridCol, gridRowSpan, gridColSpan } = entry;
-    if (
-      !name || name.length > 255 || !code || priceCents === null || !color ||
-      typeof gridRow !== 'number' || !Number.isInteger(gridRow) || gridRow < 0 ||
-      typeof gridCol !== 'number' || !Number.isInteger(gridCol) || gridCol < 0 ||
-      typeof gridRowSpan !== 'number' || !Number.isInteger(gridRowSpan) || gridRowSpan < 1 ||
-      typeof gridColSpan !== 'number' || !Number.isInteger(gridColSpan) || gridColSpan < 1 ||
-      gridRow + gridRowSpan > gridDims.gridRows ||
-      gridCol + gridColSpan > gridDims.gridCols
-    ) {
-      return null;
-    }
+    const fields = parseZoneEntry(entry, gridDims);
+    if (!fields) return null;
+    if (!claimZoneCells(occupied, fields)) return null;
 
-    for (let r = gridRow; r < gridRow + gridRowSpan; r += 1) {
-      for (let c = gridCol; c < gridCol + gridColSpan; c += 1) {
-        if (occupied[r]![c]) return null; // overlaps a zone earlier in the payload
-        occupied[r]![c] = true;
-      }
-    }
-
-    let uniqueCode = code;
-    for (let suffix = 2; seenCodes.has(uniqueCode); suffix += 1) {
-      uniqueCode = `${code}${suffix}`.slice(0, 10);
-    }
-    seenCodes.add(uniqueCode);
-    zones.push({ inventoryItemId, name, code: uniqueCode, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan });
+    const code = uniqueZoneCode(fields.code, seenCodes);
+    seenCodes.add(code);
+    zones.push({ ...fields, code });
   }
   return zones;
 }
@@ -460,6 +497,133 @@ async function upsertGridSettings(connection: mysql.PoolConnection, eventId: num
   );
 }
 
+type ZoneInventoryCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly status: number; readonly error: string };
+
+/** Every zone that references an existing `inventoryItemId` must actually
+ * belong to this event (a stale/foreign id would otherwise upsert nothing
+ * and silently orphan the payload). */
+function checkZoneReferencesExist(
+  zones: readonly ParsedZone[],
+  existingZoneById: ReadonlyMap<number, mysql.RowDataPacket>,
+): ZoneInventoryCheck {
+  for (const zone of zones) {
+    if (zone.inventoryItemId !== null && !existingZoneById.has(zone.inventoryItemId)) {
+      return { ok: false, status: 400, error: 'invalid_inventory_payload' };
+    }
+  }
+  return { ok: true };
+}
+
+/** A zone that already has a committed (SOLD/HELD) seat has its rectangle
+ * frozen: it must still appear in the payload at the exact same position and
+ * size, though name/price/colour stay editable. */
+function checkCommittedZonesUnchanged(
+  committedZoneIds: ReadonlySet<number>,
+  existingZoneById: ReadonlyMap<number, mysql.RowDataPacket>,
+  payloadZoneById: ReadonlyMap<number, ParsedZone>,
+): ZoneInventoryCheck {
+  for (const zoneId of committedZoneIds) {
+    const existing = existingZoneById.get(zoneId)!;
+    const payloadZone = payloadZoneById.get(zoneId);
+    if (
+      !payloadZone ||
+      payloadZone.gridRow !== existing.grid_row ||
+      payloadZone.gridCol !== existing.grid_col ||
+      payloadZone.gridRowSpan !== existing.grid_row_span ||
+      payloadZone.gridColSpan !== existing.grid_col_span
+    ) {
+      return { ok: false, status: 409, error: 'cannot_modify_committed_seat' };
+    }
+  }
+  return { ok: true };
+}
+
+/** Upserts each zone's metadata + rectangle, returning the eventual
+ * `inventory_item_id` for each zone (same order as `zones`). */
+async function upsertZoneRows(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  tier: EventTier,
+  zones: readonly ParsedZone[],
+): Promise<number[]> {
+  const zoneUpsertIds: number[] = [];
+  for (const zone of zones) {
+    const totalQty = tier === 'TIER1_GA' ? zone.gridRowSpan * zone.gridColSpan : 0;
+    if (zone.inventoryItemId !== null) {
+      await connection.execute(
+        'UPDATE inventory_items SET name = ?, section_code = ?, price_cents = ?, color = ?, ' +
+          'grid_row = ?, grid_col = ?, grid_row_span = ?, grid_col_span = ?' +
+          (tier === 'TIER1_GA' ? ', total_qty = ?' : '') +
+          ' WHERE inventory_item_id = ?',
+        tier === 'TIER1_GA'
+          ? [zone.name, zone.code, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan, totalQty, zone.inventoryItemId]
+          : [zone.name, zone.code, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan, zone.inventoryItemId],
+      );
+      zoneUpsertIds.push(zone.inventoryItemId);
+    } else {
+      const [result] = await connection.execute<mysql.ResultSetHeader>(
+        'INSERT INTO inventory_items (event_id, name, section_code, total_qty, price_cents, color, grid_row, grid_col, grid_row_span, grid_col_span) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [eventId, zone.name, zone.code, totalQty, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan],
+      );
+      zoneUpsertIds.push(result.insertId);
+    }
+  }
+  return zoneUpsertIds;
+}
+
+/** Zones dropped from the payload are removed (safe: any zone still holding
+ * a committed seat was required by `checkCommittedZonesUnchanged` to remain
+ * present, so it can never be "dropped" here). */
+async function deleteDroppedZones(
+  connection: mysql.PoolConnection,
+  existingZoneIds: Iterable<number>,
+  keepIds: ReadonlySet<number>,
+): Promise<void> {
+  for (const existingId of existingZoneIds) {
+    if (keepIds.has(existingId)) continue;
+    await connection.execute('DELETE FROM seats WHERE inventory_item_id = ?', [existingId]);
+    await connection.execute('DELETE FROM inventory_items WHERE inventory_item_id = ?', [existingId]);
+  }
+}
+
+/** TIER2_SEATED only: regenerates the AVAILABLE seats for each zone's
+ * rectangle (one per cell); any committed seats already occupy their cells
+ * and are left alone. */
+async function regenerateSeatedZoneSeats(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  zones: readonly ParsedZone[],
+  zoneUpsertIds: readonly number[],
+): Promise<void> {
+  for (let i = 0; i < zones.length; i += 1) {
+    const zone = zones[i]!;
+    const zoneId = zoneUpsertIds[i]!;
+    await connection.execute("DELETE FROM seats WHERE inventory_item_id = ? AND status = 'AVAILABLE'", [zoneId]);
+    const [remainingRows] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT pos_x, pos_y FROM seats WHERE inventory_item_id = ?',
+      [zoneId],
+    );
+    const occupied = new Set(remainingRows.map((row) => `${row.pos_y},${row.pos_x}`));
+    for (let r = zone.gridRow; r < zone.gridRow + zone.gridRowSpan; r += 1) {
+      for (let c = zone.gridCol; c < zone.gridCol + zone.gridColSpan; c += 1) {
+        if (occupied.has(`${r},${c}`)) continue;
+        const seatLabel = `${rowLabel(r)}${c + 1}`;
+        await connection.execute(
+          'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [eventId, zoneId, seatLabel, rowLabel(r), c + 1, c, r],
+        );
+      }
+    }
+  }
+  await connection.execute(
+    'UPDATE inventory_items ii SET total_qty = (SELECT COUNT(*) FROM seats s WHERE s.inventory_item_id = ii.inventory_item_id) WHERE ii.event_id = ?',
+    [eventId],
+  );
+}
+
 /**
  * A zone is a rectangle; the payload is the full desired set of zones. For
  * TIER2_SEATED events, seats are derived here (one per cell) rather than
@@ -488,12 +652,12 @@ async function putZoneInventory(
       [eventId],
     );
     const existingZoneById = new Map(existingZoneRows.map((row) => [row.inventory_item_id as number, row]));
-    for (const zone of zones) {
-      if (zone.inventoryItemId !== null && !existingZoneById.has(zone.inventoryItemId)) {
-        await connection.rollback();
-        res.status(400).json({ error: 'invalid_inventory_payload' });
-        return;
-      }
+
+    const referenceCheck = checkZoneReferencesExist(zones, existingZoneById);
+    if (!referenceCheck.ok) {
+      await connection.rollback();
+      res.status(referenceCheck.status).json({ error: referenceCheck.error });
+      return;
     }
 
     const [committedRows] = await connection.query<mysql.RowDataPacket[]>(
@@ -502,83 +666,19 @@ async function putZoneInventory(
     );
     const committedZoneIds = new Set(committedRows.map((row) => row.inventory_item_id as number));
     const payloadZoneById = new Map(zones.filter((z) => z.inventoryItemId !== null).map((z) => [z.inventoryItemId as number, z]));
-    for (const zoneId of committedZoneIds) {
-      const existing = existingZoneById.get(zoneId)!;
-      const payloadZone = payloadZoneById.get(zoneId);
-      if (
-        !payloadZone ||
-        payloadZone.gridRow !== existing.grid_row ||
-        payloadZone.gridCol !== existing.grid_col ||
-        payloadZone.gridRowSpan !== existing.grid_row_span ||
-        payloadZone.gridColSpan !== existing.grid_col_span
-      ) {
-        await connection.rollback();
-        res.status(409).json({ error: 'cannot_modify_committed_seat' });
-        return;
-      }
+
+    const committedCheck = checkCommittedZonesUnchanged(committedZoneIds, existingZoneById, payloadZoneById);
+    if (!committedCheck.ok) {
+      await connection.rollback();
+      res.status(committedCheck.status).json({ error: committedCheck.error });
+      return;
     }
 
-    // Upsert zone metadata + rectangle; remember each zone's eventual id.
-    const zoneUpsertIds: number[] = [];
-    for (const zone of zones) {
-      const totalQty = tier === 'TIER1_GA' ? zone.gridRowSpan * zone.gridColSpan : 0;
-      if (zone.inventoryItemId !== null) {
-        await connection.execute(
-          'UPDATE inventory_items SET name = ?, section_code = ?, price_cents = ?, color = ?, ' +
-            'grid_row = ?, grid_col = ?, grid_row_span = ?, grid_col_span = ?' +
-            (tier === 'TIER1_GA' ? ', total_qty = ?' : '') +
-            ' WHERE inventory_item_id = ?',
-          tier === 'TIER1_GA'
-            ? [zone.name, zone.code, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan, totalQty, zone.inventoryItemId]
-            : [zone.name, zone.code, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan, zone.inventoryItemId],
-        );
-        zoneUpsertIds.push(zone.inventoryItemId);
-      } else {
-        const [result] = await connection.execute<mysql.ResultSetHeader>(
-          'INSERT INTO inventory_items (event_id, name, section_code, total_qty, price_cents, color, grid_row, grid_col, grid_row_span, grid_col_span) ' +
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [eventId, zone.name, zone.code, totalQty, zone.priceCents, zone.color, zone.gridRow, zone.gridCol, zone.gridRowSpan, zone.gridColSpan],
-        );
-        zoneUpsertIds.push(result.insertId);
-      }
-    }
-
-    // Zones dropped from the payload are removed (safe: any zone still
-    // holding a committed seat was required above to appear in the payload).
-    const payloadZoneIds = new Set(zoneUpsertIds);
-    for (const existingId of existingZoneById.keys()) {
-      if (payloadZoneIds.has(existingId)) continue;
-      await connection.execute('DELETE FROM seats WHERE inventory_item_id = ?', [existingId]);
-      await connection.execute('DELETE FROM inventory_items WHERE inventory_item_id = ?', [existingId]);
-    }
+    const zoneUpsertIds = await upsertZoneRows(connection, eventId, tier, zones);
+    await deleteDroppedZones(connection, existingZoneById.keys(), new Set(zoneUpsertIds));
 
     if (tier === 'TIER2_SEATED') {
-      for (let i = 0; i < zones.length; i += 1) {
-        const zone = zones[i]!;
-        const zoneId = zoneUpsertIds[i]!;
-        // Regenerate the AVAILABLE seats for this zone's rectangle; any
-        // committed seats already occupy their cells and are left alone.
-        await connection.execute("DELETE FROM seats WHERE inventory_item_id = ? AND status = 'AVAILABLE'", [zoneId]);
-        const [remainingRows] = await connection.query<mysql.RowDataPacket[]>(
-          'SELECT pos_x, pos_y FROM seats WHERE inventory_item_id = ?',
-          [zoneId],
-        );
-        const occupied = new Set(remainingRows.map((row) => `${row.pos_y},${row.pos_x}`));
-        for (let r = zone.gridRow; r < zone.gridRow + zone.gridRowSpan; r += 1) {
-          for (let c = zone.gridCol; c < zone.gridCol + zone.gridColSpan; c += 1) {
-            if (occupied.has(`${r},${c}`)) continue;
-            const seatLabel = `${rowLabel(r)}${c + 1}`;
-            await connection.execute(
-              'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES (?, ?, ?, ?, ?, ?, ?)',
-              [eventId, zoneId, seatLabel, rowLabel(r), c + 1, c, r],
-            );
-          }
-        }
-      }
-      await connection.execute(
-        'UPDATE inventory_items ii SET total_qty = (SELECT COUNT(*) FROM seats s WHERE s.inventory_item_id = ii.inventory_item_id) WHERE ii.event_id = ?',
-        [eventId],
-      );
+      await regenerateSeatedZoneSeats(connection, eventId, zones, zoneUpsertIds);
     }
 
     await upsertGridSettings(connection, eventId, gridDims);
@@ -604,6 +704,39 @@ interface HoldInput {
   readonly seatIds?: unknown;
 }
 
+type HoldRequest =
+  | { readonly ok: true; readonly inventoryItemId: number; readonly quantity: number; readonly seatIds: number[] | null }
+  | { readonly ok: false };
+
+/** Validates and normalises a hold request body. TIER2_SEATED holds name the
+ * exact seats wanted (so the same seat can't be handed to two customers);
+ * TIER1_GA holds are a plain capacity count since there are no individual
+ * seat rows to name. */
+function parseHoldRequest(body: HoldInput, tier: EventTier): HoldRequest {
+  const inventoryItemId = typeof body.inventoryItemId === 'number' && Number.isSafeInteger(body.inventoryItemId)
+    ? body.inventoryItemId
+    : null;
+  if (!inventoryItemId) return { ok: false };
+
+  let quantity: number;
+  let seatIds: number[] | null = null;
+  if (tier === 'TIER2_SEATED') {
+    const rawSeatIds = body.seatIds;
+    const isValidSeatIdList = Array.isArray(rawSeatIds) &&
+      rawSeatIds.length > 0 &&
+      rawSeatIds.every((id) => typeof id === 'number' && Number.isSafeInteger(id));
+    if (!isValidSeatIdList) return { ok: false };
+    seatIds = [...new Set(rawSeatIds as number[])];
+    if (seatIds.length !== (rawSeatIds as number[]).length) return { ok: false };
+    quantity = seatIds.length;
+  } else {
+    quantity = typeof body.quantity === 'number' ? body.quantity : Number.NaN;
+  }
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_HOLD_QTY) return { ok: false };
+
+  return { ok: true, inventoryItemId, quantity, seatIds };
+}
+
 /**
  * A hold reserves inventory ahead of payment (see CONTEXT.md "oversell
  * prevention"). `inventory_items.total_qty` is the organiser-saved capacity
@@ -624,34 +757,10 @@ app.post('/events/:eventId/holds', async (req, res) => {
   if (!event) return res.status(404).json({ error: 'event_not_found' });
   if (event.status !== 'PUBLISHED') return res.status(409).json({ error: 'event_not_on_sale' });
 
-  const body = req.body as HoldInput;
-  const inventoryItemId = typeof body.inventoryItemId === 'number' && Number.isSafeInteger(body.inventoryItemId)
-    ? body.inventoryItemId
-    : null;
-  if (!inventoryItemId) return res.status(400).json({ error: 'invalid_hold_payload' });
+  const holdRequest = parseHoldRequest(req.body as HoldInput, event.tier);
+  if (!holdRequest.ok) return res.status(400).json({ error: 'invalid_hold_payload' });
 
-  // TIER2_SEATED holds name the exact seats wanted (so the same seat can't be
-  // handed to two customers); TIER1_GA holds are a plain capacity count since
-  // there are no individual seat rows to name.
-  let quantity: number;
-  let seatIds: number[] | null = null;
-  if (event.tier === 'TIER2_SEATED') {
-    const rawSeatIds = body.seatIds;
-    const isValidSeatIdList = Array.isArray(rawSeatIds) &&
-      rawSeatIds.length > 0 &&
-      rawSeatIds.every((id) => typeof id === 'number' && Number.isSafeInteger(id));
-    if (!isValidSeatIdList) return res.status(400).json({ error: 'invalid_hold_payload' });
-    seatIds = [...new Set(rawSeatIds as number[])];
-    if (seatIds.length !== (rawSeatIds as number[]).length) return res.status(400).json({ error: 'invalid_hold_payload' });
-    quantity = seatIds.length;
-  } else {
-    quantity = typeof body.quantity === 'number' ? body.quantity : Number.NaN;
-  }
-  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_HOLD_QTY) {
-    return res.status(400).json({ error: 'invalid_hold_payload' });
-  }
-
-  await createHold(eventId, inventoryItemId, quantity, caller.sub, seatIds, res);
+  await createHold(eventId, holdRequest.inventoryItemId, holdRequest.quantity, caller.sub, holdRequest.seatIds, res);
 });
 
 /**
