@@ -516,7 +516,7 @@ app.get('/events/:eventId/image', async (req, res) => {
     [eventId],
   );
   const row = rows[0];
-  if (!row || !row.image_data || !row.image_mime_type) return res.status(404).json({ error: 'image_not_set' });
+  if (!row?.image_data || !row?.image_mime_type) return res.status(404).json({ error: 'image_not_set' });
   res.set('Content-Type', row.image_mime_type as string);
   res.set('Cache-Control', 'private, max-age=300');
   res.send(row.image_data as Buffer);
