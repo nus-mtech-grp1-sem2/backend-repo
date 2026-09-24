@@ -464,9 +464,12 @@ describe('organiser endpoints', () => {
       const members = [{ membership_id: 1, user_sub: 'bob', role: 'HELPER' }];
       isOrganiser();
       on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, members);
+      // The route enriches each row with a `name` looked up from Cognito
+      // (mocked to `{}` above, so `AdminGetUserCommand` resolves with no
+      // UserAttributes and the looked-up name falls back to '').
       assert.deepEqual(await request('GET', '/events/5/team-members', { token: 'alice' }), {
         status: 200,
-        body: { members },
+        body: { members: members.map((member) => ({ ...member, name: '' })) },
       });
 
       assert.equal((await request('GET', '/events/zero/team-members', { token: 'alice' })).status, 400);
