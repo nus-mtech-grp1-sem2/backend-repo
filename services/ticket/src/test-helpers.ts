@@ -100,6 +100,7 @@ export interface OrderFixtureInput {
  * schema but is uniquely constrained, so each fixture needs its own
  * placeholder value rather than a shared literal. */
 export async function createOrderFixture(input: OrderFixtureInput): Promise<number> {
+  counter += 1;
   const [result] = await checkoutPool.execute<mysql.ResultSetHeader>(
     `INSERT INTO orders
        (event_id, customer_sub, customer_email, hold_id, status, total_amount_cents, currency, paid_at)
@@ -108,7 +109,7 @@ export async function createOrderFixture(input: OrderFixtureInput): Promise<numb
       input.eventId,
       input.customerSub,
       `${input.customerSub}@test.example`,
-      Date.now() * 1000 + (counter += 1),
+      Date.now() * 1000 + counter,
       input.status ?? 'PAID',
       input.totalAmountCents ?? 5000,
       input.status === 'PENDING' ? null : new Date(),
@@ -159,9 +160,10 @@ export async function createQueueEntryFixture(input: QueueEntryFixtureInput): Pr
     );
     queueSessionId = sessionResult.insertId;
   }
+  counter += 1;
   const [entryResult] = await queuePool.execute<mysql.ResultSetHeader>(
     'INSERT INTO queue_entries (queue_session_id, customer_sub, position, status) VALUES (?, ?, ?, ?)',
-    [queueSessionId, input.customerSub, (counter += 1), input.status ?? 'WAITING'],
+    [queueSessionId, input.customerSub, counter, input.status ?? 'WAITING'],
   );
   return entryResult.insertId;
 }
