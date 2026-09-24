@@ -8,7 +8,9 @@
 -- whether that's the right outcome for those seats before running this.
 USE event_inventory;
 
-UPDATE seats SET status = 'AVAILABLE' WHERE status = 'BLOCKED';
+SET @available_status = 'AVAILABLE';
+
+UPDATE seats SET status = @available_status WHERE status = 'BLOCKED';
 
 ALTER TABLE seats
   DROP COLUMN tag,
