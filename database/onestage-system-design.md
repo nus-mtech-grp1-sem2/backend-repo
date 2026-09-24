@@ -314,13 +314,22 @@ classDiagram
 
 For a new database, run `02-init-create-tables-index.sql`. It creates `events.total_seats` and the invitation lifecycle columns and index on `event_team_memberships`.
 
-For an existing schema created before these fields were introduced, run the migrations once in order:
+For an existing schema created before these fields were introduced, run the migrations once, in numeric order (each filename's number reflects when it was written, so this is also the safe apply order):
 
 1. `03-add-event-team-invitations.sql` adds `invite_status`, nullable `responded_at`, and the `(user_sub, invite_status)` lookup index used for a user's inbox.
 2. `04-add-event-total-seats.sql` adds the required event-capacity column with a default of `1` for existing rows.
-3. `06-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, so the Event & Inventory Service can generate and render a structured seat grid per section.
-4. `06-add-queue-order-idempotency.sql` adds the unique event-session and hold-order keys used to make queue configuration and order creation idempotent. It fails without deleting data if legacy duplicates need manual review first.
-5. `07-add-event-available-buyers.sql` adds the nullable concurrent-buyer limit and its capacity check. A `NULL` value keeps the default of 10% of total seats, rounded up with a minimum of one.
+3. `06-add-notification-schema.sql` creates the `notification` database and `email_notifications` table for post-purchase confirmation emails.
+4. `07-add-queue-order-idempotency.sql` adds the unique event-session and hold-order keys used to make queue configuration and order creation idempotent. It fails without deleting data if legacy duplicates need manual review first.
+5. `08-ticket-checkin-attempts.sql` adds check-in audit logging support.
+6. `09-add-customer-name.sql` preserves the attendee display name for helper lookup and organiser rosters.
+7. `10-add-event-available-buyers.sql` adds the nullable concurrent-buyer limit and its capacity check. A `NULL` value keeps the default of 10% of total seats, rounded up with a minimum of one.
+8. `11-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, so the Event & Inventory Service can generate and render a structured seat grid per section.
+9. `12-add-event-image-and-seat-tags.sql` adds the event photo, per-zone colour, and seat tag columns (rollback: `12-add-event-image-and-seat-tags.rollback.sql`).
+10. `13-add-inventory-grid-position.sql` adds a virtual row/column position per zone/section for the drag-and-drop venue map.
+11. `14-add-grid-customization.sql` adds a per-event custom grid size and multi-cell zone/section spans.
+12. `15-email-notifications-per-ticket.sql` moves `email_notifications` from one row per order to one row per ticket.
+
+After running `06-add-notification-schema.sql`, also re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new `notification` schema.
 
 `total_seats` is configured capacity on `events`; `available_buyers` limits how many customers may be admitted or checking out concurrently. `inventory_items.total_qty`, `reserved_qty`, and `sold_qty` remain the operational quantities used to calculate currently available inventory.
 

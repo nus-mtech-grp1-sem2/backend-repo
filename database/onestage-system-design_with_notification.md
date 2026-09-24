@@ -668,7 +668,7 @@ erDiagram
     }
 ```
 
-`ticket_id` carries a unique key, not just an index — it's what makes the send idempotent. A second call for the same ticket updates the existing row (`ON DUPLICATE KEY UPDATE`) instead of inserting a duplicate, while `order_id` is a plain index so one order can hold several rows. `ticket_id` is nullable only for rows written before per-ticket emails; MySQL allows any number of `NULL`s under a unique key. Apply `08-email-notifications-per-ticket.sql` to move an existing database to this shape.
+`ticket_id` carries a unique key, not just an index — it's what makes the send idempotent. A second call for the same ticket updates the existing row (`ON DUPLICATE KEY UPDATE`) instead of inserting a duplicate, while `order_id` is a plain index so one order can hold several rows. `ticket_id` is nullable only for rows written before per-ticket emails; MySQL allows any number of `NULL`s under a unique key. Apply `15-email-notifications-per-ticket.sql` to move an existing database to this shape.
 
 ### Domain model
 
@@ -716,7 +716,7 @@ classDiagram
 
 ### Schema installation
 
-Run `06-add-notification-schema.sql` once, in addition to `02-init-create-tables-index.sql`; it creates the `notification` database and the `email_notifications` table (`CREATE ... IF NOT EXISTS`, so it's safe to re-run). Afterward, re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new schema too. On a database created before per-ticket emails, also run `08-email-notifications-per-ticket.sql` once (it checks `information_schema` first, so it's safe to re-run); it adds `ticket_id`, makes it the unique key, and demotes `order_id` to a plain index. The Notification Service needs it: its per-ticket queries fail with `Unknown column 'ticket_id'` until it has been applied.
+Run `06-add-notification-schema.sql` once, in addition to `02-init-create-tables-index.sql`; it creates the `notification` database and the `email_notifications` table (`CREATE ... IF NOT EXISTS`, so it's safe to re-run). Afterward, re-run `05-grant-onestage-app-schema-access.sql` so `onestage_app` can reach the new schema too. On a database created before per-ticket emails, also run `15-email-notifications-per-ticket.sql` once (it checks `information_schema` first, so it's safe to re-run); it adds `ticket_id`, makes it the unique key, and demotes `order_id` to a plain index. The Notification Service needs it: its per-ticket queries fail with `Unknown column 'ticket_id'` until it has been applied.
 
 ---
 

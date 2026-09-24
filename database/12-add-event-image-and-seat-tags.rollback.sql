@@ -1,4 +1,4 @@
--- Rollback for 07-add-event-image-and-seat-tags.sql.
+-- Rollback for 12-add-event-image-and-seat-tags.sql.
 -- Only run this if you need to undo the event photo / zone colour / seat tag columns.
 --
 -- WARNING: this permanently deletes any data already stored in the affected

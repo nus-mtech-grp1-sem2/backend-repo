@@ -1,4 +1,4 @@
--- Apply once to existing event_inventory schemas (after 08-add-inventory-grid-position.sql).
+-- Apply once to existing event_inventory schemas (after 13-add-inventory-grid-position.sql).
 -- Lets organisers pick their own grid size per event (instead of a fixed 6x8)
 -- and lets a single zone/section span more than one row/column, so adjacent
 -- cells can be visually merged into one block on the venue map.
