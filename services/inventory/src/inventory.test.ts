@@ -210,3 +210,54 @@ test('a zone with a sold seat has its rectangle frozen, but name/price/colour an
     await destroyFixture(fixture.eventId);
   }
 });
+
+test('a zone with only expired/released hold history cannot be dropped — 409, not a 502 FK crash', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [{ name: 'Balcony', price: 40, color: '#00FF00', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 2 }],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const { zones } = await getRes.json();
+    const inventoryItemId = zones[0].inventoryItemId;
+
+    // No seat is SOLD/HELD (so `checkCommittedZonesUnchanged` doesn't block the
+    // drop), but a past reservation attempt left a hold row referencing this
+    // zone — released/expired long ago, never cleaned up. `inventory_holds`
+    // still FK-references the zone, so deleting it would otherwise crash.
+    await testPool.execute(
+      "INSERT INTO inventory_holds (event_id, inventory_item_id, customer_sub, quantity, status, expires_at) " +
+        "VALUES (?, ?, 'expired-customer', 1, 'EXPIRED', DATE_SUB(NOW(), INTERVAL 1 DAY))",
+      [fixture.eventId, inventoryItemId],
+    );
+
+    // Submitting a layout that drops this zone must be rejected clearly, not
+    // crash with a 502 when MySQL blocks the DELETE.
+    const dropRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [] }),
+    });
+    assert.equal(dropRes.status, 409);
+    const dropBody = await dropRes.json();
+    assert.equal(dropBody.error, 'zone_has_reservation_history');
+
+    // Nothing was touched — the zone and its seat both still exist.
+    const finalGetRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const finalBody = await finalGetRes.json();
+    assert.equal(finalBody.zones.length, 1);
+    assert.equal(finalBody.zones[0].inventoryItemId, inventoryItemId);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});

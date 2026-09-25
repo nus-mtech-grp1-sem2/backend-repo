@@ -516,6 +516,28 @@ function checkZoneReferencesExist(
   return { ok: true };
 }
 
+/** A zone that has ever been referenced by an `inventory_holds` row — active,
+ * confirmed, released, or expired — cannot be hard-deleted:
+ * `inventory_holds.inventory_item_id` FK-references `inventory_items`, and
+ * MySQL blocks the DELETE (ER_ROW_IS_REFERENCED_2) even for holds that were
+ * released/expired long ago and no longer show up as a committed seat. Check
+ * for this up front and reject with a clear 409 instead of letting the
+ * DELETE throw and surface as a 502. */
+async function checkNoHoldHistory(
+  connection: mysql.PoolConnection,
+  droppedZoneIds: readonly number[],
+): Promise<ZoneInventoryCheck> {
+  if (droppedZoneIds.length === 0) return { ok: true };
+  const [rows] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT DISTINCT inventory_item_id FROM inventory_holds WHERE inventory_item_id IN (?)',
+    [droppedZoneIds],
+  );
+  if (rows.length > 0) {
+    return { ok: false, status: 409, error: 'zone_has_reservation_history' };
+  }
+  return { ok: true };
+}
+
 /** A zone that already has a committed (SOLD/HELD) seat has its rectangle
  * frozen: it must still appear in the payload at the exact same position and
  * size, though name/price/colour stay editable. */
@@ -674,6 +696,14 @@ async function putZoneInventory(
       return;
     }
 
+    const droppedZoneIds = [...existingZoneById.keys()].filter((id) => !payloadZoneById.has(id));
+    const holdHistoryCheck = await checkNoHoldHistory(connection, droppedZoneIds);
+    if (!holdHistoryCheck.ok) {
+      await connection.rollback();
+      res.status(holdHistoryCheck.status).json({ error: holdHistoryCheck.error });
+      return;
+    }
+
     const zoneUpsertIds = await upsertZoneRows(connection, eventId, tier, zones);
     await deleteDroppedZones(connection, existingZoneById.keys(), new Set(zoneUpsertIds));
 
@@ -687,8 +717,16 @@ async function putZoneInventory(
     res.status(204).end();
   } catch (error) {
     await connection.rollback();
-    if ((error as { code?: string }).code === 'ER_DUP_ENTRY') {
+    const code = (error as { code?: string }).code;
+    if (code === 'ER_DUP_ENTRY') {
       res.status(409).json({ error: 'duplicate_seat_label' });
+      return;
+    }
+    // Defensive fallback for the same FK constraint `checkNoHoldHistory`
+    // guards against above — e.g. a hold created concurrently between that
+    // check and the DELETE. Still a clear 409, never a raw 502.
+    if (code === 'ER_ROW_IS_REFERENCED_2' || code === 'ER_ROW_IS_REFERENCED') {
+      res.status(409).json({ error: 'zone_has_reservation_history' });
       return;
     }
     console.error('failed to update zone inventory', error);
