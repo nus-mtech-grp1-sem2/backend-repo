@@ -34,30 +34,34 @@ if errorlevel 1 (
 )
 
 set "AWS_MYSQL_IP="
+if not defined ONESTAGE_AWS_PROFILE set "ONESTAGE_AWS_PROFILE=onestage-admin"
 where aws >nul 2>&1
 if errorlevel 1 (
-  echo AWS CLI still not available - leaving .env DB_HOST unchanged ^(local mysql container will be used^).
-  goto :skip_aws_ip
+  echo AWS CLI is required to resolve the current AWS MySQL endpoint.
+  pause
+  exit /b 1
 )
 
-aws sts get-caller-identity >nul 2>&1
+aws sts get-caller-identity --profile "%ONESTAGE_AWS_PROFILE%" >nul 2>&1
 if errorlevel 1 (
-  echo AWS CLI not configured with credentials - leaving .env DB_HOST unchanged.
-  goto :skip_aws_ip
+  echo AWS profile "%ONESTAGE_AWS_PROFILE%" is not authenticated.
+  echo Run: aws sso login --profile %ONESTAGE_AWS_PROFILE%
+  pause
+  exit /b 1
 )
 
 echo Fetching current AWS mysql task public IP...
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%BACKEND_DIR%scripts\mysql-public-ip.ps1" 2^>nul`) do set "AWS_MYSQL_IP=%%I"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%BACKEND_DIR%scripts\mysql-public-ip.ps1" -Profile "%ONESTAGE_AWS_PROFILE%" 2^>nul`) do set "AWS_MYSQL_IP=%%I"
 
 echo %AWS_MYSQL_IP%| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul
 if errorlevel 1 (
-  echo Could not determine AWS mysql IP ^(got: "%AWS_MYSQL_IP%"^) - leaving .env DB_HOST unchanged.
+  echo Could not determine AWS mysql IP ^(got: "%AWS_MYSQL_IP%"^). Refusing to start with a stale endpoint.
+  pause
+  exit /b 1
 ) else (
   echo Updating .env DB_HOST to %AWS_MYSQL_IP%...
   powershell -NoProfile -ExecutionPolicy Bypass -Command "(Get-Content -Raw '%BACKEND_DIR%.env') -replace '(?m)^DB_HOST=.*$', 'DB_HOST=%AWS_MYSQL_IP%' | Set-Content -NoNewline '%BACKEND_DIR%.env'"
 )
-
-:skip_aws_ip
 
 echo Stopping previous OneStage launchers and backend containers...
 taskkill /FI "WINDOWTITLE eq OneStage Backend*" /T /F >nul 2>&1

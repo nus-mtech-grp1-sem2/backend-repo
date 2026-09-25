@@ -24,7 +24,7 @@ eni_id=$(aws ecs describe-tasks \
   --region "${REGION}" \
   --cluster "${CLUSTER}" \
   --tasks "${task_arn}" \
-  --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+  --query 'tasks[0].attachments[?type==`ElasticNetworkInterface`] | [0].details[?name==`networkInterfaceId`].value | [0]' \
   --output text)
 
 aws ec2 describe-network-interfaces \

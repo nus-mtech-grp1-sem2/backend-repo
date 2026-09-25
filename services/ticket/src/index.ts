@@ -817,14 +817,8 @@ app.get('/customers/me/tickets', async (req, res) => {
      INNER JOIN event_inventory.events e ON e.event_id = t.event_id
      LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
      WHERE t.customer_sub = ?
-       AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-       AND NOT EXISTS (
-         SELECT 1 FROM event_inventory.event_team_memberships etm
-         WHERE etm.event_id = t.event_id AND etm.user_sub = t.customer_sub
-           AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-       )
      ORDER BY e.starts_at ASC, t.ticket_id ASC`,
-    [caller.sub, caller.sub],
+    [caller.sub],
   );
   return res.json({ tickets });
 });
@@ -916,14 +910,8 @@ app.get('/customers/me/tickets', async (req, res) => {
        JOIN event_inventory.events e ON e.event_id = t.event_id
        LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
        WHERE t.customer_sub = ?
-         AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM event_inventory.event_team_memberships etm
-           WHERE etm.event_id = t.event_id AND etm.user_sub = t.customer_sub
-             AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-         )
        ORDER BY e.starts_at DESC, t.ticket_id`,
-      [caller.sub, caller.sub],
+      [caller.sub],
     );
     return res.json({ tickets });
   } catch (error) {

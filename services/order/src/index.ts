@@ -170,14 +170,6 @@ async function hasEventRole(eventId: number, sub: string, roles: readonly string
   return rows.length > 0;
 }
 
-export function isEventTeamPurchase(
-  eventOrganiserSub: unknown,
-  acceptedMembershipCount: number,
-  customerSub: string,
-): boolean {
-  return String(eventOrganiserSub ?? '') === customerSub || acceptedMembershipCount > 0;
-}
-
 /**
  * Why tickets for an event cannot be bought right now, or null when they can.
  * Events carry a start time but no end time, so one that has started is
@@ -348,21 +340,11 @@ app.post('/orders', async (req, res) => {
       eventId = Number(hold.event_id);
     }
     const [events] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT event_id, organiser_sub, tier, status, starts_at < UTC_TIMESTAMP() AS has_started
+      `SELECT event_id, tier, status, starts_at < UTC_TIMESTAMP() AS has_started
        FROM event_inventory.events WHERE event_id = ? LIMIT 1`, [eventId],
     );
     const event = events[0];
     if (!event) { await connection.rollback(); return res.status(404).json({ error: 'event_not_found' }); }
-    const [teamMemberships] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT membership_id FROM event_inventory.event_team_memberships
-       WHERE event_id = ? AND user_sub = ? AND role IN ('ORGANISER', 'HELPER')
-         AND invite_status = 'ACCEPTED' LIMIT 1`,
-      [eventId, caller.sub],
-    );
-    if (isEventTeamPurchase(event.organiser_sub, teamMemberships.length, caller.sub)) {
-      await connection.rollback();
-      return res.status(403).json({ error: 'event_team_cannot_purchase' });
-    }
     const saleBlock = saleBlockReason(event);
     if (saleBlock) { await connection.rollback(); return res.status(409).json({ error: saleBlock }); }
 
@@ -768,16 +750,10 @@ app.get('/customers/me/orders', async (req, res) => {
      INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
      LEFT JOIN order_items i ON i.order_id = o.order_id
      WHERE o.customer_sub = ?
-       AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-       AND NOT EXISTS (
-         SELECT 1 FROM event_inventory.event_team_memberships etm
-         WHERE etm.event_id = o.event_id AND etm.user_sub = o.customer_sub
-           AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-       )
      GROUP BY o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
        o.total_amount_cents, o.currency, o.created_at, o.paid_at, h.expires_at,
        e.title, e.venue, e.starts_at
-     ORDER BY o.created_at DESC`, [caller.sub, caller.sub],
+     ORDER BY o.created_at DESC`, [caller.sub],
   );
   return res.json({ orders });
 });

@@ -3,7 +3,6 @@ import { after, describe, it } from 'node:test';
 
 import {
   app,
-  isEventTeamPurchase,
   parseCreateOrder,
   positiveInteger,
   requestQueueRefill,
@@ -33,17 +32,6 @@ describe('order input validation', () => {
     assert.equal(positiveInteger('1 OR 1=1'), null);
     assert.equal(parseCreateOrder({ eventId: 7, quantity: 2, seatIds: [10, 10] }), null);
     assert.equal(parseCreateOrder({ eventId: 7, quantity: 2, seatIds: [10] }), null);
-  });
-});
-
-describe('event-team purchase restriction', () => {
-  it('blocks the event owner and accepted event-team members', () => {
-    assert.equal(isEventTeamPurchase('owner-sub', 0, 'owner-sub'), true);
-    assert.equal(isEventTeamPurchase('owner-sub', 1, 'helper-sub'), true);
-  });
-
-  it('allows a customer who is not on the event team', () => {
-    assert.equal(isEventTeamPurchase('owner-sub', 0, 'customer-sub'), false);
   });
 });
 

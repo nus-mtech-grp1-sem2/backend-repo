@@ -31,7 +31,6 @@ describe('POST /orders sale window', () => {
     on(EVENT_QUERY, [
       { event_id: 5, organiser_sub: 'organiser', tier: 'TIER1_GA', status: 'PUBLISHED', has_started: 0, ...overrides },
     ]);
-    on(/FROM event_inventory\.event_team_memberships/, []);
   };
   const placeOrder = async (body: unknown, token = 'alice') => {
     const response = await fetch(`${base}/orders`, {
@@ -117,6 +116,24 @@ describe('POST /orders sale window', () => {
     const response = await placeOrder({ eventId: 5, quantity: 1 });
 
     assert.deepEqual(response, { status: 409, body: { error: 'inventory_unavailable' } });
+  });
+
+  it('lets event owners and accepted team members through to the normal stock check', async () => {
+    for (const token of ['organiser', 'helper']) {
+      db.clearRules();
+      scriptEvent();
+      on(/FROM event_inventory\.inventory_items/, []);
+      on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 9 }]);
+
+      assert.deepEqual(await placeOrder({ eventId: 5, quantity: 1 }, token), {
+        status: 409,
+        body: { error: 'inventory_unavailable' },
+      });
+      assert.equal(
+        calls.some((call) => /FROM event_inventory\.event_team_memberships/.test(call.sql)),
+        false,
+      );
+    }
   });
 
   it('rejects an unauthenticated order before looking at the event', async () => {

@@ -57,6 +57,15 @@ test('customer can fetch their own issued tickets, but not another customer\'s',
       assert.equal(typeof ticket.qr_token, 'string');
       assert.equal(typeof ticket.event_title, 'string');
     }
+
+    await createTicketFixture({ eventId: fixture.eventId, customerSub: fixture.organiserSub });
+    const organiserResponse = await fetch(`${baseUrl}/customers/me/tickets`, {
+      headers: { ...authHeader(fixture.organiserSub) },
+    });
+    assert.equal(organiserResponse.status, 200);
+    const organiserBody = await organiserResponse.json();
+    assert.equal(organiserBody.tickets.length, 1);
+    assert.equal(organiserBody.tickets[0].event_id, fixture.eventId);
   } finally {
     await destroyFixture(fixture.eventId);
   }
