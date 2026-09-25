@@ -28,9 +28,19 @@ const TICKET_RECONCILIATION_INTERVAL_MS = Math.max(
   10_000,
   Number(process.env.TICKET_RECONCILIATION_INTERVAL_MS ?? 60_000) || 60_000,
 );
-const verifier = USER_POOL_ID && CLIENT_ID
+let verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
+
+/**
+ * Test-only seam: swaps the Cognito verifier for a fake one so tests can
+ * authenticate as a known `sub` without a real Cognito token. Never called
+ * outside test code — production always uses the verifier built above from
+ * real Cognito env vars.
+ */
+export function __setVerifierForTests(fake: typeof verifier): void {
+  verifier = fake;
+}
 const databaseName = process.env.DB_NAME ?? process.env.DB_NAME_TICKETING ?? '';
 const databaseConfigured = Boolean(process.env.DB_HOST && databaseName && process.env.DB_USER && process.env.DB_PASSWORD);
 const database = mysql.createPool({
@@ -1025,6 +1035,123 @@ app.get('/events/:eventId/checkin-stats', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------
+// GET /events/:eventId/attendees — OR-08: lets an event's organiser view
+// (and, client-side, export) their own attendee contact info and order
+// details. Orders live in the Checkout & Payment Service's schema; this
+// service already has a pool with cross-schema grants, so it joins in.
+// Organiser-only (unlike check-in stats, which helpers can also see): this
+// is customer contact and payment data.
+// -----------------------------------------------------------------------
+
+async function isEventOrganiser(eventId: number, sub: string): Promise<boolean> {
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    "SELECT membership_id FROM event_inventory.event_team_memberships " +
+      "WHERE event_id = ? AND user_sub = ? AND role = 'ORGANISER' AND invite_status = 'ACCEPTED' LIMIT 1",
+    [eventId, sub],
+  );
+  return rows.length > 0;
+}
+
+interface AttendeeRow extends mysql.RowDataPacket {
+  ticket_id: number;
+  customer_sub: string;
+  customer_email: string;
+  seat_label: string | null;
+  status: 'ISSUED' | 'CHECKED_IN' | 'VOID';
+  order_id: number;
+  order_status: 'PENDING' | 'PAID' | 'FAILED' | 'CANCELLED';
+  total_amount_cents: number;
+  currency: string;
+  paid_at: Date | null;
+}
+
+app.get('/events/:eventId/attendees', async (req, res) => {
+  if (!(await requireConfigured(res))) return;
+  const caller = await requireCaller(req, res);
+  const eventId = parseEventId(req.params.eventId);
+  if (!caller) return;
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const [rows] = await database.query<AttendeeRow[]>(
+    `SELECT
+       t.ticket_id, t.customer_sub, t.customer_email, s.seat_label, t.status,
+       o.order_id, o.status AS order_status, o.total_amount_cents, o.currency, o.paid_at
+     FROM tickets t
+     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+     JOIN checkout.orders o ON o.order_id = t.order_id
+     WHERE t.event_id = ?
+     ORDER BY t.ticket_id`,
+    [eventId],
+  );
+
+  res.json({
+    eventId,
+    attendees: rows.map((row) => ({
+      ticket_id: row.ticket_id,
+      customer_sub: row.customer_sub,
+      customer_email: row.customer_email,
+      seat_label: row.seat_label,
+      status: row.status,
+      order_id: row.order_id,
+      order_status: row.order_status,
+      total_amount_cents: row.total_amount_cents,
+      currency: row.currency,
+      paid_at: row.paid_at,
+    })),
+  });
+});
+
+// -----------------------------------------------------------------------
+// GET /events/:eventId/orders/summary — OR-07: the live numbers half of an
+// organiser's on-sale dashboard (paired with the Event & Inventory
+// Service's GET /events/{eventId} for the static event details). Pulls
+// together revenue and paid-order count from Checkout, remaining stock
+// from Event & Inventory, and waiting-room size from Queue — all in one
+// call so the frontend isn't stitching together three separate requests.
+// -----------------------------------------------------------------------
+
+interface OrdersSummaryRow extends mysql.RowDataPacket {
+  orders_paid: number;
+  revenue_cents: number;
+}
+
+app.get('/events/:eventId/orders/summary', async (req, res) => {
+  if (!(await requireConfigured(res))) return;
+  const caller = await requireCaller(req, res);
+  const eventId = parseEventId(req.params.eventId);
+  if (!caller) return;
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const [orderRows] = await database.query<OrdersSummaryRow[]>(
+    "SELECT COUNT(*) AS orders_paid, COALESCE(SUM(total_amount_cents), 0) AS revenue_cents " +
+      "FROM checkout.orders WHERE event_id = ? AND status = 'PAID'",
+    [eventId],
+  );
+  const [inventoryRows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT COALESCE(SUM(total_qty - reserved_qty - sold_qty), 0) AS remaining ' +
+      'FROM event_inventory.inventory_items WHERE event_id = ?',
+    [eventId],
+  );
+  const [queueRows] = await database.query<mysql.RowDataPacket[]>(
+    "SELECT COUNT(*) AS queue_length FROM queue.queue_entries qe " +
+      'JOIN queue.queue_sessions qs ON qs.queue_session_id = qe.queue_session_id ' +
+      "WHERE qs.event_id = ? AND qe.status = 'WAITING'",
+    [eventId],
+  );
+
+  const orderRow = orderRows[0]!;
+  res.json({
+    eventId,
+    ordersPaid: Number(orderRow.orders_paid),
+    revenueCents: Number(orderRow.revenue_cents),
+    remainingInventory: Number(inventoryRows[0]!.remaining),
+    queueLength: Number(queueRows[0]!.queue_length),
+  });
+});
+
 if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, HOST, () => {
     console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
@@ -1038,4 +1165,4 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-export { app };
+export { app, database };

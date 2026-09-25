@@ -10,22 +10,41 @@ const PORT = Number(process.env.PORT ?? 3001);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const configured = USER_POOL_ID.length > 0 && CLIENT_ID.length > 0;
-const verifier = configured
+let verifier = configured
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
-const cognito = new CognitoIdentityProviderClient({});
+let cognito: Pick<CognitoIdentityProviderClient, 'send'> = new CognitoIdentityProviderClient({});
+
+/**
+ * Test-only seams: swap the Cognito JWT verifier and the Cognito Identity
+ * Provider client for fakes so tests can authenticate as a known `sub` and
+ * control what user lookups return, without a real Cognito user pool.
+ * Never called outside test code — production always uses the real clients
+ * built above from real Cognito env vars.
+ */
+export function __setVerifierForTests(fake: typeof verifier): void {
+  verifier = fake;
+}
+export function __setCognitoForTests(fake: typeof cognito): void {
+  cognito = fake;
+}
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json());
+// Higher than the default 100kb so a base64-encoded event photo (~5MB binary
+// -> ~6.7MB base64) fits; every route still validates its own field sizes.
+app.use(express.json({ limit: '8mb' }));
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: SERVICE });
 });
 
+// docker-compose sets DB_NAME to this service's schema directly; running
+// outside docker (dev:local, tests) only has the per-schema DB_NAME_* vars
+// from the root .env, so fall back to that — same pattern as services/ticket.
 const databaseConfigured = Boolean(
   process.env.DB_HOST &&
-  process.env.DB_NAME &&
+  (process.env.DB_NAME || process.env.DB_NAME_EVENT_INVENTORY) &&
   process.env.DB_USER &&
   process.env.DB_PASSWORD,
 );
@@ -33,7 +52,7 @@ const databaseConfigured = Boolean(
 const database = mysql.createPool({
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),
-  database: process.env.DB_NAME ?? '',
+  database: process.env.DB_NAME ?? process.env.DB_NAME_EVENT_INVENTORY ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
   waitForConnections: true,
@@ -415,10 +434,17 @@ app.put('/events/:eventId', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
-    await connection.execute(
-      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
+    // Scoped to DRAFT the same way the DELETE endpoint is: a published (or
+    // cancelled) event matches zero rows instead of silently accepting the
+    // edit, so an organiser can no longer change a live event's details.
+    const [updateResult] = await connection.execute<mysql.ResultSetHeader>(
+      "UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ? AND status = 'DRAFT'",
       [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier, eventId],
     );
+    if (updateResult.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'event_not_editable' });
+    }
     const [items] = await connection.query<mysql.RowDataPacket[]>(
       "SELECT inventory_item_id, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1 FOR UPDATE",
       [eventId],
@@ -448,6 +474,59 @@ app.put('/events/:eventId', async (req, res) => {
     connection.release();
   }
   res.status(204).end();
+});
+
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+interface EventImageInput {
+  readonly imageBase64?: unknown;
+  readonly mimeType?: unknown;
+}
+
+app.put('/events/:eventId/image', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+
+  const body = req.body as EventImageInput;
+  const mimeType = typeof body.mimeType === 'string' ? body.mimeType : '';
+  const base64 = typeof body.imageBase64 === 'string' ? body.imageBase64.replace(/^data:[^;]+;base64,/, '') : '';
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(mimeType) || !base64) return res.status(400).json({ error: 'invalid_image' });
+
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch {
+    return res.status(400).json({ error: 'invalid_image' });
+  }
+  if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) return res.status(400).json({ error: 'image_too_large' });
+
+  try {
+    await database.execute('UPDATE events SET image_mime_type = ?, image_data = ? WHERE event_id = ?', [mimeType, buffer, eventId]);
+    res.status(204).end();
+  } catch (error) {
+    console.error('failed to save event image', error);
+    res.status(502).json({ error: 'image_save_failed' });
+  }
+});
+
+app.get('/events/:eventId/image', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT image_mime_type, image_data FROM events WHERE event_id = ? LIMIT 1',
+    [eventId],
+  );
+  const row = rows[0];
+  if (!row?.image_data || !row?.image_mime_type) return res.status(404).json({ error: 'image_not_set' });
+  res.set('Content-Type', row.image_mime_type as string);
+  res.set('Cache-Control', 'private, max-age=300');
+  res.send(row.image_data as Buffer);
 });
 
 app.post('/events/:eventId/publish', async (req, res) => {
@@ -513,15 +592,33 @@ app.get('/events/:eventId/users', async (req, res) => {
   }
 });
 
+/** Looks up a member's display name from Cognito by their `sub` (stored as
+ * `user_sub`, which is also their Cognito Username for this user pool).
+ * Falls back to an empty name — never fails the whole roster over one bad
+ * lookup (e.g. a deleted Cognito user still on the roster). */
+async function lookUpMemberName(userSub: string): Promise<string> {
+  if (!configured) return '';
+  try {
+    const user = await cognito.send(new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: userSub }));
+    return attribute(user.UserAttributes, 'name');
+  } catch (error) {
+    console.error(`failed to look up Cognito name for ${userSub}`, error);
+    return '';
+  }
+}
+
 app.get('/events/:eventId/team-members', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!(await requireEventOrganiser(req, res, eventId))) return;
-  const [members] = await database.query(
+  const [members] = await database.query<mysql.RowDataPacket[]>(
     "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? ORDER BY role, user_email",
     [eventId],
   );
-  res.json({ members });
+  const withNames = await Promise.all(
+    members.map(async (member) => ({ ...member, name: await lookUpMemberName(String(member.user_sub)) })),
+  );
+  res.json({ members: withNames });
 });
 
 app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
@@ -545,6 +642,30 @@ app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
   if (member.role === 'ORGANISER' && event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
   if (member.role === 'HELPER' && !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
   await database.execute('DELETE FROM event_team_memberships WHERE event_id = ? AND user_sub = ?', [eventId, memberSub]);
+  res.status(204).end();
+});
+
+app.patch('/events/:eventId/team-members/:userSub', async (req, res) => {
+  const eventId = validEventId(req.params.eventId);
+  const caller = await requireAuthenticated(req, res);
+  const memberSub = req.params.userSub;
+  const body = req.body as { role?: unknown };
+  const role = body.role === 'ORGANISER' || body.role === 'HELPER' ? body.role : '';
+  if (!caller) return;
+  if (!eventId || !memberSub || !role || memberSub === caller.sub) return res.status(400).json({ error: 'invalid_role_change' });
+  const [events] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT organiser_sub FROM events WHERE event_id = ? LIMIT 1',
+    [eventId],
+  );
+  if (events.length === 0) return res.status(404).json({ error: 'event_not_found' });
+  const event = events[0]!;
+  if (event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
+  if (memberSub === event.organiser_sub) return res.status(400).json({ error: 'cannot_change_owner_role' });
+  const [result] = await database.execute<mysql.ResultSetHeader>(
+    'UPDATE event_team_memberships SET role = ? WHERE event_id = ? AND user_sub = ?',
+    [role, eventId, memberSub],
+  );
+  if (result.affectedRows === 0) return res.status(404).json({ error: 'team_member_not_found' });
   res.status(204).end();
 });
 
@@ -611,10 +732,12 @@ app.get('/team-invitations', async (req, res) => {
   res.json({ invitations });
 });
 
+// Guarded so importing this module from tests (NODE_ENV=test) doesn't also
+// bind the real port — tests start their own ephemeral listener via `app`.
 if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, HOST, () => {
     console.log(`${SERVICE}-service -> http://${HOST}:${PORT}`);
   });
 }
 
-export { app, parseEventInput, parsePriceCents, validEventId };
+export { app, database, parseEventInput, parsePriceCents, validEventId };

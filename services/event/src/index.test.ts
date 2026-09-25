@@ -381,6 +381,19 @@ describe('organiser endpoints', () => {
       assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
       mock.restoreAll();
     });
+
+    it('will not edit an event that is no longer a draft (e.g. already published)', async () => {
+      isOrganiser();
+      // The UPDATE is scoped to `AND status = 'DRAFT'`, so a published event
+      // matches zero rows instead of silently going through.
+      on(/UPDATE events SET title/, { affectedRows: 0 });
+
+      const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
+
+      assert.deepEqual(response, { status: 409, body: { error: 'event_not_editable' } });
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+      assert.equal(sqlMatching(/SELECT inventory_item_id, reserved_qty, sold_qty/).length, 0);
+    });
   });
 
   describe('POST /events/:eventId/publish', () => {
@@ -464,9 +477,12 @@ describe('organiser endpoints', () => {
       const members = [{ membership_id: 1, user_sub: 'bob', role: 'HELPER' }];
       isOrganiser();
       on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, members);
+      // The route enriches each row with a `name` looked up from Cognito
+      // (mocked to `{}` above, so `AdminGetUserCommand` resolves with no
+      // UserAttributes and the looked-up name falls back to '').
       assert.deepEqual(await request('GET', '/events/5/team-members', { token: 'alice' }), {
         status: 200,
-        body: { members },
+        body: { members: members.map((member) => ({ ...member, name: '' })) },
       });
 
       assert.equal((await request('GET', '/events/zero/team-members', { token: 'alice' })).status, 400);

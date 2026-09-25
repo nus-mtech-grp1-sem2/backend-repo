@@ -31,15 +31,36 @@ Safe to re-run — `GRANT` is idempotent.
 
 ## Existing database upgrades
 
-Run these once, in order, only when upgrading a schema created before the fields existed:
+Run these once, in numeric order, only when upgrading a schema created before the fields existed. Each filename's number reflects when it was written, so this is also the safe apply order:
 
 ```powershell
 Get-Content ..\..\database\03-add-event-team-invitations.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\04-add-event-total-seats.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\06-add-notification-schema.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_NOTIFICATION
+Get-Content ..\..\database\05-grant-onestage-app-schema-access.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u root -p
+Get-Content ..\..\database\07-add-queue-order-idempotency.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_QUEUE
+Get-Content ..\..\database\08-ticket-checkin-attempts.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_TICKETING
+Get-Content ..\..\database\09-add-customer-name.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_CHECKOUT
+Get-Content ..\..\database\10-add-event-available-buyers.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\11-add-inventory-layout.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\12-add-event-image-and-seat-tags.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\13-add-inventory-grid-position.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\14-add-grid-customization.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\15-email-notifications-per-ticket.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_NOTIFICATION
 ```
 
 - `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
 - `04-add-event-total-seats.sql` adds the event capacity column with a default of `1` for existing events.
+- `06-add-notification-schema.sql` creates the `notification` database and `email_notifications` table. Re-run `05-grant-onestage-app-schema-access.sql` afterward so `onestage_app` can reach it.
+- `07-add-queue-order-idempotency.sql` adds unique event-session and hold-order keys so queue configuration and order creation are idempotent.
+- `08-ticket-checkin-attempts.sql` adds check-in audit logging support.
+- `09-add-customer-name.sql` preserves the attendee display name for helper lookup and organiser rosters.
+- `10-add-event-available-buyers.sql` adds the nullable concurrent-buyer limit and its capacity check.
+- `11-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, used by the organiser inventory/seat-map configuration UI.
+- `12-add-event-image-and-seat-tags.sql` adds the event photo, per-zone colour, and seat tag columns (rollback: `12-add-event-image-and-seat-tags.rollback.sql`).
+- `13-add-inventory-grid-position.sql` adds a virtual row/column position per zone/section for the drag-and-drop venue map.
+- `14-add-grid-customization.sql` adds a per-event custom grid size and multi-cell zone/section spans.
+- `15-email-notifications-per-ticket.sql` moves `email_notifications` from one row per order to one row per ticket.
 
 Do not rerun an upgrade after it has been applied: MySQL will reject a duplicate column or index.
 
