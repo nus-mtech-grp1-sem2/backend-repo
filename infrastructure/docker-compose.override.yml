@@ -15,6 +15,11 @@ services:
       - ../database/09-add-customer-name.sql:/docker-entrypoint-initdb.d/07-add-customer-name.sql:ro
       - ../database/15-email-notifications-per-ticket.sql:/docker-entrypoint-initdb.d/08-email-notifications-per-ticket.sql:ro
       - ../database/06-add-notification-schema.sql:/docker-entrypoint-initdb.d/05-add-notification-schema.sql:ro
+      # Later migrations. Targets sort after the ones above, which is the order init scripts run in.
+      - ../database/11-add-inventory-layout.sql:/docker-entrypoint-initdb.d/09-add-inventory-layout.sql:ro
+      - ../database/12-add-event-image-and-seat-tags.sql:/docker-entrypoint-initdb.d/10-add-event-image-and-seat-tags.sql:ro
+      - ../database/13-add-inventory-grid-position.sql:/docker-entrypoint-initdb.d/11-add-inventory-grid-position.sql:ro
+      - ../database/14-add-grid-customization.sql:/docker-entrypoint-initdb.d/12-add-grid-customization.sql:ro
     networks:
       - backend
     healthcheck:
