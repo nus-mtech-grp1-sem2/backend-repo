@@ -381,6 +381,19 @@ describe('organiser endpoints', () => {
       assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
       mock.restoreAll();
     });
+
+    it('will not edit an event that is no longer a draft (e.g. already published)', async () => {
+      isOrganiser();
+      // The UPDATE is scoped to `AND status = 'DRAFT'`, so a published event
+      // matches zero rows instead of silently going through.
+      on(/UPDATE events SET title/, { affectedRows: 0 });
+
+      const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
+
+      assert.deepEqual(response, { status: 409, body: { error: 'event_not_editable' } });
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+      assert.equal(sqlMatching(/SELECT inventory_item_id, reserved_qty, sold_qty/).length, 0);
+    });
   });
 
   describe('POST /events/:eventId/publish', () => {

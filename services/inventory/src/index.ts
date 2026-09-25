@@ -479,6 +479,9 @@ app.put('/events/:eventId/inventory', async (req, res) => {
   if (!event) return res.status(404).json({ error: 'event_not_found' });
   if (!(await requireEventOrganiser(req, res, eventId))) return;
   if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_cancelled' });
+  // Zones/seats are configured before publishing; once live, the layout is
+  // locked the same way the event service locks the event's own details.
+  if (event.status === 'PUBLISHED') return res.status(409).json({ error: 'event_already_published' });
 
   const gridDims = parseGridDims(req.body as { gridRows?: unknown; gridCols?: unknown }, await fetchGridSettings(eventId));
   if (!gridDims) return res.status(400).json({ error: 'invalid_inventory_payload' });

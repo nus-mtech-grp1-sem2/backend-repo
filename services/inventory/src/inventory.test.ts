@@ -148,6 +148,33 @@ test('overlapping zone rectangles are rejected — each cell belongs to at most 
   }
 });
 
+test('a published event\'s inventory is locked — no zone changes are accepted', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED', 'PUBLISHED');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'Front Stalls', price: 75, color: '#FF0000', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 409);
+    const body = await putRes.json();
+    assert.equal(body.error, 'event_already_published');
+
+    // Nothing was written.
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const getBody = await getRes.json();
+    assert.equal(getBody.zones.length, 0);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('a zone with a sold seat has its rectangle frozen, but name/price/colour and other zones stay editable', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {

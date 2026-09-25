@@ -434,10 +434,17 @@ app.put('/events/:eventId', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
-    await connection.execute(
-      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
+    // Scoped to DRAFT the same way the DELETE endpoint is: a published (or
+    // cancelled) event matches zero rows instead of silently accepting the
+    // edit, so an organiser can no longer change a live event's details.
+    const [updateResult] = await connection.execute<mysql.ResultSetHeader>(
+      "UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ? AND status = 'DRAFT'",
       [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier, eventId],
     );
+    if (updateResult.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'event_not_editable' });
+    }
     const [items] = await connection.query<mysql.RowDataPacket[]>(
       "SELECT inventory_item_id, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1 FOR UPDATE",
       [eventId],

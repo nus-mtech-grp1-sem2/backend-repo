@@ -103,14 +103,20 @@ export interface EventFixture {
 /** A bare event with an ACCEPTED ORGANISER membership, for tests exercising
  * `requireEventOrganiser`-gated endpoints (it checks `event_team_memberships`,
  * not `events.organiser_sub`). Defaults to TIER1_GA; pass 'TIER2_SEATED' for
- * tests that need the seated-zone branch. */
-export async function createEventFixture(tier: 'TIER1_GA' | 'TIER2_SEATED' = 'TIER1_GA'): Promise<EventFixture> {
+ * tests that need the seated-zone branch. Defaults to DRAFT status — the
+ * real organiser flow configures zones/seats before publishing, and a
+ * PUBLISHED event's inventory is locked (see `putZoneInventory`'s status
+ * check) — pass 'PUBLISHED' explicitly for tests exercising that lock. */
+export async function createEventFixture(
+  tier: 'TIER1_GA' | 'TIER2_SEATED' = 'TIER1_GA',
+  status: 'DRAFT' | 'PUBLISHED' | 'CANCELLED' = 'DRAFT',
+): Promise<EventFixture> {
   const suffix = uniqueSuffix();
   const organiserSub = `tdd-organiser-${suffix}`;
   const [eventResult] = await testPool.execute<mysql.ResultSetHeader>(
     "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
-      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), ?, 'PUBLISHED')",
-    [organiserSub, `TDD-TEST-EVENT-${suffix}`, tier],
+      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), ?, ?)",
+    [organiserSub, `TDD-TEST-EVENT-${suffix}`, tier, status],
   );
   const eventId = eventResult.insertId;
   await testPool.execute(
