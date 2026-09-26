@@ -64,8 +64,20 @@ describe('paid order event validation', () => {
       eventId: 12,
       customerSub: 'customer-123',
       customerEmail: 'customer@example.com',
+      customerName: '',
       items: [{ orderItemId: 91, seatId: 31, quantity: 1 }],
     });
+  });
+
+  it('carries the buyer name, cleaned, and treats a missing or malformed one as blank', () => {
+    const base = {
+      type: 'OrderPaid', version: 1, orderId: 81, eventId: 12, customerSub: 'customer-123',
+      customerEmail: 'customer@example.com', items: [{ order_item_id: 91, seat_id: null, quantity: 1 }],
+    };
+    assert.equal(parseOrderPaid({ ...base, customerName: ' Ada\u0000  Lovelace ' })?.customerName, 'Ada Lovelace');
+    assert.equal(parseOrderPaid({ ...base, customerName: 'x'.repeat(300) })?.customerName.length, 255);
+    assert.equal(parseOrderPaid({ ...base, customerName: 42 })?.customerName, '');
+    assert.equal(parseOrderPaid(base)?.customerName, '');
   });
 
   it('rejects an invalid or repeated seated ticket quantity', () => {
@@ -92,6 +104,13 @@ describe('EH-05 manual lookup query validation', () => {
     assert.equal(parseSearchQuery({ q: 'pr' }), null);
     assert.equal(parseSearchQuery({ q: 'priya' }), 'priya');
     assert.equal(parseSearchQuery({ q: 'priya', eventId: '2' }), null);
+  });
+
+  it('accepts a short all-digit query as an order ID', () => {
+    assert.equal(parseSearchQuery({ q: '7' }), '7');
+    assert.equal(parseSearchQuery({ q: ' 82 ' }), '82');
+    assert.equal(parseSearchQuery({ q: '8a' }), null);
+    assert.equal(parseSearchQuery({ q: '' }), null);
   });
 });
 

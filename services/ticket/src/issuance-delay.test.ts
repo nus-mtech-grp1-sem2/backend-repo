@@ -15,7 +15,7 @@ describe('ticket issuance delay', () => {
   beforeEach(() => db.reset());
   const event = {
     type: 'OrderPaid' as const, version: 1 as const, orderId: 42, eventId: 5,
-    customerSub: 'alice', customerEmail: 'alice@example.com',
+    customerSub: 'alice', customerEmail: 'alice@example.com', customerName: 'Alice Tan',
     items: [{ orderItemId: 7, seatId: null, quantity: 2 }],
   };
 
@@ -23,7 +23,7 @@ describe('ticket issuance delay', () => {
     db.on(/AS paid_age_ms/, [{ status, paid_age_ms: age }]);
     db.on(/GET_LOCK/, [{ acquired: 1 }]);
     db.on(/RELEASE_LOCK/, []);
-    db.on(/FROM checkout.orders WHERE order_id = \? FOR UPDATE/, [{ order_id: 42, status, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com' }]);
+    db.on(/FROM checkout.orders WHERE order_id = \? FOR UPDATE/, [{ order_id: 42, status, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com', customer_name: 'Alice Tan' }]);
     db.on(/FROM checkout.order_items/, [{ order_item_id: 7, quantity: 2, seat_id: null }]);
     db.on(/SELECT order_item_id FROM tickets/, Array.from({ length: existing }, () => ({ order_item_id: 7 })));
     db.on(/SELECT COUNT\(\*\) AS count/, [{ count: existing }]);
@@ -42,7 +42,12 @@ describe('ticket issuance delay', () => {
     it(`${path} issues both tickets once the delay has elapsed`, async () => {
       script(10_000);
       await issue();
-      assert.equal(db.calls.filter((call) => /INSERT INTO/.test(call.sql)).length, 2);
+      const inserts = db.calls.filter((call) => /INSERT INTO/.test(call.sql));
+      assert.equal(inserts.length, 2);
+      for (const insert of inserts) {
+        assert.match(insert.sql, /customer_email, customer_name,/);
+        assert.equal(insert.params[5], 'Alice Tan', 'the buyer name is stored on every ticket');
+      }
       assert.ok(db.calls.some((call) => call.sql === 'COMMIT'));
     });
 
