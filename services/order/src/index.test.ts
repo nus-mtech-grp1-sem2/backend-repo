@@ -3,6 +3,7 @@ import { after, describe, it } from 'node:test';
 
 import {
   app,
+  cleanCustomerName,
   parseCreateOrder,
   positiveInteger,
   requestQueueRefill,
@@ -14,7 +15,7 @@ describe('order input validation', () => {
   it('accepts the documented hold contract', () => {
     assert.deepEqual(parseCreateOrder({ holdId: 41, customerEmail: 'Buyer@example.com' }), {
       holdId: 41, eventId: null, inventoryItemId: null, quantity: null, seatIds: [],
-      admissionToken: null, customerEmail: 'buyer@example.com',
+      admissionToken: null, customerEmail: 'buyer@example.com', customerName: '',
     });
   });
 
@@ -24,8 +25,24 @@ describe('order input validation', () => {
       customerEmail: 'buyer@example.com',
     }), {
       holdId: null, eventId: 7, inventoryItemId: null, quantity: 2, seatIds: [10, 11],
-      admissionToken: 'opaque-admission-token', customerEmail: 'buyer@example.com',
+      admissionToken: 'opaque-admission-token', customerEmail: 'buyer@example.com', customerName: '',
     });
+  });
+
+  it('accepts an optional buyer name, cleaned for display and door lookup', () => {
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: '  Ada \t  Lovelace\n ' })?.customerName, 'Ada Lovelace');
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: '' })?.customerName, '');
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: '   ' })?.customerName, '');
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: null })?.customerName, '');
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: 42 }), null);
+    assert.equal(parseCreateOrder({ holdId: 41, customerName: ['Ada'] }), null);
+  });
+
+  it('strips control characters and caps the name at the 255-character column', () => {
+    assert.equal(cleanCustomerName('Ada\u0000\u0007Lovelace\u001b[31m'), 'Ada Lovelace [31m');
+    assert.equal(cleanCustomerName('x'.repeat(300)).length, 255);
+    assert.equal(Array.from(cleanCustomerName('李'.repeat(300))).length, 255);
+    assert.equal(cleanCustomerName('😀'.repeat(256)), '😀'.repeat(255), 'never splits a surrogate pair');
   });
 
   it('rejects duplicates, mismatched quantities, and malformed identifiers', () => {
