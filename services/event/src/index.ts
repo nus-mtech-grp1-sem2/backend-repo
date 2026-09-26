@@ -327,6 +327,9 @@ app.post('/events', async (req, res) => {
   if (!caller) return;
   if (!input) return res.status(400).json({ error: 'invalid_event' });
 
+  // The access token carries no email, so the owner's comes from Cognito;
+  // if that lookup fails the roster fills it in when it is read.
+  const { email: ownerEmail } = await lookUpCognitoProfile(caller.sub);
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
@@ -338,8 +341,8 @@ app.post('/events', async (req, res) => {
       [caller.sub, input.title, input.description, input.venue, input.startsAt, input.tier],
     );
     await connection.execute(
-      "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",
-      [result.insertId, caller.sub, caller.sub],
+      "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, ?, 'ORGANISER', 'ACCEPTED', ?)",
+      [result.insertId, caller.sub, ownerEmail, caller.sub],
     );
     await connection.commit();
     res.status(201).json({ eventId: result.insertId });
@@ -545,18 +548,18 @@ app.get('/events/:eventId/users', async (req, res) => {
   }
 });
 
-/** Looks up a member's display name from Cognito by their `sub` (stored as
- * `user_sub`, which is also their Cognito Username for this user pool).
- * Falls back to an empty name — never fails the whole roster over one bad
- * lookup (e.g. a deleted Cognito user still on the roster). */
-async function lookUpMemberName(userSub: string): Promise<string> {
-  if (!configured) return '';
+/** Looks up a user's display name and email from Cognito by their `sub`
+ * (stored as `user_sub`, which is also their Cognito Username for this user
+ * pool). Falls back to empty strings — never fails the whole roster over one
+ * bad lookup (e.g. a deleted Cognito user still on the roster). */
+async function lookUpCognitoProfile(userSub: string): Promise<{ name: string; email: string }> {
+  if (!configured) return { name: '', email: '' };
   try {
     const user = await cognito.send(new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: userSub }));
-    return attribute(user.UserAttributes, 'name');
+    return { name: attribute(user.UserAttributes, 'name'), email: attribute(user.UserAttributes, 'email') };
   } catch (error) {
-    console.error(`failed to look up Cognito name for ${userSub}`, error);
-    return '';
+    console.error(`failed to look up Cognito profile for ${userSub}`, error);
+    return { name: '', email: '' };
   }
 }
 
@@ -568,8 +571,13 @@ app.get('/events/:eventId/team-members', async (req, res) => {
     "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? ORDER BY role, user_email",
     [eventId],
   );
+  // Owners of events created before the email was stored have user_email
+  // '', so fall back to the email Cognito has for them.
   const withNames = await Promise.all(
-    members.map(async (member) => ({ ...member, name: await lookUpMemberName(String(member.user_sub)) })),
+    members.map(async (member) => {
+      const profile = await lookUpCognitoProfile(String(member.user_sub));
+      return { ...member, user_email: member.user_email || profile.email, name: profile.name };
+    }),
   );
   res.json({ members: withNames });
 });

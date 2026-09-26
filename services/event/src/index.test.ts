@@ -264,9 +264,41 @@ describe('organiser endpoints', () => {
         assert.equal(sqlMatching(/inventory_items|INSERT INTO seats/).length, 0, 'zones and seats come from Configure inventory');
         const membership = sqlMatching(/INSERT INTO event_team_memberships/)[0];
         assert.match(membership?.sql ?? '', /'ORGANISER', 'ACCEPTED'/);
-        assert.deepEqual(membership?.params, [100, 'alice', 'alice']);
+        assert.deepEqual(membership?.params, [100, 'alice', '', 'alice']);
       });
     }
+
+    it("stores the owner's email from Cognito on their membership", async () => {
+      cognitoSend.mock.mockImplementation(async () => ({
+        UserAttributes: [{ Name: 'email', Value: 'alice@example.com' }],
+      }));
+      on(/INSERT INTO events /, { insertId: 100 });
+      on(/INSERT INTO event_team_memberships/, {});
+
+      const response = await request('POST', '/events', { token: 'alice', body: newEvent });
+
+      assert.equal(response.status, 201);
+      const command = cognitoSend.mock.calls[0]?.arguments[0] as AdminGetUserCommand;
+      assert.ok(command instanceof AdminGetUserCommand);
+      assert.equal(command.input['Username'], 'alice');
+      const membership = sqlMatching(/INSERT INTO event_team_memberships/)[0];
+      assert.deepEqual(membership?.params, [100, 'alice', 'alice@example.com', 'alice']);
+    });
+
+    it('still creates the event when the Cognito lookup fails', async () => {
+      mock.method(console, 'error', () => undefined);
+      cognitoSend.mock.mockImplementation(async () => {
+        throw new Error('throttled');
+      });
+      on(/INSERT INTO events /, { insertId: 100 });
+      on(/INSERT INTO event_team_memberships/, {});
+
+      const response = await request('POST', '/events', { token: 'alice', body: newEvent });
+
+      assert.deepEqual(response, { status: 201, body: { eventId: 100 } });
+      assert.deepEqual(sqlMatching(/INSERT INTO event_team_memberships/)[0]?.params, [100, 'alice', '', 'alice']);
+      mock.restoreAll();
+    });
 
     it('rolls the whole creation back and reports 502 when a step fails', async () => {
       mock.method(console, 'error', () => undefined);
@@ -485,8 +517,35 @@ describe('organiser endpoints', () => {
   });
 
   describe('team members', () => {
+    it("fills in an owner's missing email from Cognito, keeping stored emails", async () => {
+      isOrganiser();
+      on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, [
+        { membership_id: 1, user_sub: 'alice', user_email: '', role: 'ORGANISER' },
+        { membership_id: 2, user_sub: 'bob', user_email: 'bob@example.com', role: 'HELPER' },
+      ]);
+      cognitoSend.mock.mockImplementation(async (command) => {
+        const username = (command as AdminGetUserCommand).input['Username'];
+        return {
+          UserAttributes: [
+            { Name: 'name', Value: username === 'alice' ? 'Alice Owner' : 'Bob Helper' },
+            { Name: 'email', Value: `${String(username)}@cognito.example` },
+          ],
+        };
+      });
+
+      const response = await request('GET', '/events/5/team-members', { token: 'alice' });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body, {
+        members: [
+          { membership_id: 1, user_sub: 'alice', user_email: 'alice@cognito.example', role: 'ORGANISER', name: 'Alice Owner' },
+          { membership_id: 2, user_sub: 'bob', user_email: 'bob@example.com', role: 'HELPER', name: 'Bob Helper' },
+        ],
+      });
+    });
+
     it('lists the team to an organiser and rejects a bad event id or a non-organiser', async () => {
-      const members = [{ membership_id: 1, user_sub: 'bob', role: 'HELPER' }];
+      const members = [{ membership_id: 1, user_sub: 'bob', user_email: 'bob@example.com', role: 'HELPER' }];
       isOrganiser();
       on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, members);
       // The route enriches each row with a `name` looked up from Cognito
