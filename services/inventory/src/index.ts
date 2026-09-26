@@ -79,6 +79,7 @@ interface EventRow {
   readonly event_id: number;
   readonly status: 'DRAFT' | 'PUBLISHED' | 'CANCELLED';
   readonly tier: EventTier;
+  readonly has_started: number;
 }
 
 interface ZoneInput {
@@ -219,7 +220,7 @@ function parsePriceCents(price: unknown): number | null {
 
 async function fetchEvent(eventId: number): Promise<EventRow | null> {
   const [rows] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT event_id, status, tier FROM events WHERE event_id = ? LIMIT 1',
+    'SELECT event_id, status, tier, starts_at < UTC_TIMESTAMP() AS has_started FROM events WHERE event_id = ? LIMIT 1',
     [eventId],
   );
   return rows.length > 0 ? (rows[0] as unknown as EventRow) : null;
@@ -479,9 +480,12 @@ app.put('/events/:eventId/inventory', async (req, res) => {
   if (!event) return res.status(404).json({ error: 'event_not_found' });
   if (!(await requireEventOrganiser(req, res, eventId))) return;
   if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_cancelled' });
-  // Zones/seats are configured before publishing; once live, the layout is
-  // locked the same way the event service locks the event's own details.
-  if (event.status === 'PUBLISHED') return res.status(409).json({ error: 'event_already_published' });
+  // A live event may still add or remove capacity and change prices; the
+  // checks in putZoneInventory keep every sold or held ticket intact. Once the
+  // event has started, the layout is final.
+  if (event.status === 'PUBLISHED' && Number(event.has_started) === 1) {
+    return res.status(409).json({ error: 'event_completed' });
+  }
 
   const gridDims = parseGridDims(req.body as { gridRows?: unknown; gridCols?: unknown }, await fetchGridSettings(eventId));
   if (!gridDims) return res.status(400).json({ error: 'invalid_inventory_payload' });
@@ -560,6 +564,25 @@ function checkCommittedZonesUnchanged(
       payloadZone.gridColSpan !== existing.grid_col_span
     ) {
       return { ok: false, status: 409, error: 'cannot_modify_committed_seat' };
+    }
+  }
+  return { ok: true };
+}
+
+/** TIER1_GA only: a zone's capacity is its rectangle's area, and it cannot
+ * shrink below the tickets already sold or currently held in it. */
+function checkGaZonesCoverAllocated(
+  tier: EventTier,
+  zones: readonly ParsedZone[],
+  existingZoneById: ReadonlyMap<number, mysql.RowDataPacket>,
+): ZoneInventoryCheck {
+  if (tier !== 'TIER1_GA') return { ok: true };
+  for (const zone of zones) {
+    if (zone.inventoryItemId === null) continue;
+    const existing = existingZoneById.get(zone.inventoryItemId)!;
+    const allocated = Number(existing.reserved_qty) + Number(existing.sold_qty);
+    if (zone.gridRowSpan * zone.gridColSpan < allocated) {
+      return { ok: false, status: 409, error: 'zone_below_allocated' };
     }
   }
   return { ok: true };
@@ -673,7 +696,7 @@ async function putZoneInventory(
     await connection.beginTransaction();
 
     const [existingZoneRows] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT inventory_item_id, grid_row, grid_col, grid_row_span, grid_col_span FROM inventory_items WHERE event_id = ? FOR UPDATE',
+      'SELECT inventory_item_id, grid_row, grid_col, grid_row_span, grid_col_span, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? FOR UPDATE',
       [eventId],
     );
     const existingZoneById = new Map(existingZoneRows.map((row) => [row.inventory_item_id as number, row]));
@@ -696,6 +719,13 @@ async function putZoneInventory(
     if (!committedCheck.ok) {
       await connection.rollback();
       res.status(committedCheck.status).json({ error: committedCheck.error });
+      return;
+    }
+
+    const allocatedCheck = checkGaZonesCoverAllocated(tier, zones, existingZoneById);
+    if (!allocatedCheck.ok) {
+      await connection.rollback();
+      res.status(allocatedCheck.status).json({ error: allocatedCheck.error });
       return;
     }
 

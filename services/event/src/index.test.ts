@@ -77,7 +77,6 @@ describe('parseEventInput', () => {
       description: 'A night',
       venue: 'NUS ISS',
       startsAt: '2027-09-17T00:23',
-      totalSeats: 100,
       availableBuyers: 10,
       tier: 'TIER1_GA',
       priceCents: 2500,
@@ -102,15 +101,17 @@ describe('parseEventInput', () => {
     assert.equal(parseEventInput({ ...valid, startsAt: 'someday' }), null);
   });
 
-  it('requires total seats to be a whole number from 1 to 1,000,000', () => {
-    for (const totalSeats of [0, 1.5, -2, 1_000_001, '10']) {
-      assert.equal(parseEventInput({ ...valid, totalSeats }), null, String(totalSeats));
+  it('ignores total seats, which only Configure inventory sets', () => {
+    for (const totalSeats of [undefined, 0, -2, 'lots']) {
+      assert.deepEqual(parseEventInput({ ...valid, totalSeats }), parseEventInput(valid), String(totalSeats));
     }
+    assert.equal('totalSeats' in parseEventInput(valid)!, false);
   });
 
-  it('keeps available buyers between 1 and the total seats', () => {
+  it('keeps available buyers a whole number from 1 to 1,000,000', () => {
     assert.equal(parseEventInput({ ...valid, availableBuyers: 0 }), null);
-    assert.equal(parseEventInput({ ...valid, availableBuyers: 101 }), null);
+    assert.equal(parseEventInput({ ...valid, availableBuyers: 1.5 }), null);
+    assert.equal(parseEventInput({ ...valid, availableBuyers: 1_000_001 }), null);
     assert.equal(parseEventInput({ ...valid, availableBuyers: 100 })?.availableBuyers, 100);
   });
 
@@ -248,58 +249,29 @@ describe('organiser endpoints', () => {
       assert.equal(calls.length, 0, 'nothing may be written for a rejected event');
     });
 
-    it('creates the event, its General Admission stock and the creator as accepted organiser', async () => {
-      on(/INSERT INTO events /, { insertId: 100 });
-      on(/INSERT INTO inventory_items/, { insertId: 200 });
-      on(/INSERT INTO event_team_memberships/, {});
+    for (const tier of ['TIER1_GA', 'TIER2_SEATED']) {
+      it(`creates a ${tier} event with no seats and no zones, and the creator as accepted organiser`, async () => {
+        on(/INSERT INTO events /, { insertId: 100 });
+        on(/INSERT INTO event_team_memberships/, {});
 
-      const response = await request('POST', '/events', { token: 'alice', body: newEvent });
+        const response = await request('POST', '/events', { token: 'alice', body: { ...newEvent, tier, totalSeats: 50 } });
 
-      assert.deepEqual(response, { status: 201, body: { eventId: 100 } });
-      assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
-      assert.deepEqual(sqlMatching(/INSERT INTO events /)[0]?.params, [
-        'alice',
-        'Event NUS',
-        'A night',
-        'NUS ISS',
-        '2027-09-17T00:23',
-        3,
-        2,
-        'TIER1_GA',
-      ]);
-      assert.deepEqual(sqlMatching(/INSERT INTO inventory_items/)[0]?.params, [100, 'General Admission', 3, 2500]);
-      const membership = sqlMatching(/INSERT INTO event_team_memberships/)[0];
-      assert.match(membership?.sql ?? '', /'ORGANISER', 'ACCEPTED'/);
-      assert.deepEqual(membership?.params, [100, 'alice', 'alice']);
-      assert.equal(sqlMatching(/INSERT INTO seats/).length, 0, 'general admission has no seat map');
-    });
-
-    it('provisions one numbered seat per ticket for a reserved-seating event', async () => {
-      on(/INSERT INTO events /, { insertId: 100 });
-      on(/INSERT INTO inventory_items/, { insertId: 200 });
-      on(/INSERT INTO seats/, {});
-      on(/INSERT INTO event_team_memberships/, {});
-
-      const response = await request('POST', '/events', {
-        token: 'alice',
-        body: { ...newEvent, tier: 'TIER2_SEATED' },
+        assert.deepEqual(response, { status: 201, body: { eventId: 100 } });
+        assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
+        const [insert] = sqlMatching(/INSERT INTO events /);
+        assert.match(insert!.sql, /VALUES \(\?, \?, \?, \?, \?, 0, NULL, \?\)/, 'no seats and no buyer limit until inventory exists');
+        assert.deepEqual(insert!.params, ['alice', 'Event NUS', 'A night', 'NUS ISS', '2027-09-17T00:23', tier]);
+        assert.equal(sqlMatching(/inventory_items|INSERT INTO seats/).length, 0, 'zones and seats come from Configure inventory');
+        const membership = sqlMatching(/INSERT INTO event_team_memberships/)[0];
+        assert.match(membership?.sql ?? '', /'ORGANISER', 'ACCEPTED'/);
+        assert.deepEqual(membership?.params, [100, 'alice', 'alice']);
       });
-
-      assert.equal(response.status, 201);
-      assert.deepEqual(
-        sqlMatching(/INSERT INTO seats/).map((call) => call.params),
-        [
-          [100, 200, 'S001'],
-          [100, 200, 'S002'],
-          [100, 200, 'S003'],
-        ],
-      );
-    });
+    }
 
     it('rolls the whole creation back and reports 502 when a step fails', async () => {
       mock.method(console, 'error', () => undefined);
       on(/INSERT INTO events /, { insertId: 100 });
-      on(/INSERT INTO inventory_items/, new Error('disk full'));
+      on(/INSERT INTO event_team_memberships/, new Error('disk full'));
 
       const response = await request('POST', '/events', { token: 'alice', body: newEvent });
 
@@ -312,7 +284,7 @@ describe('organiser endpoints', () => {
   describe('PUT /events/:eventId', () => {
     it('rejects a malformed event id or body before checking ownership', async () => {
       const badId = await request('PUT', '/events/abc', { token: 'alice', body: newEvent });
-      const badBody = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, totalSeats: 0 } });
+      const badBody = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, title: ' ' } });
       assert.equal(badId.status, 400);
       assert.equal(badBody.status, 400);
       assert.equal(calls.length, 0);
@@ -331,48 +303,52 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/UPDATE events/).length, 0);
     });
 
-    it('updates the event and its stock, leaving the price alone when none is given', async () => {
-      isOrganiser();
-      on(/UPDATE events SET title/, {});
-      on(/SELECT inventory_item_id, reserved_qty, sold_qty/, [{ inventory_item_id: 9, reserved_qty: 1, sold_qty: 1 }]);
-      on(/UPDATE inventory_items SET total_qty/, {});
-      const { price: _price, ...withoutPrice } = newEvent;
+    const stored = (status: string, totalSeats = 10) =>
+      on(/SELECT status, total_seats FROM events/, [{ status, total_seats: totalSeats }]);
 
-      const response = await request('PUT', '/events/5', { token: 'alice', body: withoutPrice });
+    it("updates a draft's details but never its capacity, zones or price, which the inventory owns", async () => {
+      isOrganiser();
+      stored('DRAFT');
+      on(/UPDATE events SET title/, {});
+
+      const response = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, totalSeats: 999 } });
 
       assert.equal(response.status, 204);
       assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
-      assert.deepEqual(sqlMatching(/UPDATE events SET title/)[0]?.params.slice(-1), [5]);
-      assert.deepEqual(sqlMatching(/UPDATE inventory_items SET total_qty/)[0]?.params, [3, null, 9]);
+      const [update] = sqlMatching(/UPDATE events SET title/);
+      assert.doesNotMatch(update!.sql, /total_seats/);
+      assert.deepEqual(update!.params, ['Event NUS', 'A night', 'NUS ISS', '2027-09-17T00:23', 2, 'TIER1_GA', 5]);
+      assert.equal(sqlMatching(/inventory_items/).length, 0);
     });
 
-    it('will not shrink capacity below what is already reserved or sold', async () => {
+    it('will not allow more available buyers than the stored total seats', async () => {
       isOrganiser();
-      on(/UPDATE events SET title/, {});
-      on(/SELECT inventory_item_id, reserved_qty, sold_qty/, [{ inventory_item_id: 9, reserved_qty: 2, sold_qty: 2 }]);
+      stored('DRAFT', 3);
 
-      const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
+      const response = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, totalSeats: 50, availableBuyers: 4 } });
 
-      assert.deepEqual(response, { status: 409, body: { error: 'total_seats_below_allocated' } });
+      assert.deepEqual(response, { status: 409, body: { error: 'available_buyers_above_total_seats' } });
       assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
-      assert.equal(sqlMatching(/UPDATE inventory_items/).length, 0);
+      assert.equal(sqlMatching(/UPDATE events/).length, 0);
     });
 
-    it('creates the General Admission stock when the event has none yet', async () => {
-      isOrganiser();
-      on(/UPDATE events SET title/, {});
-      on(/SELECT inventory_item_id, reserved_qty, sold_qty/, []);
-      on(/INSERT INTO inventory_items/, {});
+    for (const status of ['PUBLISHED', 'CANCELLED']) {
+      it(`will not edit a ${status.toLowerCase()} event, not even its total seats`, async () => {
+        isOrganiser();
+        stored(status);
 
-      const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
+        const response = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, totalSeats: 40 } });
 
-      assert.equal(response.status, 204);
-      assert.deepEqual(sqlMatching(/INSERT INTO inventory_items/)[0]?.params, [5, 3, 2500]);
-    });
+        assert.deepEqual(response, { status: 409, body: { error: 'event_not_editable' } });
+        assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+        assert.equal(sqlMatching(/^UPDATE/).length, 0);
+      });
+    }
 
     it('rolls back and reports 502 when the update fails', async () => {
       mock.method(console, 'error', () => undefined);
       isOrganiser();
+      stored('DRAFT');
       on(/UPDATE events SET title/, new Error('deadlock'));
 
       const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
@@ -380,19 +356,6 @@ describe('organiser endpoints', () => {
       assert.deepEqual(response, { status: 502, body: { error: 'event_update_failed' } });
       assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
       mock.restoreAll();
-    });
-
-    it('will not edit an event that is no longer a draft (e.g. already published)', async () => {
-      isOrganiser();
-      // The UPDATE is scoped to `AND status = 'DRAFT'`, so a published event
-      // matches zero rows instead of silently going through.
-      on(/UPDATE events SET title/, { affectedRows: 0 });
-
-      const response = await request('PUT', '/events/5', { token: 'alice', body: newEvent });
-
-      assert.deepEqual(response, { status: 409, body: { error: 'event_not_editable' } });
-      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
-      assert.equal(sqlMatching(/SELECT inventory_item_id, reserved_qty, sold_qty/).length, 0);
     });
   });
 
@@ -404,10 +367,9 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/status = 'PUBLISHED'/).length, 0);
     });
 
-    it('makes sure stock exists, then publishes in one transaction', async () => {
+    it('publishes an event whose inventory is configured, in one transaction', async () => {
       isOrganiser();
-      on(/SELECT total_seats, tier FROM events/, [{ total_seats: 3, tier: 'TIER1_GA' }]);
-      on(/SELECT inventory_item_id FROM inventory_items/, [{ inventory_item_id: 9 }]);
+      on(/SELECT e.total_seats, \(SELECT COUNT\(\*\) FROM inventory_items/, [{ total_seats: 3, zones: 1 }]);
       on(/UPDATE events SET status = 'PUBLISHED'/, {});
 
       const response = await request('POST', '/events/5/publish', { token: 'alice' });
@@ -415,12 +377,27 @@ describe('organiser endpoints', () => {
       assert.equal(response.status, 204);
       assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
       assert.deepEqual(sqlMatching(/status = 'PUBLISHED'/)[0]?.params, [5]);
+      assert.equal(sqlMatching(/INSERT/).length, 0, 'publishing never creates stock');
+    });
+
+    it('will not publish until Configure inventory has created a zone', async () => {
+      for (const row of [{ total_seats: 0, zones: 0 }, { total_seats: 0, zones: 1 }]) {
+        db.reset();
+        isOrganiser();
+        on(/SELECT e.total_seats, \(SELECT COUNT\(\*\) FROM inventory_items/, [row]);
+
+        const response = await request('POST', '/events/5/publish', { token: 'alice' });
+
+        assert.deepEqual(response, { status: 409, body: { error: 'inventory_not_configured' } });
+        assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+        assert.equal(sqlMatching(/^(UPDATE|INSERT)/).length, 0);
+      }
     });
 
     it('rolls back and reports 502 when publishing fails', async () => {
       mock.method(console, 'error', () => undefined);
       isOrganiser();
-      on(/SELECT total_seats, tier FROM events/, []);
+      on(/SELECT e.total_seats, \(SELECT COUNT\(\*\) FROM inventory_items/, [{ total_seats: 3, zones: 1 }]);
       on(/UPDATE events SET status = 'PUBLISHED'/, new Error('lost connection'));
 
       const response = await request('POST', '/events/5/publish', { token: 'alice' });
@@ -456,19 +433,54 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/DELETE FROM events/).length, 0);
     });
 
-    it('deletes a draft event', async () => {
+    it('deletes a draft together with its zones, seats, map and team, children first', async () => {
       isOrganiser();
-      on(/DELETE FROM events/, { affectedRows: 1 });
+      on(/SELECT status FROM events/, [{ status: 'DRAFT' }]);
+      on(/FROM inventory_holds/, []);
+      on(/^DELETE FROM/, { affectedRows: 1 });
+
       const response = await request('DELETE', '/events/5', { token: 'alice' });
+
       assert.equal(response.status, 204);
-      assert.match(sqlMatching(/DELETE FROM events/)[0]?.sql ?? '', /status = 'DRAFT'/);
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
+      assert.deepEqual(
+        sqlMatching(/^DELETE FROM/).map((call) => call.sql.split(' ')[2]),
+        ['seats', 'inventory_items', 'event_grid_settings', 'event_team_memberships', 'events'],
+      );
+      assert.ok(sqlMatching(/^DELETE FROM/).every((call) => call.params[0] === 5));
     });
 
-    it('will not delete an event that is no longer a draft', async () => {
+    for (const status of ['PUBLISHED', 'CANCELLED']) {
+      it(`will not delete a ${status.toLowerCase()} event`, async () => {
+        isOrganiser();
+        on(/SELECT status FROM events/, [{ status }]);
+        const response = await request('DELETE', '/events/5', { token: 'alice' });
+        assert.deepEqual(response, { status: 409, body: { error: 'only_draft_events_can_be_deleted' } });
+        assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+        assert.equal(sqlMatching(/^DELETE/).length, 0);
+      });
+    }
+
+    it('keeps a draft that has reservation history', async () => {
       isOrganiser();
-      on(/DELETE FROM events/, { affectedRows: 0 });
+      on(/SELECT status FROM events/, [{ status: 'DRAFT' }]);
+      on(/FROM inventory_holds/, [{ 1: 1 }]);
       const response = await request('DELETE', '/events/5', { token: 'alice' });
-      assert.deepEqual(response, { status: 409, body: { error: 'only_draft_events_can_be_deleted' } });
+      assert.deepEqual(response, { status: 409, body: { error: 'event_has_reservation_history' } });
+      assert.equal(sqlMatching(/^DELETE/).length, 0);
+    });
+
+    it('rolls back and reports 502 instead of crashing when a delete fails', async () => {
+      mock.method(console, 'error', () => undefined);
+      isOrganiser();
+      on(/SELECT status FROM events/, [{ status: 'DRAFT' }]);
+      on(/FROM inventory_holds/, []);
+      on(/^DELETE FROM seats/, {});
+      on(/^DELETE FROM/, new Error('foreign key'));
+      const response = await request('DELETE', '/events/5', { token: 'alice' });
+      assert.deepEqual(response, { status: 502, body: { error: 'event_delete_failed' } });
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+      mock.restoreAll();
     });
   });
 
