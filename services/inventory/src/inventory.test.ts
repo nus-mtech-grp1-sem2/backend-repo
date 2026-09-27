@@ -121,6 +121,45 @@ test('organiser drags a rectangle to create a GA zone; capacity is the rectangle
   }
 });
 
+test('a GA zone with sales reports soldCount/heldCount from inventory_items, not the empty seats table', async () => {
+  const fixture = await createEventFixture('TIER1_GA');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const { zones } = await (await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    })).json();
+    const inventoryItemId = zones[0].inventoryItemId;
+
+    // A GA sale/hold updates inventory_items directly — there are no seat rows
+    // to derive counts from, unlike a seated zone.
+    await testPool.execute(
+      'UPDATE inventory_items SET sold_qty = 1, reserved_qty = 2 WHERE inventory_item_id = ?',
+      [inventoryItemId],
+    );
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const body = await getRes.json();
+    const zone = body.zones[0];
+    assert.equal(zone.seatCount, 6);
+    assert.equal(zone.soldCount, 1);
+    assert.equal(zone.heldCount, 2);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('overlapping zone rectangles are rejected — each cell belongs to at most one zone', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {

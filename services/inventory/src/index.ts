@@ -429,7 +429,7 @@ app.get('/events/:eventId/inventory', async (req, res) => {
 
   const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
     'SELECT ii.inventory_item_id, ii.name, ii.section_code, ii.price_cents, ii.color, ' +
-      'ii.grid_row, ii.grid_col, ii.grid_row_span, ii.grid_col_span, ii.total_qty, ' +
+      'ii.grid_row, ii.grid_col, ii.grid_row_span, ii.grid_col_span, ii.total_qty, ii.sold_qty, ii.reserved_qty, ' +
       "COUNT(s.seat_id) AS seat_count, COALESCE(SUM(s.status = 'SOLD'), 0) AS sold_count, COALESCE(SUM(s.status = 'HELD'), 0) AS held_count " +
       'FROM inventory_items ii LEFT JOIN seats s ON s.inventory_item_id = ii.inventory_item_id ' +
       'WHERE ii.event_id = ? GROUP BY ii.inventory_item_id ORDER BY ii.inventory_item_id',
@@ -454,10 +454,11 @@ app.get('/events/:eventId/inventory', async (req, res) => {
       gridRowSpan: zone.grid_row_span,
       gridColSpan: zone.grid_col_span,
       // TIER2_SEATED: derived from actual seat rows. TIER1_GA: no seat rows
-      // exist at all, so seatCount falls back to the zone's stored capacity.
+      // exist at all, so seatCount/soldCount/heldCount fall back to the
+      // zone's own stored counters instead of aggregating an empty table.
       seatCount: event.tier === 'TIER1_GA' ? zone.total_qty : zone.seat_count,
-      soldCount: zone.sold_count,
-      heldCount: zone.held_count,
+      soldCount: event.tier === 'TIER1_GA' ? zone.sold_qty : zone.sold_count,
+      heldCount: event.tier === 'TIER1_GA' ? zone.reserved_qty : zone.held_count,
     })),
     seats: seatRows.map((seat) => ({
       seatId: seat.seat_id,
