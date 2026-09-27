@@ -716,7 +716,18 @@ async function putZoneInventory(
     }
 
     await upsertGridSettings(connection, eventId, gridDims);
-    await syncEventTotalSeats(connection, eventId, tier);
+
+    const totalSeats = await computeTotalSeats(connection, eventId, tier);
+    const capacityCheck = await checkCapacityAboveAvailableBuyers(connection, eventId, totalSeats);
+    if (!capacityCheck.ok) {
+      await connection.rollback();
+      res.status(409).json({
+        error: 'capacity_below_available_buyers',
+        availableBuyers: capacityCheck.availableBuyers,
+      });
+      return;
+    }
+    await connection.execute('UPDATE events SET total_seats = ? WHERE event_id = ?', [totalSeats, eventId]);
     await connection.commit();
     res.status(204).end();
   } catch (error) {
@@ -1038,13 +1049,36 @@ app.post('/holds/:holdId/confirm', (req, res) => {
   void finishHold(req, res, 'CONFIRMED');
 });
 
-async function syncEventTotalSeats(connection: mysql.PoolConnection, eventId: number, tier: EventTier): Promise<void> {
+async function computeTotalSeats(connection: mysql.PoolConnection, eventId: number, tier: EventTier): Promise<number> {
   const query = tier === 'TIER1_GA'
     ? 'SELECT COALESCE(SUM(total_qty), 0) AS total FROM inventory_items WHERE event_id = ?'
     : 'SELECT COUNT(*) AS total FROM seats WHERE event_id = ?';
   const [rows] = await connection.query<mysql.RowDataPacket[]>(query, [eventId]);
-  const total = rows[0]!['total'] as number;
-  await connection.execute('UPDATE events SET total_seats = ? WHERE event_id = ?', [Math.max(total, 1), eventId]);
+  return Math.max(rows[0]!['total'] as number, 1);
+}
+
+type CapacityCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly availableBuyers: number };
+
+/** `chk_events_available_buyers` (see database/10-add-event-available-buyers.sql)
+ * blocks `total_seats` from dropping below `available_buyers` at the DB
+ * layer, but a raw constraint violation surfaces as an opaque 502. Checking
+ * it here first lets the organiser see exactly why the shrink was rejected. */
+async function checkCapacityAboveAvailableBuyers(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  totalSeats: number,
+): Promise<CapacityCheck> {
+  const [rows] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT available_buyers FROM events WHERE event_id = ?',
+    [eventId],
+  );
+  const availableBuyers = rows[0]?.available_buyers as number | null;
+  if (availableBuyers !== null && availableBuyers !== undefined && totalSeats < availableBuyers) {
+    return { ok: false, availableBuyers };
+  }
+  return { ok: true };
 }
 
 // Guarded so importing this module from tests (NODE_ENV=test) doesn't also

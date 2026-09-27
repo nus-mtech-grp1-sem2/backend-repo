@@ -160,6 +160,46 @@ test('a GA zone with sales reports soldCount/heldCount from inventory_items, not
   }
 });
 
+test('shrinking capacity below available_buyers is rejected with a clear error, not a 502', async () => {
+  const fixture = await createEventFixture('TIER1_GA');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 5 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    // available_buyers is normally set when the event is created; simulate
+    // that directly rather than duplicating the event service's logic.
+    await testPool.execute('UPDATE events SET available_buyers = 8 WHERE event_id = ?', [fixture.eventId]);
+
+    const shrinkRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 5 },
+        ],
+      }),
+    });
+    assert.equal(shrinkRes.status, 409);
+    const shrinkBody = await shrinkRes.json();
+    assert.equal(shrinkBody.error, 'capacity_below_available_buyers');
+    assert.equal(shrinkBody.availableBuyers, 8);
+
+    // The rejected shrink wrote nothing — capacity is exactly what it was.
+    const [eventRows] = await testPool.query('SELECT total_seats FROM events WHERE event_id = ?', [fixture.eventId]);
+    assert.equal((eventRows as { total_seats: number }[])[0]!.total_seats, 10);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('overlapping zone rectangles are rejected — each cell belongs to at most one zone', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {
