@@ -430,7 +430,7 @@ app.get('/events/:eventId/inventory', async (req, res) => {
 
   const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
     'SELECT ii.inventory_item_id, ii.name, ii.section_code, ii.price_cents, ii.color, ' +
-      'ii.grid_row, ii.grid_col, ii.grid_row_span, ii.grid_col_span, ii.total_qty, ' +
+      'ii.grid_row, ii.grid_col, ii.grid_row_span, ii.grid_col_span, ii.total_qty, ii.sold_qty, ii.reserved_qty, ' +
       "COUNT(s.seat_id) AS seat_count, COALESCE(SUM(s.status = 'SOLD'), 0) AS sold_count, COALESCE(SUM(s.status = 'HELD'), 0) AS held_count " +
       'FROM inventory_items ii LEFT JOIN seats s ON s.inventory_item_id = ii.inventory_item_id ' +
       'WHERE ii.event_id = ? GROUP BY ii.inventory_item_id ORDER BY ii.inventory_item_id',
@@ -455,10 +455,11 @@ app.get('/events/:eventId/inventory', async (req, res) => {
       gridRowSpan: zone.grid_row_span,
       gridColSpan: zone.grid_col_span,
       // TIER2_SEATED: derived from actual seat rows. TIER1_GA: no seat rows
-      // exist at all, so seatCount falls back to the zone's stored capacity.
+      // exist at all, so seatCount/soldCount/heldCount fall back to the
+      // zone's own stored counters instead of aggregating an empty table.
       seatCount: event.tier === 'TIER1_GA' ? zone.total_qty : zone.seat_count,
-      soldCount: zone.sold_count,
-      heldCount: zone.held_count,
+      soldCount: event.tier === 'TIER1_GA' ? zone.sold_qty : zone.sold_count,
+      heldCount: event.tier === 'TIER1_GA' ? zone.reserved_qty : zone.held_count,
     })),
     seats: seatRows.map((seat) => ({
       seatId: seat.seat_id,
@@ -468,6 +469,37 @@ app.get('/events/:eventId/inventory', async (req, res) => {
       inventoryItemId: seat.inventory_item_id,
       status: seat.status,
       tag: seat.tag,
+    })),
+  });
+});
+
+/**
+ * Customer-facing ticket tiers: every zone's price/colour and remaining
+ * capacity, without the organiser-only seat/grid detail `GET .../inventory`
+ * exposes. Any authenticated caller may see this — organiser status isn't
+ * required to browse what's for sale.
+ */
+app.get('/events/:eventId/zones', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await requireAuthenticated(req, res))) return;
+  const event = await fetchEvent(eventId);
+  if (!event) return res.status(404).json({ error: 'event_not_found' });
+
+  const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT inventory_item_id, name, price_cents, color, total_qty, reserved_qty, sold_qty ' +
+      'FROM inventory_items WHERE event_id = ? ORDER BY inventory_item_id',
+    [eventId],
+  );
+
+  res.json({
+    zones: zoneRows.map((zone) => ({
+      inventoryItemId: zone.inventory_item_id,
+      name: zone.name,
+      priceCents: zone.price_cents,
+      color: zone.color,
+      remaining: zone.total_qty - zone.reserved_qty - zone.sold_qty,
     })),
   });
 });
@@ -745,7 +777,18 @@ async function putZoneInventory(
     }
 
     await upsertGridSettings(connection, eventId, gridDims);
-    await syncEventTotalSeats(connection, eventId, tier);
+
+    const totalSeats = await computeTotalSeats(connection, eventId, tier);
+    const capacityCheck = await checkCapacityAboveAvailableBuyers(connection, eventId, totalSeats);
+    if (!capacityCheck.ok) {
+      await connection.rollback();
+      res.status(409).json({
+        error: 'capacity_below_available_buyers',
+        availableBuyers: capacityCheck.availableBuyers,
+      });
+      return;
+    }
+    await connection.execute('UPDATE events SET total_seats = ? WHERE event_id = ?', [totalSeats, eventId]);
     await connection.commit();
     res.status(204).end();
   } catch (error) {
@@ -1067,13 +1110,36 @@ app.post('/holds/:holdId/confirm', (req, res) => {
   void finishHold(req, res, 'CONFIRMED');
 });
 
-async function syncEventTotalSeats(connection: mysql.PoolConnection, eventId: number, tier: EventTier): Promise<void> {
+async function computeTotalSeats(connection: mysql.PoolConnection, eventId: number, tier: EventTier): Promise<number> {
   const query = tier === 'TIER1_GA'
     ? 'SELECT COALESCE(SUM(total_qty), 0) AS total FROM inventory_items WHERE event_id = ?'
     : 'SELECT COUNT(*) AS total FROM seats WHERE event_id = ?';
   const [rows] = await connection.query<mysql.RowDataPacket[]>(query, [eventId]);
-  const total = rows[0]!['total'] as number;
-  await connection.execute('UPDATE events SET total_seats = ? WHERE event_id = ?', [Math.max(total, 1), eventId]);
+  return Math.max(rows[0]!['total'] as number, 1);
+}
+
+type CapacityCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly availableBuyers: number };
+
+/** `chk_events_available_buyers` (see database/10-add-event-available-buyers.sql)
+ * blocks `total_seats` from dropping below `available_buyers` at the DB
+ * layer, but a raw constraint violation surfaces as an opaque 502. Checking
+ * it here first lets the organiser see exactly why the shrink was rejected. */
+async function checkCapacityAboveAvailableBuyers(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  totalSeats: number,
+): Promise<CapacityCheck> {
+  const [rows] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT available_buyers FROM events WHERE event_id = ?',
+    [eventId],
+  );
+  const availableBuyers = rows[0]?.available_buyers as number | null;
+  if (availableBuyers !== null && availableBuyers !== undefined && totalSeats < availableBuyers) {
+    return { ok: false, availableBuyers };
+  }
+  return { ok: true };
 }
 
 // Guarded so importing this module from tests (NODE_ENV=test) doesn't also

@@ -122,6 +122,85 @@ test('organiser drags a rectangle to create a GA zone; capacity is the rectangle
   }
 });
 
+test('a GA zone with sales reports soldCount/heldCount from inventory_items, not the empty seats table', async () => {
+  const fixture = await createEventFixture('TIER1_GA');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const { zones } = await (await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    })).json();
+    const inventoryItemId = zones[0].inventoryItemId;
+
+    // A GA sale/hold updates inventory_items directly — there are no seat rows
+    // to derive counts from, unlike a seated zone.
+    await testPool.execute(
+      'UPDATE inventory_items SET sold_qty = 1, reserved_qty = 2 WHERE inventory_item_id = ?',
+      [inventoryItemId],
+    );
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const body = await getRes.json();
+    const zone = body.zones[0];
+    assert.equal(zone.seatCount, 6);
+    assert.equal(zone.soldCount, 1);
+    assert.equal(zone.heldCount, 2);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('shrinking capacity below available_buyers is rejected with a clear error, not a 502', async () => {
+  const fixture = await createEventFixture('TIER1_GA');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 5 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    // available_buyers is normally set when the event is created; simulate
+    // that directly rather than duplicating the event service's logic.
+    await testPool.execute('UPDATE events SET available_buyers = 8 WHERE event_id = ?', [fixture.eventId]);
+
+    const shrinkRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 5 },
+        ],
+      }),
+    });
+    assert.equal(shrinkRes.status, 409);
+    const shrinkBody = await shrinkRes.json();
+    assert.equal(shrinkBody.error, 'capacity_below_available_buyers');
+    assert.equal(shrinkBody.availableBuyers, 8);
+
+    // The rejected shrink wrote nothing — capacity is exactly what it was.
+    const [eventRows] = await testPool.query('SELECT total_seats FROM events WHERE event_id = ?', [fixture.eventId]);
+    assert.equal((eventRows as { total_seats: number }[])[0]!.total_seats, 10);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('overlapping zone rectangles are rejected — each cell belongs to at most one zone', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {
@@ -337,6 +416,62 @@ test('a zone with only expired/released hold history cannot be dropped — 409, 
     const finalBody = await finalGetRes.json();
     assert.equal(finalBody.zones.length, 1);
     assert.equal(finalBody.zones[0].inventoryItemId, inventoryItemId);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('a customer can list a GA event\'s ticket tiers with remaining capacity, without organiser access', async () => {
+  const fixture = await createEventFixture('TIER1_GA', 'DRAFT');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 20, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 4, gridColSpan: 5 },
+          { name: 'VIP', price: 50, color: '#DC2626', gridRow: 4, gridCol: 0, gridRowSpan: 2, gridColSpan: 4 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const { zones: seededZones } = await getRes.json();
+    const gaZone = seededZones.find((z: { name: string }) => z.name === 'General Admission');
+    // Sell 3 GA tickets so remaining capacity actually differs from total_qty.
+    await testPool.execute('UPDATE inventory_items SET sold_qty = 3 WHERE inventory_item_id = ?', [gaZone.inventoryItemId]);
+    // Zones are configured while DRAFT (PUT is locked once PUBLISHED); the
+    // event goes on sale afterwards, same as the real organiser flow.
+    await testPool.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [fixture.eventId]);
+
+    const customerRes = await fetch(`${baseUrl}/events/${fixture.eventId}/zones`, {
+      headers: authHeader('some-customer-sub'),
+    });
+    assert.equal(customerRes.status, 200);
+    const body = await customerRes.json();
+    assert.equal(body.zones.length, 2);
+
+    const ga = body.zones.find((z: { name: string }) => z.name === 'General Admission');
+    assert.equal(ga.priceCents, 2000);
+    assert.equal(ga.color, '#2563EB');
+    assert.equal(ga.remaining, 17); // 20 capacity - 3 sold
+
+    const vip = body.zones.find((z: { name: string }) => z.name === 'VIP');
+    assert.equal(vip.priceCents, 5000);
+    assert.equal(vip.remaining, 8);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('listing ticket tiers requires authentication', async () => {
+  const fixture = await createEventFixture('TIER1_GA', 'PUBLISHED');
+  try {
+    const res = await fetch(`${baseUrl}/events/${fixture.eventId}/zones`);
+    assert.equal(res.status, 401);
   } finally {
     await destroyFixture(fixture.eventId);
   }
