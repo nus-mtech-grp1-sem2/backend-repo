@@ -90,7 +90,6 @@ type Outcome = 'VALID' | 'ALREADY_USED' | 'INVALID' | 'WRONG_EVENT';
 interface Caller {
   readonly sub: string;
   readonly email: string;
-  readonly name: string;
 }
 
 interface ScannerSession {
@@ -122,6 +121,7 @@ interface OrderPaidEvent {
   readonly eventId: number;
   readonly customerSub: string;
   readonly customerEmail: string;
+  readonly customerName: string;
   readonly items: readonly OrderPaidItem[];
 }
 
@@ -131,9 +131,7 @@ async function authenticate(req: express.Request): Promise<Caller | null> {
   if (!token || !verifier) return null;
   try {
     const claims = await verifier.verify(token);
-    const firstName = typeof claims.given_name === 'string' ? claims.given_name : '';
-    const lastName = typeof claims.family_name === 'string' ? claims.family_name : '';
-    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '', name: `${firstName} ${lastName}`.trim() };
+    return { sub: String(claims.sub), email: typeof claims.email === 'string' ? claims.email : '' };
   } catch {
     return null;
   }
@@ -219,6 +217,12 @@ function parseToken(value: unknown): string | null {
   return token.length > 0 && token.length <= 255 ? token : null;
 }
 
+// Display/door-lookup data supplied by the buyer; never use it for authorisation.
+export function cleanCustomerName(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return Array.from(value.replace(/\p{Cc}/gu, ' ').replace(/\s+/g, ' ').trim()).slice(0, 255).join('').trim();
+}
+
 export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
   if (!value || typeof value !== 'object') return null;
   const event = value as Record<string, unknown>;
@@ -226,6 +230,8 @@ export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
   const eventId = parseEventId(event['eventId']);
   const customerSub = typeof event['customerSub'] === 'string' ? event['customerSub'].trim() : '';
   const customerEmail = typeof event['customerEmail'] === 'string' ? event['customerEmail'].trim() : '';
+  // Optional so messages published before the field existed still parse.
+  const customerName = cleanCustomerName(event['customerName']);
   if (event['type'] !== 'OrderPaid' || event['version'] !== 1 || !orderId || !eventId ||
       !customerSub || customerSub.length > 36 || !customerEmail || customerEmail.length > 255 ||
       !Array.isArray(event['items']) || event['items'].length === 0) return null;
@@ -242,7 +248,7 @@ export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
     }
     items.push({ orderItemId, seatId, quantity });
   }
-  return { type: 'OrderPaid', version: 1, orderId, eventId, customerSub, customerEmail, items };
+  return { type: 'OrderPaid', version: 1, orderId, eventId, customerSub, customerEmail, customerName, items };
 }
 
 export async function issueTickets(event: OrderPaidEvent): Promise<number> {
@@ -270,9 +276,9 @@ export async function issueTickets(event: OrderPaidEvent): Promise<number> {
       for (let index = 0; index < missing; index += 1) {
         await connection.execute(
           `INSERT INTO tickets
-            (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [event.orderId, item.orderItemId, event.eventId, event.customerSub, event.customerEmail,
+            (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [event.orderId, item.orderItemId, event.eventId, event.customerSub, event.customerEmail, event.customerName,
             item.seatId, randomBytes(32).toString('base64url')],
         );
         issued += 1;
@@ -419,7 +425,7 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
     if (!lockAcquired) throw new Error('ticket_order_lock_timeout');
     await connection.beginTransaction();
     const [orders] = await connection.query<mysql.RowDataPacket[]>(
-      "SELECT order_id, event_id, customer_sub, customer_email, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
+      "SELECT order_id, event_id, customer_sub, customer_email, customer_name, status FROM checkout.orders WHERE order_id = ? FOR UPDATE",
       [orderId],
     );
     const order = orders[0];
@@ -440,9 +446,9 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
       for (let unit = existingCount; unit < quantity; unit += 1) {
         await connection.execute(
           `INSERT INTO ticketing.tickets
-             (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
-          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, item.seat_id ?? null, createQrToken()],
+             (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
+          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, cleanCustomerName(order.customer_name), item.seat_id ?? null, createQrToken()],
         );
         issued += 1;
       }
@@ -693,7 +699,9 @@ interface ScannerCheckinInput {
 export function parseSearchQuery(query: Record<string, unknown>): string | null {
   if (Object.keys(query).some((key) => key !== 'q')) return null;
   const value = typeof query.q === 'string' ? query.q.trim() : '';
-  return value.length >= 3 && value.length <= 255 ? value : null;
+  // An all-digit query is an exact order ID, so short ones (order 7, 82) are fine; text needs 3+.
+  const minLength = /^\d+$/.test(value) ? 1 : 3;
+  return value.length >= minLength && value.length <= 255 ? value : null;
 }
 
 type ScannerCheckinParse =
@@ -817,14 +825,8 @@ app.get('/customers/me/tickets', async (req, res) => {
      INNER JOIN event_inventory.events e ON e.event_id = t.event_id
      LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
      WHERE t.customer_sub = ?
-       AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-       AND NOT EXISTS (
-         SELECT 1 FROM event_inventory.event_team_memberships etm
-         WHERE etm.event_id = t.event_id AND etm.user_sub = t.customer_sub
-           AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-       )
      ORDER BY e.starts_at ASC, t.ticket_id ASC`,
-    [caller.sub, caller.sub],
+    [caller.sub],
   );
   return res.json({ tickets });
 });
@@ -916,14 +918,8 @@ app.get('/customers/me/tickets', async (req, res) => {
        JOIN event_inventory.events e ON e.event_id = t.event_id
        LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
        WHERE t.customer_sub = ?
-         AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM event_inventory.event_team_memberships etm
-           WHERE etm.event_id = t.event_id AND etm.user_sub = t.customer_sub
-             AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-         )
        ORDER BY e.starts_at DESC, t.ticket_id`,
-      [caller.sub, caller.sub],
+      [caller.sub],
     );
     return res.json({ tickets });
   } catch (error) {
@@ -1057,6 +1053,7 @@ interface AttendeeRow extends mysql.RowDataPacket {
   ticket_id: number;
   customer_sub: string;
   customer_email: string;
+  customer_name: string;
   seat_label: string | null;
   status: 'ISSUED' | 'CHECKED_IN' | 'VOID';
   order_id: number;
@@ -1076,7 +1073,7 @@ app.get('/events/:eventId/attendees', async (req, res) => {
 
   const [rows] = await database.query<AttendeeRow[]>(
     `SELECT
-       t.ticket_id, t.customer_sub, t.customer_email, s.seat_label, t.status,
+       t.ticket_id, t.customer_sub, t.customer_email, t.customer_name, s.seat_label, t.status,
        o.order_id, o.status AS order_status, o.total_amount_cents, o.currency, o.paid_at
      FROM tickets t
      LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
@@ -1092,6 +1089,7 @@ app.get('/events/:eventId/attendees', async (req, res) => {
       ticket_id: row.ticket_id,
       customer_sub: row.customer_sub,
       customer_email: row.customer_email,
+      customer_name: row.customer_name,
       seat_label: row.seat_label,
       status: row.status,
       order_id: row.order_id,

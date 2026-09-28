@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
+import type mysql from 'mysql2/promise';
 // test-helpers MUST be imported first: it forces NODE_ENV=test and loads
 // real DB creds from .env before index.ts's top-level code runs (which
 // reads process.env once, at import time, to build its DB pool and decide
@@ -227,7 +228,7 @@ test('overlapping zone rectangles are rejected — each cell belongs to at most 
   }
 });
 
-test('a published event\'s inventory is locked — no zone changes are accepted', async () => {
+test('a published event can still add capacity and change prices', async () => {
   const fixture = await createEventFixture('TIER2_SEATED', 'PUBLISHED');
   try {
     const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
@@ -239,16 +240,68 @@ test('a published event\'s inventory is locked — no zone changes are accepted'
         ],
       }),
     });
-    assert.equal(putRes.status, 409);
-    const body = await putRes.json();
-    assert.equal(body.error, 'event_already_published');
+    assert.equal(putRes.status, 204);
 
-    // Nothing was written.
     const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
       headers: authHeader(fixture.organiserSub),
     });
     const getBody = await getRes.json();
-    assert.equal(getBody.zones.length, 0);
+    assert.equal(getBody.zones.length, 1);
+    assert.equal(getBody.zones[0].seatCount, 6);
+    assert.equal(getBody.zones[0].priceCents, 7500);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('a published GA zone can grow, but never shrink below what is sold or held', async () => {
+  const fixture = await createEventFixture('TIER1_GA', 'PUBLISHED');
+  const put = (gridColSpan: number, price: number, inventoryItemId?: number) =>
+    fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [{ ...(inventoryItemId ? { inventoryItemId } : {}), name: 'Standing', price, color: '#00FF00', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan }],
+      }),
+    });
+  try {
+    assert.equal((await put(5, 30)).status, 204);
+    const [rows] = await testPool.query<mysql.RowDataPacket[]>(
+      'SELECT inventory_item_id FROM inventory_items WHERE event_id = ?', [fixture.eventId],
+    );
+    const zoneId = rows[0]!.inventory_item_id as number;
+    await testPool.execute('UPDATE inventory_items SET sold_qty = 3, reserved_qty = 1 WHERE inventory_item_id = ?', [zoneId]);
+
+    const tooSmall = await put(3, 30, zoneId);
+    assert.equal(tooSmall.status, 409);
+    assert.equal((await tooSmall.json()).error, 'zone_below_allocated');
+
+    assert.equal((await put(4, 45, zoneId)).status, 204, 'exactly the sold + held tickets is allowed');
+    assert.equal((await put(8, 45, zoneId)).status, 204);
+    const [after] = await testPool.query<mysql.RowDataPacket[]>(
+      'SELECT total_qty, price_cents FROM inventory_items WHERE inventory_item_id = ?', [zoneId],
+    );
+    assert.deepEqual({ ...after[0] }, { total_qty: 8, price_cents: 4500 });
+    const [events] = await testPool.query<mysql.RowDataPacket[]>('SELECT total_seats FROM events WHERE event_id = ?', [fixture.eventId]);
+    assert.equal(events[0]!.total_seats, 8);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('a published event that has already started keeps its inventory', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED', 'PUBLISHED');
+  try {
+    await testPool.execute('UPDATE events SET starts_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR) WHERE event_id = ?', [fixture.eventId]);
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [{ name: 'Late', price: 10, color: '#0000FF', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }],
+      }),
+    });
+    assert.equal(putRes.status, 409);
+    assert.equal((await putRes.json()).error, 'event_completed');
   } finally {
     await destroyFixture(fixture.eventId);
   }

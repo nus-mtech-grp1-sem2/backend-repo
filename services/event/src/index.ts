@@ -74,7 +74,6 @@ interface EventInput {
   readonly description?: unknown;
   readonly venue?: unknown;
   readonly startsAt?: unknown;
-  readonly totalSeats?: unknown;
   readonly availableBuyers?: unknown;
   readonly tier?: unknown;
   readonly price?: unknown;
@@ -117,23 +116,23 @@ function parsePriceCents(price: unknown): number | null {
   return Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
 }
 
-function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; totalSeats: number; availableBuyers: number | null; tier: string; priceCents: number | null } | null {
+/** Total seats is never read from the body: it comes from the zones in Configure inventory. */
+function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; availableBuyers: number | null; tier: string; priceCents: number | null } | null {
   const title = typeof input.title === 'string' ? input.title.trim() : '';
   const description = typeof input.description === 'string' ? input.description.trim() || null : null;
   const venue = typeof input.venue === 'string' ? input.venue.trim() : '';
   const startsAt = typeof input.startsAt === 'string' ? input.startsAt.trim() : '';
-  const totalSeats = typeof input.totalSeats === 'number' ? input.totalSeats : Number.NaN;
   const availableBuyers = input.availableBuyers === undefined || input.availableBuyers === null || input.availableBuyers === ''
     ? null
     : typeof input.availableBuyers === 'number' ? input.availableBuyers : Number.NaN;
   const tier = input.tier === 'TIER1_GA' || input.tier === 'TIER2_SEATED' ? input.tier : '';
   const priceCents = input.price === undefined ? (input.priceCents === undefined ? null : typeof input.priceCents === 'number' ? input.priceCents : Number.NaN) : parsePriceCents(input.price);
-  if (!title || title.length > 255 || !venue || venue.length > 255 || !Number.isSafeInteger(totalSeats) || totalSeats < 1 || totalSeats > 1_000_000 || !tier || Number.isNaN(Date.parse(startsAt))) return null;
-  if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > totalSeats)) return null;
+  if (!title || title.length > 255 || !venue || venue.length > 255 || !tier || Number.isNaN(Date.parse(startsAt))) return null;
+  if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > 1_000_000)) return null;
   if (priceCents !== null && (!Number.isSafeInteger(priceCents) || priceCents < 0 || priceCents > 100_000_000)) return null;
   // parsePriceCents answers null for both "no price" and "invalid price"; a price that was given but does not parse is invalid.
   if (input.price !== undefined && input.price !== null && priceCents === null) return null;
-  return { title, description, venue, startsAt, totalSeats, availableBuyers, tier, priceCents };
+  return { title, description, venue, startsAt, availableBuyers, tier, priceCents };
 }
 
 async function ownsEvent(eventId: number, sub: string): Promise<boolean> {
@@ -150,15 +149,6 @@ async function isEventOrganiser(eventId: number, sub: string): Promise<boolean> 
     [eventId, sub],
   );
   return rows.length > 0;
-}
-
-async function provisionSeats(connection: mysql.PoolConnection, eventId: number, inventoryItemId: number, totalSeats: number): Promise<void> {
-  for (let seatNumber = 1; seatNumber <= totalSeats; seatNumber += 1) {
-    await connection.execute(
-      'INSERT INTO seats (event_id, inventory_item_id, seat_label) VALUES (?, ?, ?)',
-      [eventId, inventoryItemId, `S${String(seatNumber).padStart(3, '0')}`],
-    );
-  }
 }
 
 async function requireEventOrganiser(req: express.Request, res: express.Response, eventId: number): Promise<Caller | null> {
@@ -181,53 +171,6 @@ function validEventId(value: string): number | null {
 
 function attribute(attributes: readonly AttributeType[] | undefined, name: string): string {
   return attributes?.find((item) => item.Name === name)?.Value ?? '';
-}
-
-async function ensureEventInventory(connection: mysql.PoolConnection, eventId: number): Promise<void> {
-  const [events] = await connection.query<mysql.RowDataPacket[]>(
-    'SELECT total_seats, tier FROM events WHERE event_id = ? LIMIT 1 FOR UPDATE',
-    [eventId],
-  );
-  const event = events[0];
-  if (!event) return;
-
-  const [items] = await connection.query<mysql.RowDataPacket[]>(
-    "SELECT inventory_item_id FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1",
-    [eventId],
-  );
-  let inventoryItemId = Number(items[0]?.inventory_item_id ?? 0);
-  if (!inventoryItemId) {
-    const [item] = await connection.execute<mysql.ResultSetHeader>(
-      "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, 0)",
-      [eventId, Number(event.total_seats)],
-    );
-    inventoryItemId = item.insertId;
-  }
-
-  if (event.tier !== 'TIER2_SEATED') return;
-
-  const [existing] = await connection.query<mysql.RowDataPacket[]>(
-    'SELECT seat_label FROM seats WHERE event_id = ? ORDER BY seat_id',
-    [eventId],
-  );
-  const totalSeats = Number(event.total_seats);
-  const missing = Math.max(0, totalSeats - existing.length);
-  if (missing === 0) return;
-
-  const labels = new Set(existing.map((seat) => String(seat.seat_label)));
-  const additions: string[] = [];
-  for (let sequence = 1; additions.length < missing; sequence += 1) {
-    const label = `S${sequence}`;
-    if (!labels.has(label)) additions.push(label);
-  }
-  for (let offset = 0; offset < additions.length; offset += 500) {
-    const batch = additions.slice(offset, offset + 500);
-    const placeholders = batch.map(() => '(?, ?, ?)').join(', ');
-    await connection.execute(
-      `INSERT INTO seats (event_id, inventory_item_id, seat_label) VALUES ${placeholders}`,
-      batch.flatMap((label) => [eventId, inventoryItemId, label]),
-    );
-  }
 }
 
 /** Published events list, newest start date first. */
@@ -358,34 +301,22 @@ app.get('/events/:eventId/seats', async (req, res) => {
   const eventId = validEventId(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
 
-  const connection = await database.getConnection();
   try {
-    await connection.beginTransaction();
-    const [events] = await connection.query<mysql.RowDataPacket[]>(
+    const [events] = await database.query<mysql.RowDataPacket[]>(
       'SELECT tier FROM events WHERE event_id = ? LIMIT 1',
       [eventId],
     );
-    if (!events[0]) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'event_not_found' });
-    }
-    if (events[0].tier !== 'TIER2_SEATED') {
-      await connection.rollback();
-      return res.status(409).json({ error: 'seat_map_not_available' });
-    }
-    await ensureEventInventory(connection, eventId);
-    const [seats] = await connection.query(
+    if (!events[0]) return res.status(404).json({ error: 'event_not_found' });
+    if (events[0].tier !== 'TIER2_SEATED') return res.status(409).json({ error: 'seat_map_not_available' });
+    // Seats exist only once an organiser has drawn zones in Configure inventory.
+    const [seats] = await database.query(
       'SELECT seat_id, seat_label, status FROM seats WHERE event_id = ? ORDER BY seat_id',
       [eventId],
     );
-    await connection.commit();
     return res.json({ seats });
   } catch (error) {
-    await connection.rollback();
     console.error('failed to load seat map', error);
     return res.status(502).json({ error: 'seat_map_failed' });
-  } finally {
-    connection.release();
   }
 });
 
@@ -396,21 +327,22 @@ app.post('/events', async (req, res) => {
   if (!caller) return;
   if (!input) return res.status(400).json({ error: 'invalid_event' });
 
+  // The access token carries no email, so the owner's comes from Cognito;
+  // if that lookup fails the roster fills it in when it is read.
+  const { email: ownerEmail } = await lookUpCognitoProfile(caller.sub);
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
+    // A new event has no seats until its organiser draws zones in Configure
+    // inventory, which sets total_seats. Available buyers must not exceed
+    // total seats, so it can only be set by editing the event after that.
     const [result] = await connection.execute<mysql.ResultSetHeader>(
-      'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, available_buyers, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [caller.sub, input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier],
+      'INSERT INTO events (organiser_sub, title, description, venue, starts_at, total_seats, available_buyers, tier) VALUES (?, ?, ?, ?, ?, 0, NULL, ?)',
+      [caller.sub, input.title, input.description, input.venue, input.startsAt, input.tier],
     );
-    const [inventory] = await connection.execute<mysql.ResultSetHeader>(
-      'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, ?, ?)',
-      [result.insertId, 'General Admission', input.totalSeats, input.priceCents ?? 0],
-    );
-    if (input.tier === 'TIER2_SEATED') await provisionSeats(connection, result.insertId, inventory.insertId, input.totalSeats);
     await connection.execute(
-      "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, '', 'ORGANISER', 'ACCEPTED', ?)",
-      [result.insertId, caller.sub, caller.sub],
+      "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, ?, 'ORGANISER', 'ACCEPTED', ?)",
+      [result.insertId, caller.sub, ownerEmail, caller.sub],
     );
     await connection.commit();
     res.status(201).json({ eventId: result.insertId });
@@ -423,6 +355,9 @@ app.post('/events', async (req, res) => {
   }
 });
 
+// Capacity and prices belong to the inventory (Configure inventory keeps
+// events.total_seats in step with the zones), so editing an event never
+// writes total_seats, zone capacity or price.
 app.put('/events/:eventId', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const caller = await requireAuthenticated(req, res);
@@ -434,37 +369,25 @@ app.put('/events/:eventId', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
-    // Scoped to DRAFT the same way the DELETE endpoint is: a published (or
-    // cancelled) event matches zero rows instead of silently accepting the
-    // edit, so an organiser can no longer change a live event's details.
-    const [updateResult] = await connection.execute<mysql.ResultSetHeader>(
-      "UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, total_seats = ?, available_buyers = ?, tier = ? WHERE event_id = ? AND status = 'DRAFT'",
-      [input.title, input.description, input.venue, input.startsAt, input.totalSeats, input.availableBuyers, input.tier, eventId],
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT status, total_seats FROM events WHERE event_id = ? FOR UPDATE',
+      [eventId],
     );
-    if (updateResult.affectedRows === 0) {
+    const event = events[0];
+    // Only a DRAFT's details are editable, the same way only a draft can be
+    // deleted: a published or cancelled event keeps them as they are.
+    if (!event || event.status !== 'DRAFT') {
       await connection.rollback();
       return res.status(409).json({ error: 'event_not_editable' });
     }
-    const [items] = await connection.query<mysql.RowDataPacket[]>(
-      "SELECT inventory_item_id, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name = 'General Admission' LIMIT 1 FOR UPDATE",
-      [eventId],
-    );
-    if (items.length === 0) {
-      await connection.execute(
-        "INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, 'General Admission', ?, ?)",
-        [eventId, input.totalSeats, input.priceCents ?? 0],
-      );
-    } else {
-      const item = items[0]!;
-      if (Number(item.reserved_qty) + Number(item.sold_qty) > input.totalSeats) {
-        await connection.rollback();
-        return res.status(409).json({ error: 'total_seats_below_allocated' });
-      }
-      await connection.execute(
-        'UPDATE inventory_items SET total_qty = ?, price_cents = COALESCE(?, price_cents), version = version + 1 WHERE inventory_item_id = ?',
-        [input.totalSeats, input.priceCents, item.inventory_item_id],
-      );
+    if (input.availableBuyers !== null && input.availableBuyers > Number(event.total_seats)) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'available_buyers_above_total_seats' });
     }
+    await connection.execute(
+      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
+      [input.title, input.description, input.venue, input.startsAt, input.availableBuyers, input.tier, eventId],
+    );
     await connection.commit();
   } catch (error) {
     await connection.rollback();
@@ -538,7 +461,15 @@ app.post('/events/:eventId/publish', async (req, res) => {
   const connection = await database.getConnection();
   try {
     await connection.beginTransaction();
-    await ensureEventInventory(connection, eventId);
+    // Nothing can be sold until Configure inventory has created at least one zone.
+    const [[inventory]] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT e.total_seats, (SELECT COUNT(*) FROM inventory_items i WHERE i.event_id = e.event_id) AS zones FROM events e WHERE e.event_id = ? FOR UPDATE',
+      [eventId],
+    );
+    if (!inventory || Number(inventory.zones) === 0 || Number(inventory.total_seats) === 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'inventory_not_configured' });
+    }
     await connection.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [eventId]);
     await connection.commit();
     res.status(204).end();
@@ -567,9 +498,34 @@ app.delete('/events/:eventId', async (req, res) => {
   const eventId = Number(req.params.eventId);
   if (!caller) return;
   if (!Number.isSafeInteger(eventId) || !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
-  const [result] = await database.execute<mysql.ResultSetHeader>("DELETE FROM events WHERE event_id = ? AND status = 'DRAFT'", [eventId]);
-  if (result.affectedRows === 0) return res.status(409).json({ error: 'only_draft_events_can_be_deleted' });
-  res.status(204).end();
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [events] = await connection.query<mysql.RowDataPacket[]>('SELECT status FROM events WHERE event_id = ? FOR UPDATE', [eventId]);
+    if (events[0]?.status !== 'DRAFT') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'only_draft_events_can_be_deleted' });
+    }
+    // A hold is purchase history, which is kept. A draft cannot be on sale, so this is rare.
+    const [holds] = await connection.query<mysql.RowDataPacket[]>('SELECT 1 FROM inventory_holds WHERE event_id = ? LIMIT 1', [eventId]);
+    if (holds.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'event_has_reservation_history' });
+    }
+    // None of these foreign keys cascade, so remove the draft's own rows first.
+    for (const table of ['seats', 'inventory_items', 'event_grid_settings', 'event_team_memberships']) {
+      await connection.execute(`DELETE FROM ${table} WHERE event_id = ?`, [eventId]);
+    }
+    await connection.execute('DELETE FROM events WHERE event_id = ?', [eventId]);
+    await connection.commit();
+    return res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to delete event', error);
+    return res.status(502).json({ error: 'event_delete_failed' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.get('/events/:eventId/users', async (req, res) => {
@@ -592,18 +548,18 @@ app.get('/events/:eventId/users', async (req, res) => {
   }
 });
 
-/** Looks up a member's display name from Cognito by their `sub` (stored as
- * `user_sub`, which is also their Cognito Username for this user pool).
- * Falls back to an empty name — never fails the whole roster over one bad
- * lookup (e.g. a deleted Cognito user still on the roster). */
-async function lookUpMemberName(userSub: string): Promise<string> {
-  if (!configured) return '';
+/** Looks up a user's display name and email from Cognito by their `sub`
+ * (stored as `user_sub`, which is also their Cognito Username for this user
+ * pool). Falls back to empty strings — never fails the whole roster over one
+ * bad lookup (e.g. a deleted Cognito user still on the roster). */
+async function lookUpCognitoProfile(userSub: string): Promise<{ name: string; email: string }> {
+  if (!configured) return { name: '', email: '' };
   try {
     const user = await cognito.send(new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: userSub }));
-    return attribute(user.UserAttributes, 'name');
+    return { name: attribute(user.UserAttributes, 'name'), email: attribute(user.UserAttributes, 'email') };
   } catch (error) {
-    console.error(`failed to look up Cognito name for ${userSub}`, error);
-    return '';
+    console.error(`failed to look up Cognito profile for ${userSub}`, error);
+    return { name: '', email: '' };
   }
 }
 
@@ -615,8 +571,13 @@ app.get('/events/:eventId/team-members', async (req, res) => {
     "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? ORDER BY role, user_email",
     [eventId],
   );
+  // Owners of events created before the email was stored have user_email
+  // '', so fall back to the email Cognito has for them.
   const withNames = await Promise.all(
-    members.map(async (member) => ({ ...member, name: await lookUpMemberName(String(member.user_sub)) })),
+    members.map(async (member) => {
+      const profile = await lookUpCognitoProfile(String(member.user_sub));
+      return { ...member, user_email: member.user_email || profile.email, name: profile.name };
+    }),
   );
   res.json({ members: withNames });
 });

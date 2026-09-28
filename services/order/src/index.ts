@@ -54,6 +54,7 @@ interface CreateOrderInput {
   readonly seatIds?: unknown;
   readonly admissionToken?: unknown;
   readonly customerEmail?: unknown;
+  readonly customerName?: unknown;
 }
 interface PaymentInput { readonly paymentToken?: unknown }
 interface CancellationInput { readonly reason?: unknown }
@@ -79,6 +80,7 @@ interface LoadedOrder {
   readonly event_id: number;
   readonly customer_sub: string;
   readonly customer_email: string;
+  readonly customer_name: string;
   readonly hold_id: number;
   readonly status: string;
   readonly total_amount_cents: number;
@@ -111,6 +113,11 @@ function positiveInteger(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+// Display/door-lookup data supplied by the client; never use it for authorisation.
+export function cleanCustomerName(value: string): string {
+  return Array.from(value.replace(/\p{Cc}/gu, ' ').replace(/\s+/g, ' ').trim()).slice(0, 255).join('').trim();
+}
+
 function parseCreateOrder(input: CreateOrderInput): {
   holdId: number | null;
   eventId: number | null;
@@ -119,6 +126,7 @@ function parseCreateOrder(input: CreateOrderInput): {
   seatIds: number[];
   admissionToken: string | null;
   customerEmail: string;
+  customerName: string;
 } | null {
   const holdId = input.holdId === undefined ? null : positiveInteger(input.holdId);
   const eventId = input.eventId === undefined ? null : positiveInteger(input.eventId);
@@ -131,12 +139,14 @@ function parseCreateOrder(input: CreateOrderInput): {
     ? input.admissionToken.trim() || null : null;
   const customerEmail = typeof input.customerEmail === 'string' ? input.customerEmail.trim().toLowerCase() : '';
   if (seatIds.some((id) => id === null) || new Set(seatIds).size !== seatIds.length || seatIds.length > 50) return null;
+  if (input.customerName !== undefined && input.customerName !== null && typeof input.customerName !== 'string') return null;
+  const customerName = typeof input.customerName === 'string' ? cleanCustomerName(input.customerName) : '';
   if (customerEmail && (customerEmail.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) return null;
   if (holdId && !eventId && !quantity && seatIds.length === 0) {
-    return { holdId, eventId: null, inventoryItemId, quantity: null, seatIds: [], admissionToken, customerEmail };
+    return { holdId, eventId: null, inventoryItemId, quantity: null, seatIds: [], admissionToken, customerEmail, customerName };
   }
   if (!eventId || !quantity || quantity > 50 || (seatIds.length > 0 && seatIds.length !== quantity)) return null;
-  return { holdId: null, eventId, inventoryItemId, quantity, seatIds: seatIds as number[], admissionToken, customerEmail };
+  return { holdId: null, eventId, inventoryItemId, quantity, seatIds: seatIds as number[], admissionToken, customerEmail, customerName };
 }
 
 async function authenticate(req: express.Request): Promise<Caller | null> {
@@ -168,14 +178,6 @@ async function hasEventRole(eventId: number, sub: string, roles: readonly string
     [eventId, sub, ...roles],
   );
   return rows.length > 0;
-}
-
-export function isEventTeamPurchase(
-  eventOrganiserSub: unknown,
-  acceptedMembershipCount: number,
-  customerSub: string,
-): boolean {
-  return String(eventOrganiserSub ?? '') === customerSub || acceptedMembershipCount > 0;
 }
 
 /**
@@ -227,7 +229,7 @@ export function selectAvailableZone(
 
 async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
   const [orders] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.hold_id, o.status,
+    `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.customer_name, o.hold_id, o.status,
        o.total_amount_cents, o.currency, o.created_at, o.paid_at,
        h.expires_at AS reservation_expires_at
      FROM orders o
@@ -381,21 +383,11 @@ app.post('/orders', async (req, res) => {
       eventId = Number(hold.event_id);
     }
     const [events] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT event_id, organiser_sub, tier, status, starts_at < UTC_TIMESTAMP() AS has_started
+      `SELECT event_id, tier, status, starts_at < UTC_TIMESTAMP() AS has_started
        FROM event_inventory.events WHERE event_id = ? LIMIT 1`, [eventId],
     );
     const event = events[0];
     if (!event) { await connection.rollback(); return res.status(404).json({ error: 'event_not_found' }); }
-    const [teamMemberships] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT membership_id FROM event_inventory.event_team_memberships
-       WHERE event_id = ? AND user_sub = ? AND role IN ('ORGANISER', 'HELPER')
-         AND invite_status = 'ACCEPTED' LIMIT 1`,
-      [eventId, caller.sub],
-    );
-    if (isEventTeamPurchase(event.organiser_sub, teamMemberships.length, caller.sub)) {
-      await connection.rollback();
-      return res.status(403).json({ error: 'event_team_cannot_purchase' });
-    }
     const saleBlock = saleBlockReason(event);
     if (saleBlock) { await connection.rollback(); return res.status(409).json({ error: saleBlock }); }
 
@@ -470,8 +462,8 @@ app.post('/orders', async (req, res) => {
     if (items.length === 0) { await connection.rollback(); return res.status(409).json({ error: 'hold_has_no_inventory' }); }
     const totalAmountCents = items.reduce((total, item) => total + item.quantity * item.unitPriceCents, 0);
     const [insert] = await connection.execute<mysql.ResultSetHeader>(
-      `INSERT INTO orders (event_id, customer_sub, customer_email, hold_id, total_amount_cents)
-       VALUES (?, ?, ?, ?, ?)`, [eventId, caller.sub, customerEmail, holdId, totalAmountCents],
+      `INSERT INTO orders (event_id, customer_sub, customer_email, customer_name, hold_id, total_amount_cents)
+       VALUES (?, ?, ?, ?, ?, ?)`, [eventId, caller.sub, customerEmail, input.customerName, holdId, totalAmountCents],
     );
     for (const item of items) {
       await connection.execute(
@@ -510,7 +502,7 @@ async function publishOrderPaid(order: NonNullable<Awaited<ReturnType<typeof loa
     MessageBody: JSON.stringify({
       type: 'OrderPaid', version: 1, occurredAt: new Date().toISOString(),
       orderId: Number(order.order_id), eventId: Number(order.event_id), customerSub: order.customer_sub,
-      customerEmail: order.customer_email, paidAt: order.paid_at, items: order.items,
+      customerEmail: order.customer_email, customerName: order.customer_name ?? '', paidAt: order.paid_at, items: order.items,
     }),
   }));
 }
@@ -812,16 +804,10 @@ app.get('/customers/me/orders', async (req, res) => {
      INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
      LEFT JOIN order_items i ON i.order_id = o.order_id
      WHERE o.customer_sub = ?
-       AND (e.organiser_sub IS NULL OR e.organiser_sub <> ?)
-       AND NOT EXISTS (
-         SELECT 1 FROM event_inventory.event_team_memberships etm
-         WHERE etm.event_id = o.event_id AND etm.user_sub = o.customer_sub
-           AND etm.role IN ('ORGANISER', 'HELPER') AND etm.invite_status = 'ACCEPTED'
-       )
      GROUP BY o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
        o.total_amount_cents, o.currency, o.created_at, o.paid_at, h.expires_at,
        e.title, e.venue, e.starts_at
-     ORDER BY o.created_at DESC`, [caller.sub, caller.sub],
+     ORDER BY o.created_at DESC`, [caller.sub],
   );
   return res.json({ orders });
 });
@@ -852,7 +838,7 @@ app.get('/events/:eventId/attendees', async (req, res) => {
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!(await hasEventRole(eventId, caller.sub, ['ORGANISER']))) return res.status(403).json({ error: 'event_organiser_required' });
   const [attendees] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT o.order_id, o.customer_sub, o.customer_email, o.paid_at, i.description, i.quantity, i.seat_id
+    `SELECT o.order_id, o.customer_sub, o.customer_email, o.customer_name, o.paid_at, i.description, i.quantity, i.seat_id
      FROM orders o INNER JOIN order_items i ON i.order_id = o.order_id
      WHERE o.event_id = ? AND o.status = 'PAID' ORDER BY o.paid_at, o.order_id, i.order_item_id`, [eventId],
   );

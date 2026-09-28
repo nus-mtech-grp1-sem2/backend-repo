@@ -30,7 +30,7 @@ describe('asynchronous mock payments', () => {
     });
   });
   function scriptOrder(status = 'PENDING', seated = false) {
-    const order = { order_id: 42, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com', hold_id: 10, status, total_amount_cents: 4000, currency: 'SGD' };
+    const order = { order_id: 42, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com', customer_name: 'Alice Tan', hold_id: 10, status, total_amount_cents: 4000, currency: 'SGD' };
     db.on(/FROM orders .*order_id = \?/, [order]);
     db.on(/FROM order_items/, []);
     db.on(/FROM payments/, []);
@@ -92,6 +92,7 @@ describe('asynchronous mock payments', () => {
       assert.equal(sends.length, 2, 'replay republishes OrderPaid so issuance can recover');
       assert.equal((sends[0] as SendMessageCommand).input.QueueUrl, 'https://sqs.invalid/tickets');
       assert.equal((sends[0] as SendMessageCommand).input.DelaySeconds, 10);
+      assert.equal(JSON.parse((sends[0] as SendMessageCommand).input.MessageBody!).customerName, 'Alice Tan');
       for (const call of db.calls.filter((call) => /UPDATE `queue`/.test(call.sql))) {
         assert.match(call.sql, /e.token_expires_at = \(SELECT expires_at/);
         assert.equal(call.params[2], 10, 'a replay may only release this order\'s checkout');

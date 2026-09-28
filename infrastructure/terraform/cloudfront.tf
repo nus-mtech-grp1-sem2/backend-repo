@@ -4,6 +4,15 @@
 # needs no build-time override, and Kong's cors plugin is unnecessary
 # (removed from kong.yml) — there's no cross-origin call to allow.
 
+# Angular client-side routing for the S3 behavior only; see the function file.
+resource "aws_cloudfront_function" "spa_routing" {
+  name    = "${local.name_prefix}-spa-routing"
+  runtime = "cloudfront-js-2.0"
+  comment = "Serve index.html for Angular routes (paths without a file extension)"
+  publish = true
+  code    = file("${path.module}/functions/spa-routing.js")
+}
+
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   default_root_object = "index.html"
@@ -33,6 +42,11 @@ resource "aws_cloudfront_distribution" "frontend" {
     allowed_methods        = ["GET", "HEAD"]
     cached_methods         = ["GET", "HEAD"]
     cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6" # AWS managed: CachingOptimized
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.spa_routing.arn
+    }
   }
 
   ordered_cache_behavior {
@@ -45,19 +59,9 @@ resource "aws_cloudfront_distribution" "frontend" {
     origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # AWS managed: AllViewerExceptHostHeader
   }
 
-  # Angular client-side routing: unknown deep-link paths 403/404 from S3
-  # should still serve index.html so the SPA router can take over.
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
+  # No custom_error_response: those apply to every behavior, so they turned
+  # the API's 403/404 JSON errors into 200 + index.html. Deep links are
+  # served by the spa_routing function on the S3 behavior instead.
 
   restrictions {
     geo_restriction {

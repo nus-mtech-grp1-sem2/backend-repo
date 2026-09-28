@@ -26,6 +26,22 @@ Or directly:
 docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
+## Running with a local, disposable MySQL
+
+`DB_HOST=mysql` in `.env` refers to a `mysql` service that only `docker-compose.override.yml`
+defines, so load both files (`-f` on the base file alone does not pick the override up):
+
+```bash
+docker compose -f infrastructure/docker-compose.yml \
+  -f infrastructure/docker-compose.override.yml --env-file .env up -d --build
+```
+
+A fresh data volume runs the init scripts listed in the override, so it gets the full schema. Init
+scripts only run on an empty volume: after adding a migration, or to reset the data, run the same
+command with `down -v` and start again. The stack needs no AWS credentials: with the queue URLs
+empty, payment and ticket issuance run in-process. To keep your `~/.aws` out of the containers,
+set `AWS_SHARED_CONFIG_DIR` in `.env` to an empty directory.
+
 ## Testing against the shared AWS database
 
 By default `.env`'s `DB_HOST=mysql` points the `auth` service at the local
