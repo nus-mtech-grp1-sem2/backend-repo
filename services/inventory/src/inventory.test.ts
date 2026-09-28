@@ -367,3 +367,59 @@ test('a zone with only expired/released hold history cannot be dropped — 409, 
     await destroyFixture(fixture.eventId);
   }
 });
+
+test('a customer can list a GA event\'s ticket tiers with remaining capacity, without organiser access', async () => {
+  const fixture = await createEventFixture('TIER1_GA', 'DRAFT');
+  try {
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 20, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 4, gridColSpan: 5 },
+          { name: 'VIP', price: 50, color: '#DC2626', gridRow: 4, gridCol: 0, gridRowSpan: 2, gridColSpan: 4 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const { zones: seededZones } = await getRes.json();
+    const gaZone = seededZones.find((z: { name: string }) => z.name === 'General Admission');
+    // Sell 3 GA tickets so remaining capacity actually differs from total_qty.
+    await testPool.execute('UPDATE inventory_items SET sold_qty = 3 WHERE inventory_item_id = ?', [gaZone.inventoryItemId]);
+    // Zones are configured while DRAFT (PUT is locked once PUBLISHED); the
+    // event goes on sale afterwards, same as the real organiser flow.
+    await testPool.execute("UPDATE events SET status = 'PUBLISHED' WHERE event_id = ?", [fixture.eventId]);
+
+    const customerRes = await fetch(`${baseUrl}/events/${fixture.eventId}/zones`, {
+      headers: authHeader('some-customer-sub'),
+    });
+    assert.equal(customerRes.status, 200);
+    const body = await customerRes.json();
+    assert.equal(body.zones.length, 2);
+
+    const ga = body.zones.find((z: { name: string }) => z.name === 'General Admission');
+    assert.equal(ga.priceCents, 2000);
+    assert.equal(ga.color, '#2563EB');
+    assert.equal(ga.remaining, 17); // 20 capacity - 3 sold
+
+    const vip = body.zones.find((z: { name: string }) => z.name === 'VIP');
+    assert.equal(vip.priceCents, 5000);
+    assert.equal(vip.remaining, 8);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('listing ticket tiers requires authentication', async () => {
+  const fixture = await createEventFixture('TIER1_GA', 'PUBLISHED');
+  try {
+    const res = await fetch(`${baseUrl}/events/${fixture.eventId}/zones`);
+    assert.equal(res.status, 401);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});

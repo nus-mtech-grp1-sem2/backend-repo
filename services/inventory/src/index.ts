@@ -472,6 +472,37 @@ app.get('/events/:eventId/inventory', async (req, res) => {
   });
 });
 
+/**
+ * Customer-facing ticket tiers: every zone's price/colour and remaining
+ * capacity, without the organiser-only seat/grid detail `GET .../inventory`
+ * exposes. Any authenticated caller may see this — organiser status isn't
+ * required to browse what's for sale.
+ */
+app.get('/events/:eventId/zones', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  if (!(await requireAuthenticated(req, res))) return;
+  const event = await fetchEvent(eventId);
+  if (!event) return res.status(404).json({ error: 'event_not_found' });
+
+  const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT inventory_item_id, name, price_cents, color, total_qty, reserved_qty, sold_qty ' +
+      'FROM inventory_items WHERE event_id = ? ORDER BY inventory_item_id',
+    [eventId],
+  );
+
+  res.json({
+    zones: zoneRows.map((zone) => ({
+      inventoryItemId: zone.inventory_item_id,
+      name: zone.name,
+      priceCents: zone.price_cents,
+      color: zone.color,
+      remaining: zone.total_qty - zone.reserved_qty - zone.sold_qty,
+    })),
+  });
+});
+
 app.put('/events/:eventId/inventory', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const eventId = validEventId(req.params.eventId);
