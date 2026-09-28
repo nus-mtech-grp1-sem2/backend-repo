@@ -192,6 +192,39 @@ export function saleBlockReason(
   return Number(event['has_started']) === 1 ? 'event_completed' : null;
 }
 
+export interface ZoneCandidate {
+  readonly inventoryItemId: number;
+  readonly priceCents: number;
+  readonly totalQty: number;
+  readonly reservedQty: number;
+  readonly soldQty: number;
+}
+
+/**
+ * A GA event can have several zones/tiers (e.g. 20 cheap seats, 8 pricier
+ * ones). Without a requested zone, pick the cheapest one that still has
+ * enough capacity — airline-style fare-class fallback — rather than always
+ * the first-created zone, which previously 409'd once it sold out even
+ * though a pricier zone still had room.
+ */
+export function selectAvailableZone(
+  zones: readonly ZoneCandidate[],
+  quantity: number,
+  requestedInventoryItemId: number | null,
+): ZoneCandidate | null {
+  const hasCapacity = (zone: ZoneCandidate): boolean =>
+    zone.totalQty - zone.reservedQty - zone.soldQty >= quantity;
+
+  if (requestedInventoryItemId !== null) {
+    const zone = zones.find((z) => z.inventoryItemId === requestedInventoryItemId);
+    return zone && hasCapacity(zone) ? zone : null;
+  }
+
+  const cheapestFirst = [...zones].sort((a, b) =>
+    a.priceCents - b.priceCents || a.inventoryItemId - b.inventoryItemId);
+  return cheapestFirst.find(hasCapacity) ?? null;
+}
+
 async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
   const [orders] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.hold_id, o.status,
@@ -398,27 +431,38 @@ app.post('/orders', async (req, res) => {
         );
         hold = { hold_id: insert.insertId, event_id: eventId!, inventory_item_id: null, quantity: input.quantity! };
       } else {
-        const itemSelector = input.inventoryItemId ? 'inventory_item_id = ? AND event_id = ?' : 'event_id = ?';
-        const params = input.inventoryItemId ? [input.inventoryItemId, eventId] : [eventId];
+        // Fetch every zone for the event (not just the first-created one) so
+        // that a sold-out cheap tier doesn't block sales of a pricier tier
+        // that still has capacity — see selectAvailableZone.
         const [inventory] = await connection.query<mysql.RowDataPacket[]>(
-          `SELECT inventory_item_id, total_qty, reserved_qty, sold_qty FROM event_inventory.inventory_items
-           WHERE ${itemSelector} ORDER BY inventory_item_id LIMIT 1 FOR UPDATE`, params,
+          `SELECT inventory_item_id, price_cents, total_qty, reserved_qty, sold_qty FROM event_inventory.inventory_items
+           WHERE event_id = ? FOR UPDATE`, [eventId],
         );
-        const item = inventory[0];
-        if (!item || Number(item.total_qty) - Number(item.reserved_qty) - Number(item.sold_qty) < input.quantity!) {
+        const item = selectAvailableZone(
+          inventory.map((row) => ({
+            inventoryItemId: Number(row.inventory_item_id),
+            priceCents: Number(row.price_cents),
+            totalQty: Number(row.total_qty),
+            reservedQty: Number(row.reserved_qty),
+            soldQty: Number(row.sold_qty),
+          })),
+          input.quantity!,
+          input.inventoryItemId,
+        );
+        if (!item) {
           await connection.rollback(); return res.status(409).json({ error: 'inventory_unavailable' });
         }
         await connection.execute(
           'UPDATE event_inventory.inventory_items SET reserved_qty = reserved_qty + ?, version = version + 1 WHERE inventory_item_id = ?',
-          [input.quantity, item.inventory_item_id],
+          [input.quantity, item.inventoryItemId],
         );
         const [insert] = await connection.execute<mysql.ResultSetHeader>(
           `INSERT INTO event_inventory.inventory_holds (event_id, inventory_item_id, customer_sub, quantity, expires_at)
            VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ${RESERVATION_TIMEOUT_MINUTES} MINUTE))`,
-          [eventId, item.inventory_item_id, caller.sub, input.quantity],
+          [eventId, item.inventoryItemId, caller.sub, input.quantity],
         );
         holdId = insert.insertId;
-        hold = { hold_id: insert.insertId, event_id: eventId!, inventory_item_id: Number(item.inventory_item_id), quantity: input.quantity! };
+        hold = { hold_id: insert.insertId, event_id: eventId!, inventory_item_id: item.inventoryItemId, quantity: input.quantity! };
       }
     }
 
