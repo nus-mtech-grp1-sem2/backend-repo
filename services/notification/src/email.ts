@@ -1,6 +1,10 @@
 import nodemailer, { type Transporter } from "nodemailer";
 import QRCode from "qrcode";
-import type { OrderConfirmationRequest, OrderConfirmationTicket } from "./types.js";
+import type {
+  EventCancellationRequest,
+  OrderConfirmationRequest,
+  OrderConfirmationTicket,
+} from "./types.js";
 
 const SENDER_NAME = "OneStage";
 
@@ -34,6 +38,17 @@ export function ticketConfirmationSubject(
 ): string {
   const subject = `Your OneStage booking is confirmed — Order #${orderId}`;
   return totalTickets > 1 ? `${subject}, Ticket ${ticketNumber} of ${totalTickets}` : subject;
+}
+
+/** Subject of an order's cancellation email. Also what is stored in email_notifications.subject. */
+export function eventCancellationSubject(orderId: number, eventTitle: string): string {
+  return `Event cancelled: ${eventTitle} — Order #${orderId}`;
+}
+
+/** "SGD 50.00": the order's currency code and amount. */
+export function formatAmount(amountCents: number, currency: string): string {
+  const amount = (amountCents / 100).toFixed(2);
+  return `${currency.toUpperCase()} ${amount}`;
 }
 
 /** Tells apart the separate emails of one booking; a lone general-admission ticket needs no caption. */
@@ -94,6 +109,46 @@ function renderTicketConfirmationText(payload: OrderConfirmationRequest): string
   ].join("\n");
 }
 
+// Payment is simulated, so no money moves: the refund is a status shown to the customer, nothing more.
+const REFUND_STATUS = "Refund initiated";
+const REFUND_NOTE = "A full refund will be returned to your original payment method.";
+
+function cancellationLines(payload: EventCancellationRequest): string[] {
+  const tickets = payload.ticketCount === 1 ? "1 ticket" : `${payload.ticketCount} tickets`;
+  return [
+    `Event Name: ${payload.event.title}`,
+    `Location: ${payload.event.venue}`,
+    `Date/Time: ${formatStartsAt(payload.event.startsAt)}`,
+    `Order: #${payload.orderId} (${tickets})`,
+  ];
+}
+
+function renderEventCancellationHtml(payload: EventCancellationRequest): string {
+  const details = cancellationLines(payload)
+    .map((line) => `<div>${escapeHtml(line)}</div>`)
+    .join("");
+  return `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#111;font-size:15px;line-height:1.6;">
+      <p>We're sorry — this event has been cancelled by the organiser. Your tickets are no longer valid and cannot be used for entry.</p>
+      ${details}
+      <div style="margin-top:24px;">Refund Amount: ${escapeHtml(formatAmount(payload.refund.amountCents, payload.refund.currency))}</div>
+      <div>Refund Status: ${REFUND_STATUS}</div>
+      <p>${REFUND_NOTE}</p>
+    </div>`;
+}
+
+function renderEventCancellationText(payload: EventCancellationRequest): string {
+  return [
+    "We're sorry — this event has been cancelled by the organiser. Your tickets are no longer valid and cannot be used for entry.",
+    "",
+    ...cancellationLines(payload),
+    "",
+    `Refund Amount: ${formatAmount(payload.refund.amountCents, payload.refund.currency)}`,
+    `Refund Status: ${REFUND_STATUS}`,
+    REFUND_NOTE,
+  ].join("\n");
+}
+
 export class EmailService {
   private readonly transporter: Transporter;
   private readonly fromAddress: string;
@@ -134,6 +189,17 @@ export class EmailService {
       text: renderTicketConfirmationText(payload),
       html: renderTicketConfirmationHtml(payload, ticket, ticketNumber, totalTickets, qr.cid),
       attachments: [qr],
+    });
+  }
+
+  /** Tells the customer their event is cancelled, their tickets are void, and a refund is on its way. */
+  async sendEventCancellation(payload: EventCancellationRequest): Promise<void> {
+    await this.transporter.sendMail({
+      from: `"${SENDER_NAME}" <${this.fromAddress}>`,
+      to: payload.customerEmail,
+      subject: eventCancellationSubject(payload.orderId, payload.event.title),
+      text: renderEventCancellationText(payload),
+      html: renderEventCancellationHtml(payload),
     });
   }
 }

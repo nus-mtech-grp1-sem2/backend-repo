@@ -5,9 +5,11 @@ import {
   app,
   checkinInput,
   createQrToken,
+  notifyEventCancelled,
   notifyOrderConfirmed,
   parseOrderPaid,
   parseSearchQuery,
+  reconcileCancelledEvents,
   reconcilePaidOrders,
   verifyScannerSession,
 } from './index.js';
@@ -249,5 +251,108 @@ describe('booking confirmation email hook', () => {
     } finally {
       logged.mock.restore();
     }
+  });
+});
+
+describe('event cancellation email hook', () => {
+  const payload = {
+    orderId: 42,
+    eventId: 7,
+    customerSub: 'customer-sub',
+    customerEmail: 'buyer@example.com',
+    event: { title: 'Event NUS', venue: 'NUS ISS', startsAt: '2026-09-16T16:23:00.000Z' },
+    ticketCount: 2,
+    refund: { amountCents: 5000, currency: 'SGD' },
+  };
+
+  it('posts the cancellation to the notification service', async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const requester = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ orderId: 42, notification: { status: 'SENT' } }), { status: 201 });
+    }) as typeof fetch;
+
+    assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006/', requester), true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, 'http://notification:3006/notifications/event-cancellation');
+    assert.equal(calls[0]?.init.method, 'POST');
+    assert.deepEqual(JSON.parse(String(calls[0]?.init.body)), payload);
+  });
+
+  it('logs an email that was not delivered, but still counts the request as accepted', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    try {
+      const requester = (async () =>
+        new Response(JSON.stringify({ notification: { status: 'FAILED', errorMessage: 'smtp exploded' } }), {
+          status: 201,
+        })) as typeof fetch;
+      assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006', requester), true);
+      assert.deepEqual(logged.mock.calls[0]?.arguments[1], { orderId: 42, reason: 'smtp exploded' });
+    } finally {
+      logged.mock.restore();
+    }
+  });
+
+  it('sends nothing for an order that is not a paid order of a cancelled event', async () => {
+    let requested = false;
+    const requester = (async () => {
+      requested = true;
+      return new Response('{}', { status: 201 });
+    }) as typeof fetch;
+    assert.equal(await notifyEventCancelled(42, async () => null, 'http://notification:3006', requester), false);
+    assert.equal(requested, false);
+  });
+
+  it('never throws', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    try {
+      const serverError = (async () => new Response('{}', { status: 500 })) as typeof fetch;
+      assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006', serverError), false);
+      assert.equal(
+        await notifyEventCancelled(42, async () => { throw new Error('db down'); }, 'http://notification:3006'),
+        false,
+      );
+    } finally {
+      logged.mock.restore();
+    }
+  });
+});
+
+describe('cancelled event sweep', () => {
+  it('voids stray tickets, then tells each paid order that has not been told yet', async () => {
+    const notified: number[] = [];
+    const result = await reconcileCancelledEvents(
+      50,
+      async () => 1,
+      async (limit) => {
+        assert.equal(limit, 50);
+        return [11, 12, 13];
+      },
+      async (orderId) => {
+        notified.push(orderId);
+        return orderId !== 12;
+      },
+      'http://notification:3006',
+    );
+
+    assert.deepEqual(notified, [11, 12, 13]);
+    assert.deepEqual(result, { voidedTickets: 1, matchedOrders: 3, notifiedOrders: 2 });
+  });
+
+  it('still voids tickets when no notification service is configured, but looks for no one to email', async () => {
+    let looked = false;
+    const result = await reconcileCancelledEvents(
+      50,
+      async () => 4,
+      async () => {
+        looked = true;
+        return [11];
+      },
+      async () => true,
+      '',
+    );
+
+    assert.equal(looked, false);
+    assert.deepEqual(result, { voidedTickets: 4, matchedOrders: 0, notifiedOrders: 0 });
   });
 });

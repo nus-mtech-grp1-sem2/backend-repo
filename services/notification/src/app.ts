@@ -1,8 +1,15 @@
 import express, { type Request, type Response } from "express";
-import { EmailService, ticketConfirmationSubject } from "./email.js";
-import { listByOrderId, findByTicketId, upsertOutcome } from "./notificationRepository.js";
+import { EmailService, eventCancellationSubject, ticketConfirmationSubject } from "./email.js";
+import {
+  claimCancellation,
+  findByTicketId,
+  findCancellationByOrderId,
+  listByOrderId,
+  recordOutcome,
+  upsertOutcome,
+} from "./notificationRepository.js";
 import type { EmailNotificationRecord, NotificationStatus } from "./types.js";
-import { validateOrderConfirmation } from "./validation.js";
+import { validateEventCancellation, validateOrderConfirmation } from "./validation.js";
 
 const SERVICE = "notification";
 
@@ -77,6 +84,45 @@ export function createApp() {
     }
 
     res.status(attempted ? 201 : 200).json({ orderId: payload.orderId, notifications });
+  });
+
+  // Called by the ticket service for each paid order of a cancelled event. Sends
+  // one email per order: the event is cancelled, its tickets are void, and a
+  // refund is on its way. Sent at most once per order: an order that already has
+  // a cancellation row (SENT, FAILED, or still PENDING) is answered with that row
+  // and never emailed again, so a caller retry cannot double-email a customer.
+  app.post("/notifications/event-cancellation", async (req: Request, res: Response) => {
+    const payload = validateEventCancellation(req.body);
+    if (!payload) {
+      res.status(400).json({ error: "invalid event cancellation payload" });
+      return;
+    }
+
+    const existing = await findCancellationByOrderId(payload.orderId);
+    if (existing) {
+      res.status(200).json({ orderId: payload.orderId, notification: existing });
+      return;
+    }
+
+    const notificationId = await claimCancellation({
+      orderId: payload.orderId,
+      eventId: payload.eventId,
+      customerSub: payload.customerSub,
+      customerEmail: payload.customerEmail,
+      subject: eventCancellationSubject(payload.orderId, payload.event.title),
+    });
+
+    let status: NotificationStatus = "SENT";
+    let errorMessage: string | null = null;
+    try {
+      await getEmailService().sendEventCancellation(payload);
+    } catch (err) {
+      status = "FAILED";
+      errorMessage = err instanceof Error ? err.message : String(err);
+    }
+
+    const notification = await recordOutcome(notificationId, status, errorMessage);
+    res.status(201).json({ orderId: payload.orderId, notification });
   });
 
   app.get("/notifications/:orderId", async (req: Request, res: Response) => {

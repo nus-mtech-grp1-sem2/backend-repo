@@ -5,19 +5,28 @@ const findByTicketIdMock = vi.hoisted(() => vi.fn());
 const listByOrderIdMock = vi.hoisted(() => vi.fn());
 const upsertOutcomeMock = vi.hoisted(() => vi.fn());
 const sendTicketConfirmationMock = vi.hoisted(() => vi.fn());
+const findCancellationByOrderIdMock = vi.hoisted(() => vi.fn());
+const claimCancellationMock = vi.hoisted(() => vi.fn());
+const recordOutcomeMock = vi.hoisted(() => vi.fn());
+const sendEventCancellationMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./notificationRepository.js", () => ({
   findByTicketId: findByTicketIdMock,
   listByOrderId: listByOrderIdMock,
   upsertOutcome: upsertOutcomeMock,
+  findCancellationByOrderId: findCancellationByOrderIdMock,
+  claimCancellation: claimCancellationMock,
+  recordOutcome: recordOutcomeMock,
 }));
 
 vi.mock("./email.js", () => ({
   EmailService: vi.fn().mockImplementation(() => ({
     sendTicketConfirmation: sendTicketConfirmationMock,
+    sendEventCancellation: sendEventCancellationMock,
   })),
   ticketConfirmationSubject: (orderId: number, ticketNumber: number, total: number) =>
     `subject order ${orderId} ticket ${ticketNumber}/${total}`,
+  eventCancellationSubject: (orderId: number, title: string) => `cancelled ${title} order ${orderId}`,
 }));
 
 const { createApp } = await import("./app.js");
@@ -47,6 +56,24 @@ const record = (ticketId: number, status: string) => ({
   status,
 });
 
+const cancellationPayload = {
+  orderId: 123,
+  eventId: 45,
+  customerSub: "cognito-sub-1",
+  customerEmail: "buyer@example.com",
+  event: { title: "Concert Night", venue: "Esplanade", startsAt: "2026-10-01T19:00:00Z" },
+  ticketCount: 2,
+  refund: { amountCents: 10000, currency: "SGD" },
+};
+
+const cancellationRecord = (status: string) => ({
+  notificationId: 900,
+  orderId: 123,
+  ticketId: null,
+  type: "EVENT_CANCELLATION",
+  status,
+});
+
 const app = createApp();
 
 describe("notification service app", () => {
@@ -60,6 +87,14 @@ describe("notification service app", () => {
     upsertOutcomeMock.mockImplementation(async (input: { ticketId: number; status: string }) =>
       record(input.ticketId, input.status),
     );
+    findCancellationByOrderIdMock.mockReset();
+    claimCancellationMock.mockReset();
+    recordOutcomeMock.mockReset();
+    sendEventCancellationMock.mockReset();
+    findCancellationByOrderIdMock.mockResolvedValue(null);
+    claimCancellationMock.mockResolvedValue(900);
+    sendEventCancellationMock.mockResolvedValue(undefined);
+    recordOutcomeMock.mockImplementation(async (_id: number, status: string) => cancellationRecord(status));
   });
 
   it("GET /health reports the service is up", async () => {
@@ -183,6 +218,69 @@ describe("notification service app", () => {
       );
       expect(res.status).toBe(201);
       expect(res.body.notifications).toEqual([record(1, "FAILED"), record(2, "SENT")]);
+    });
+  });
+
+  describe("POST /notifications/event-cancellation", () => {
+    it("rejects an invalid payload without touching the repository or email", async () => {
+      const res = await request(app).post("/notifications/event-cancellation").send({ orderId: 123 });
+      expect(res.status).toBe(400);
+      expect(claimCancellationMock).not.toHaveBeenCalled();
+      expect(sendEventCancellationMock).not.toHaveBeenCalled();
+    });
+
+    it("records a PENDING row, sends one email for the order, then marks it SENT", async () => {
+      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+
+      expect(claimCancellationMock).toHaveBeenCalledWith({
+        orderId: 123,
+        eventId: 45,
+        customerSub: "cognito-sub-1",
+        customerEmail: "buyer@example.com",
+        subject: "cancelled Concert Night order 123",
+      });
+      expect(sendEventCancellationMock).toHaveBeenCalledTimes(1);
+      expect(sendEventCancellationMock).toHaveBeenCalledWith(cancellationPayload);
+      expect(recordOutcomeMock).toHaveBeenCalledWith(900, "SENT", null);
+      expect(claimCancellationMock.mock.invocationCallOrder[0]).toBeLessThan(
+        sendEventCancellationMock.mock.invocationCallOrder[0]!,
+      );
+      expect(res.status).toBe(201);
+      expect(res.body).toEqual({ orderId: 123, notification: cancellationRecord("SENT") });
+    });
+
+    it("never emails an order twice, whatever became of the first attempt", async () => {
+      for (const status of ["SENT", "FAILED", "PENDING"]) {
+        findCancellationByOrderIdMock.mockResolvedValue(cancellationRecord(status));
+
+        const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+
+        expect(res.status).toBe(200);
+        expect(res.body.notification).toEqual(cancellationRecord(status));
+      }
+      expect(claimCancellationMock).not.toHaveBeenCalled();
+      expect(sendEventCancellationMock).not.toHaveBeenCalled();
+    });
+
+    it("sends nothing when the row cannot be recorded first", async () => {
+      claimCancellationMock.mockRejectedValue(new Error("Data truncated for column 'type'"));
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+
+      expect(res.status).toBe(500);
+      expect(sendEventCancellationMock).not.toHaveBeenCalled();
+      logged.mockRestore();
+    });
+
+    it("records FAILED when the email cannot be sent", async () => {
+      sendEventCancellationMock.mockRejectedValue(new Error("smtp exploded"));
+
+      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+
+      expect(recordOutcomeMock).toHaveBeenCalledWith(900, "FAILED", "smtp exploded");
+      expect(res.status).toBe(201);
+      expect(res.body.notification).toEqual(cancellationRecord("FAILED"));
     });
   });
 

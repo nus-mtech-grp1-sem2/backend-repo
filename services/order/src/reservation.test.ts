@@ -122,4 +122,19 @@ describe('reservation cancellation and expiry', () => {
       error: 'reservation_not_cancellable',
     });
   });
+
+  it("leaves a cancelled event's orders out of the customer's own orders", async () => {
+    on(/WHERE o\.status = 'PENDING' AND h\.status = 'ACTIVE'/, []);
+    on(/FROM orders o INNER JOIN event_inventory\.events e/, [{ order_id: 42, status: 'PAID' }]);
+
+    const response = await fetch(`${base}/customers/me/orders`, {
+      headers: { authorization: 'Bearer alice' },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { orders: [{ order_id: 42, status: 'PAID' }] });
+    const listing = calls.find((call) => /FROM orders o INNER JOIN event_inventory\.events e/.test(call.sql));
+    assert.match(listing?.sql ?? '', /WHERE o\.customer_sub = \? AND e\.status <> 'CANCELLED'/);
+    assert.deepEqual(listing?.params, ['alice']);
+  });
 });

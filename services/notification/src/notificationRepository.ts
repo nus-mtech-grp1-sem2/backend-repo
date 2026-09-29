@@ -1,6 +1,6 @@
-import type { RowDataPacket } from "mysql2";
+import type { ResultSetHeader, RowDataPacket } from "mysql2";
 import { pool } from "./db.js";
-import type { EmailNotificationRecord, NotificationStatus } from "./types.js";
+import type { EmailNotificationRecord, NotificationStatus, NotificationType } from "./types.js";
 
 interface EmailNotificationRow extends RowDataPacket {
   notification_id: number;
@@ -9,7 +9,7 @@ interface EmailNotificationRow extends RowDataPacket {
   event_id: number;
   customer_sub: string;
   customer_email: string;
-  type: "ORDER_CONFIRMATION";
+  type: NotificationType;
   status: NotificationStatus;
   subject: string;
   error_message: string | null;
@@ -88,6 +88,65 @@ export async function upsertOutcome(input: UpsertOutcomeInput): Promise<EmailNot
   );
 
   const record = await findByTicketId(input.ticketId);
+  if (!record) {
+    throw new Error("failed to persist notification record");
+  }
+  return record;
+}
+
+async function findById(notificationId: number): Promise<EmailNotificationRecord | null> {
+  const [rows] = await pool.query<EmailNotificationRow[]>(
+    "SELECT * FROM email_notifications WHERE notification_id = ?",
+    [notificationId],
+  );
+  const row = rows[0];
+  return row ? toRecord(row) : null;
+}
+
+/** The cancellation email recorded for an order, if one was ever attempted. */
+export async function findCancellationByOrderId(orderId: number): Promise<EmailNotificationRecord | null> {
+  const [rows] = await pool.query<EmailNotificationRow[]>(
+    "SELECT * FROM email_notifications WHERE order_id = ? AND type = 'EVENT_CANCELLATION' ORDER BY notification_id LIMIT 1",
+    [orderId],
+  );
+  const row = rows[0];
+  return row ? toRecord(row) : null;
+}
+
+export interface ClaimCancellationInput {
+  orderId: number;
+  eventId: number;
+  customerSub: string;
+  customerEmail: string;
+  subject: string;
+}
+
+/**
+ * Records a PENDING cancellation email before it is sent. Writing first means a
+ * row that cannot be written (e.g. before the EVENT_CANCELLATION migration) stops
+ * the email from going out, so a caller that retries can never email twice.
+ */
+export async function claimCancellation(input: ClaimCancellationInput): Promise<number> {
+  const [result] = await pool.query<ResultSetHeader>(
+    `INSERT INTO email_notifications
+       (order_id, ticket_id, event_id, customer_sub, customer_email, type, status, subject)
+     VALUES (?, NULL, ?, ?, ?, 'EVENT_CANCELLATION', 'PENDING', ?)`,
+    [input.orderId, input.eventId, input.customerSub, input.customerEmail, input.subject],
+  );
+  return result.insertId;
+}
+
+/** Records whether a claimed email went out. */
+export async function recordOutcome(
+  notificationId: number,
+  status: NotificationStatus,
+  errorMessage: string | null,
+): Promise<EmailNotificationRecord> {
+  await pool.query(
+    "UPDATE email_notifications SET status = ?, error_message = ?, sent_at = ? WHERE notification_id = ?",
+    [status, errorMessage, status === "SENT" ? new Date() : null, notificationId],
+  );
+  const record = await findById(notificationId);
   if (!record) {
     throw new Error("failed to persist notification record");
   }
