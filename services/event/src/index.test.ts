@@ -456,6 +456,7 @@ describe('organiser endpoints', () => {
       on(/SELECT event_id FROM events WHERE event_id = \? FOR UPDATE/, [{ event_id: 5 }]);
       on(/UPDATE events SET status = 'CANCELLED'/, {});
       on(/UPDATE ticketing\.tickets SET status = 'VOID'/, {});
+      on(/UPDATE checkout\.orders SET status = 'CANCELLED'/, {});
     };
 
     it('cancels an event nobody has bought tickets to, without asking for confirmation', async () => {
@@ -496,6 +497,18 @@ describe('organiser endpoints', () => {
       assert.equal(voided.length, 1);
       assert.match(voided[0]!.sql, /WHERE event_id = \? AND status <> 'VOID'/);
       assert.deepEqual(voided[0]!.params, [5]);
+    });
+
+    it('marks the paid orders refunded, so cancelling again later only counts newer buyers', async () => {
+      isOrganiser();
+      sold(2, 3);
+      scriptCancel();
+      await request('POST', '/events/5/cancel', { token: 'alice', body: { confirm: true } });
+      const refunded = sqlMatching(/UPDATE checkout\.orders SET status = 'CANCELLED'/);
+      assert.equal(refunded.length, 1);
+      assert.match(refunded[0]!.sql, /WHERE event_id = \? AND status = 'PAID'/);
+      assert.deepEqual(refunded[0]!.params, [5]);
+      assert.match(sqlMatching(IMPACT)[0]!.sql, /o\.status = 'PAID'/, 'only orders still paid are counted');
     });
 
     it('rolls back and reports 502 when voiding the tickets fails, leaving the event live', async () => {

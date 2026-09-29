@@ -487,7 +487,10 @@ interface CancellationImpact {
   readonly ticketsSold: number;
 }
 
-/** Who has bought tickets to the event: every paid order, whether or not its tickets are issued yet. */
+/**
+ * Who a cancellation would affect now: every order still paid, whether or not its tickets are
+ * issued yet. Orders refunded by an earlier cancellation are CANCELLED, so they are not counted again.
+ */
 async function loadCancellationImpact(executor: mysql.Pool | mysql.PoolConnection, eventId: number): Promise<CancellationImpact> {
   const [[row]] = await executor.query<mysql.RowDataPacket[]>(
     `SELECT COUNT(DISTINCT o.customer_sub) AS customers, COALESCE(SUM(oi.quantity), 0) AS tickets_sold
@@ -511,10 +514,11 @@ app.get('/events/:eventId/cancellation-impact', async (req, res) => {
 });
 
 /**
- * Cancels the event and voids every ticket sold for it, so none can be scanned or
- * shown to its customer again. Once anyone has bought tickets, the organiser must
- * send { confirm: true }; without it the answer is 409 with who would be affected.
- * The ticket service then emails each paid order about the cancellation and refund.
+ * Cancels the event, voids every ticket sold for it so none can be scanned or shown
+ * to its customer again, and marks its paid orders CANCELLED: refunded, since they
+ * keep their paid_at. Once anyone has bought tickets, the organiser must send
+ * { confirm: true }; without it the answer is 409 with who would be affected.
+ * The ticket service then emails each refunded order about the cancellation.
  */
 app.post('/events/:eventId/cancel', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
@@ -535,6 +539,7 @@ app.post('/events/:eventId/cancel', async (req, res) => {
     }
     await connection.execute("UPDATE events SET status = 'CANCELLED' WHERE event_id = ?", [eventId]);
     await connection.execute("UPDATE ticketing.tickets SET status = 'VOID' WHERE event_id = ? AND status <> 'VOID'", [eventId]);
+    await connection.execute("UPDATE checkout.orders SET status = 'CANCELLED' WHERE event_id = ? AND status = 'PAID'", [eventId]);
     await connection.commit();
     res.status(204).end();
   } catch (error) {

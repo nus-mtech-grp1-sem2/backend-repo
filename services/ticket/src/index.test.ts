@@ -319,11 +319,11 @@ describe('event cancellation email hook', () => {
 });
 
 describe('cancelled event sweep', () => {
-  it('voids stray tickets, then tells each paid order that has not been told yet', async () => {
+  it('settles stray tickets and orders, then tells each refunded order that has not been told yet', async () => {
     const notified: number[] = [];
     const result = await reconcileCancelledEvents(
       50,
-      async () => 1,
+      async () => ({ voidedTickets: 1, refundedOrders: 1 }),
       async (limit) => {
         assert.equal(limit, 50);
         return [11, 12, 13];
@@ -336,14 +336,14 @@ describe('cancelled event sweep', () => {
     );
 
     assert.deepEqual(notified, [11, 12, 13]);
-    assert.deepEqual(result, { voidedTickets: 1, matchedOrders: 3, notifiedOrders: 2 });
+    assert.deepEqual(result, { voidedTickets: 1, refundedOrders: 1, matchedOrders: 3, notifiedOrders: 2 });
   });
 
-  it('still voids tickets when no notification service is configured, but looks for no one to email', async () => {
+  it('still settles when no notification service is configured, but looks for no one to email', async () => {
     let looked = false;
     const result = await reconcileCancelledEvents(
       50,
-      async () => 4,
+      async () => ({ voidedTickets: 4, refundedOrders: 2 }),
       async () => {
         looked = true;
         return [11];
@@ -353,6 +353,6 @@ describe('cancelled event sweep', () => {
     );
 
     assert.equal(looked, false);
-    assert.deepEqual(result, { voidedTickets: 4, matchedOrders: 0, notifiedOrders: 0 });
+    assert.deepEqual(result, { voidedTickets: 4, refundedOrders: 2, matchedOrders: 0, notifiedOrders: 0 });
   });
 });
