@@ -639,28 +639,42 @@ export interface EventCancellationPayload {
   refund: { amountCents: number; currency: string };
 }
 
+interface CancelledEventSettlement {
+  readonly voidedTickets: number;
+  readonly refundedOrders: number;
+}
+
 /**
- * Voids any ticket still live for a cancelled event. The event service voids them
- * when it cancels; this catches a ticket issued afterwards for an order paid just
- * before the cancel.
+ * Voids any ticket still live for a cancelled event and refunds any order still
+ * paid for one (CANCELLED, keeping its paid_at). The event service does both when
+ * it cancels; this catches an order paid, or a ticket issued, just after that.
  */
-async function voidTicketsOfCancelledEvents(): Promise<number> {
-  const [result] = await database.execute<mysql.ResultSetHeader>(
+async function settleCancelledEvents(): Promise<CancelledEventSettlement> {
+  const [tickets] = await database.execute<mysql.ResultSetHeader>(
     `UPDATE ticketing.tickets t
        JOIN event_inventory.events e ON e.event_id = t.event_id
         SET t.status = 'VOID'
       WHERE e.status = 'CANCELLED' AND t.status <> 'VOID'`,
   );
-  return result.affectedRows;
+  const [orders] = await database.execute<mysql.ResultSetHeader>(
+    `UPDATE checkout.orders o
+       JOIN event_inventory.events e ON e.event_id = o.event_id
+        SET o.status = 'CANCELLED'
+      WHERE e.status = 'CANCELLED' AND o.status = 'PAID'`,
+  );
+  return { voidedTickets: tickets.affectedRows, refundedOrders: orders.affectedRows };
 }
 
-/** Paid orders of cancelled events whose customer has not been emailed about it yet. */
+/**
+ * Orders refunded by an event cancellation (CANCELLED, but paid) whose customer has
+ * not been emailed about it yet. An unpaid reservation that was cancelled has no
+ * paid_at, so it is never emailed.
+ */
 async function findCancelledOrdersToNotify(limit: number): Promise<readonly number[]> {
   const [rows] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id
        FROM checkout.orders o
-       JOIN event_inventory.events e ON e.event_id = o.event_id
-      WHERE e.status = 'CANCELLED' AND o.status = 'PAID'
+      WHERE o.status = 'CANCELLED' AND o.paid_at IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM notification.email_notifications n
            WHERE n.order_id = o.order_id AND n.type = 'EVENT_CANCELLATION'
@@ -672,7 +686,7 @@ async function findCancelledOrdersToNotify(limit: number): Promise<readonly numb
   return rows.map((row) => Number(row.order_id)).filter((orderId) => Number.isSafeInteger(orderId) && orderId > 0);
 }
 
-/** Everything the cancellation email needs for one paid order. The refund is the whole amount paid. */
+/** Everything the cancellation email needs for one refunded order. The refund is the whole amount paid. */
 export async function loadEventCancellation(orderId: number): Promise<EventCancellationPayload | null> {
   const [orders] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.total_amount_cents, o.currency,
@@ -680,7 +694,7 @@ export async function loadEventCancellation(orderId: number): Promise<EventCance
             (SELECT COALESCE(SUM(oi.quantity), 0) FROM checkout.order_items oi WHERE oi.order_id = o.order_id) AS ticket_count
        FROM checkout.orders o
        INNER JOIN event_inventory.events e ON e.event_id = o.event_id
-      WHERE o.order_id = ? AND o.status = 'PAID' AND e.status = 'CANCELLED' LIMIT 1`,
+      WHERE o.order_id = ? AND o.status = 'CANCELLED' AND o.paid_at IS NOT NULL LIMIT 1`,
     [orderId],
   );
   const order = orders[0];
@@ -735,21 +749,20 @@ export async function notifyEventCancelled(
   }
 }
 
-interface CancellationSweepResult {
-  readonly voidedTickets: number;
+interface CancellationSweepResult extends CancelledEventSettlement {
   readonly matchedOrders: number;
   readonly notifiedOrders: number;
 }
 
-/** Makes sure every cancelled event's tickets are void and each of its paid orders is told. */
+/** Makes sure every cancelled event's tickets are void, its orders refunded, and each refunded order told. */
 export async function reconcileCancelledEvents(
   limit = 50,
-  voidTickets: () => Promise<number> = voidTicketsOfCancelledEvents,
+  settle: () => Promise<CancelledEventSettlement> = settleCancelledEvents,
   findOrders: (limit: number) => Promise<readonly number[]> = findCancelledOrdersToNotify,
   notify: (orderId: number) => Promise<boolean> = notifyEventCancelled,
   notificationUrl = NOTIFICATION_SERVICE_URL,
 ): Promise<CancellationSweepResult> {
-  const voidedTickets = await voidTickets();
+  const settled = await settle();
   // Without a notification service nothing could be sent, so there is nothing to look for.
   const orderIds = notificationUrl ? await findOrders(limit) : [];
   let notifiedOrders = 0;
@@ -757,7 +770,7 @@ export async function reconcileCancelledEvents(
   for (const orderId of orderIds) {
     if (await notify(orderId)) notifiedOrders += 1;
   }
-  return { voidedTickets, matchedOrders: orderIds.length, notifiedOrders };
+  return { ...settled, matchedOrders: orderIds.length, notifiedOrders };
 }
 
 let reconciliationRunning = false;
@@ -775,7 +788,7 @@ async function runPaidOrderReconciliation(): Promise<void> {
   }
   try {
     const result = await reconcileCancelledEvents();
-    if (result.voidedTickets > 0 || result.matchedOrders > 0) {
+    if (result.voidedTickets > 0 || result.refundedOrders > 0 || result.matchedOrders > 0) {
       console.log(JSON.stringify({ svc: SERVICE, operation: 'event-cancellation', ...result }));
     }
   } catch (error) {
