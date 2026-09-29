@@ -202,6 +202,7 @@ describe('organiser endpoints', () => {
       ['PUT', '/events/5', newEvent],
       ['POST', '/events/5/publish'],
       ['POST', '/events/5/cancel'],
+      ['GET', '/events/5/cancellation-impact'],
       ['DELETE', '/events/5'],
       ['GET', '/events/5/team-members'],
       ['DELETE', '/events/5/team-members/bob'],
@@ -448,12 +449,95 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/CANCELLED/).length, 0);
     });
 
-    it('cancels the event for an organiser', async () => {
-      isOrganiser();
+    const IMPACT = /FROM checkout\.orders o JOIN checkout\.order_items oi/;
+    const sold = (customers: number, ticketsSold: number) =>
+      on(IMPACT, [{ customers, tickets_sold: ticketsSold }]);
+    const scriptCancel = () => {
+      on(/SELECT event_id FROM events WHERE event_id = \? FOR UPDATE/, [{ event_id: 5 }]);
       on(/UPDATE events SET status = 'CANCELLED'/, {});
+      on(/UPDATE ticketing\.tickets SET status = 'VOID'/, {});
+    };
+
+    it('cancels an event nobody has bought tickets to, without asking for confirmation', async () => {
+      isOrganiser();
+      sold(0, 0);
+      scriptCancel();
       const response = await request('POST', '/events/5/cancel', { token: 'alice' });
       assert.equal(response.status, 204);
-      assert.deepEqual(sqlMatching(/CANCELLED/)[0]?.params, [5]);
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
+      assert.deepEqual(sqlMatching(/UPDATE events SET status = 'CANCELLED'/)[0]?.params, [5]);
+    });
+
+    it('asks for confirmation once customers have bought tickets, and changes nothing', async () => {
+      for (const body of [undefined, {}, { confirm: 'yes' }, { confirm: 1 }]) {
+        db.reset();
+        isOrganiser();
+        sold(2, 3);
+        scriptCancel();
+        const response = await request('POST', '/events/5/cancel', { token: 'alice', body });
+        assert.deepEqual(
+          response,
+          { status: 409, body: { error: 'cancellation_confirmation_required', customers: 2, ticketsSold: 3 } },
+          JSON.stringify(body),
+        );
+        assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+        assert.equal(sqlMatching(/^UPDATE/).length, 0);
+      }
+    });
+
+    it('once confirmed, cancels the event and voids every ticket sold for it in one transaction', async () => {
+      isOrganiser();
+      sold(2, 3);
+      scriptCancel();
+      const response = await request('POST', '/events/5/cancel', { token: 'alice', body: { confirm: true } });
+      assert.equal(response.status, 204);
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
+      const voided = sqlMatching(/UPDATE ticketing\.tickets SET status = 'VOID'/);
+      assert.equal(voided.length, 1);
+      assert.match(voided[0]!.sql, /WHERE event_id = \? AND status <> 'VOID'/);
+      assert.deepEqual(voided[0]!.params, [5]);
+    });
+
+    it('rolls back and reports 502 when voiding the tickets fails, leaving the event live', async () => {
+      mock.method(console, 'error', () => undefined);
+      isOrganiser();
+      sold(1, 1);
+      on(/SELECT event_id FROM events WHERE event_id = \? FOR UPDATE/, [{ event_id: 5 }]);
+      on(/UPDATE events SET status = 'CANCELLED'/, {});
+      on(/UPDATE ticketing\.tickets SET status = 'VOID'/, new Error('lock wait timeout'));
+      const response = await request('POST', '/events/5/cancel', { token: 'alice', body: { confirm: true } });
+      assert.deepEqual(response, { status: 502, body: { error: 'event_cancel_failed' } });
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+      mock.restoreAll();
+    });
+  });
+
+  describe('GET /events/:eventId/cancellation-impact', () => {
+    const IMPACT = /FROM checkout\.orders o JOIN checkout\.order_items oi/;
+
+    it('is refused for a non-organiser', async () => {
+      isNotOrganiser();
+      const response = await request('GET', '/events/5/cancellation-impact', { token: 'mallory' });
+      assert.equal(response.status, 403);
+      assert.equal(sqlMatching(IMPACT).length, 0);
+    });
+
+    it('reports how many customers and tickets a cancellation would affect', async () => {
+      isOrganiser();
+      on(IMPACT, [{ customers: 2, tickets_sold: '3' }]);
+      const response = await request('GET', '/events/5/cancellation-impact', { token: 'alice' });
+      assert.deepEqual(response, {
+        status: 200,
+        body: { eventId: 5, customers: 2, ticketsSold: 3, requiresConfirmation: true },
+      });
+      assert.match(sqlMatching(IMPACT)[0]!.sql, /o\.status = 'PAID'/);
+    });
+
+    it('needs no confirmation when nobody has bought tickets', async () => {
+      isOrganiser();
+      on(IMPACT, [{ customers: 0, tickets_sold: 0 }]);
+      const response = await request('GET', '/events/5/cancellation-impact', { token: 'alice' });
+      assert.equal(response.body?.requiresConfirmation, false);
     });
   });
 

@@ -496,7 +496,7 @@ export async function loadOrderConfirmation(orderId: number): Promise<OrderConfi
             e.title, e.venue, e.starts_at
        FROM checkout.orders o
        INNER JOIN event_inventory.events e ON e.event_id = o.event_id
-      WHERE o.order_id = ? AND o.status = 'PAID' LIMIT 1`,
+      WHERE o.order_id = ? AND o.status = 'PAID' AND e.status <> 'CANCELLED' LIMIT 1`,
     [orderId],
   );
   const order = orders[0];
@@ -629,6 +629,137 @@ export async function reconcilePaidOrders(
   return { matchedOrders: orderIds.length, issuedTickets, failedOrders };
 }
 
+export interface EventCancellationPayload {
+  orderId: number;
+  eventId: number;
+  customerSub: string;
+  customerEmail: string;
+  event: { title: string; venue: string; startsAt: string };
+  ticketCount: number;
+  refund: { amountCents: number; currency: string };
+}
+
+/**
+ * Voids any ticket still live for a cancelled event. The event service voids them
+ * when it cancels; this catches a ticket issued afterwards for an order paid just
+ * before the cancel.
+ */
+async function voidTicketsOfCancelledEvents(): Promise<number> {
+  const [result] = await database.execute<mysql.ResultSetHeader>(
+    `UPDATE ticketing.tickets t
+       JOIN event_inventory.events e ON e.event_id = t.event_id
+        SET t.status = 'VOID'
+      WHERE e.status = 'CANCELLED' AND t.status <> 'VOID'`,
+  );
+  return result.affectedRows;
+}
+
+/** Paid orders of cancelled events whose customer has not been emailed about it yet. */
+async function findCancelledOrdersToNotify(limit: number): Promise<readonly number[]> {
+  const [rows] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT o.order_id
+       FROM checkout.orders o
+       JOIN event_inventory.events e ON e.event_id = o.event_id
+      WHERE e.status = 'CANCELLED' AND o.status = 'PAID'
+        AND NOT EXISTS (
+          SELECT 1 FROM notification.email_notifications n
+           WHERE n.order_id = o.order_id AND n.type = 'EVENT_CANCELLATION'
+        )
+      ORDER BY o.order_id
+      LIMIT ?`,
+    [limit],
+  );
+  return rows.map((row) => Number(row.order_id)).filter((orderId) => Number.isSafeInteger(orderId) && orderId > 0);
+}
+
+/** Everything the cancellation email needs for one paid order. The refund is the whole amount paid. */
+export async function loadEventCancellation(orderId: number): Promise<EventCancellationPayload | null> {
+  const [orders] = await database.query<mysql.RowDataPacket[]>(
+    `SELECT o.order_id, o.event_id, o.customer_sub, o.customer_email, o.total_amount_cents, o.currency,
+            e.title, e.venue, e.starts_at,
+            (SELECT COALESCE(SUM(oi.quantity), 0) FROM checkout.order_items oi WHERE oi.order_id = o.order_id) AS ticket_count
+       FROM checkout.orders o
+       INNER JOIN event_inventory.events e ON e.event_id = o.event_id
+      WHERE o.order_id = ? AND o.status = 'PAID' AND e.status = 'CANCELLED' LIMIT 1`,
+    [orderId],
+  );
+  const order = orders[0];
+  if (!order) return null;
+  return {
+    orderId: Number(order.order_id),
+    eventId: Number(order.event_id),
+    customerSub: String(order.customer_sub),
+    customerEmail: String(order.customer_email),
+    event: {
+      title: String(order.title),
+      venue: String(order.venue ?? ''),
+      startsAt: order.starts_at instanceof Date ? order.starts_at.toISOString() : String(order.starts_at),
+    },
+    ticketCount: Number(order.ticket_count),
+    refund: { amountCents: Number(order.total_amount_cents), currency: String(order.currency) },
+  };
+}
+
+/**
+ * Asks the notification service to tell one customer their event is cancelled and
+ * their refund is on its way. Never throws. The notification service sends at
+ * most one cancellation email per order, so asking again cannot double-email.
+ */
+export async function notifyEventCancelled(
+  orderId: number,
+  load: (orderId: number) => Promise<EventCancellationPayload | null> = loadEventCancellation,
+  notificationUrl = NOTIFICATION_SERVICE_URL,
+  requester: typeof fetch = fetch,
+  timeoutMs = NOTIFICATION_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!notificationUrl) return false;
+  try {
+    const payload = await load(orderId);
+    if (!payload) return false;
+    const response = await requester(`${notificationUrl.replace(/\/$/, '')}/notifications/event-cancellation`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) throw new Error(`notification_request_failed:${response.status}`);
+    const result = (await response.json().catch(() => null)) as
+      { notification?: { status?: string; errorMessage?: string | null } } | null;
+    if (result?.notification?.status === 'FAILED') {
+      console.error('event cancellation email was not delivered', { orderId, reason: result.notification.errorMessage });
+    }
+    return true;
+  } catch (error) {
+    console.error('event cancellation email request failed', { orderId, error });
+    return false;
+  }
+}
+
+interface CancellationSweepResult {
+  readonly voidedTickets: number;
+  readonly matchedOrders: number;
+  readonly notifiedOrders: number;
+}
+
+/** Makes sure every cancelled event's tickets are void and each of its paid orders is told. */
+export async function reconcileCancelledEvents(
+  limit = 50,
+  voidTickets: () => Promise<number> = voidTicketsOfCancelledEvents,
+  findOrders: (limit: number) => Promise<readonly number[]> = findCancelledOrdersToNotify,
+  notify: (orderId: number) => Promise<boolean> = notifyEventCancelled,
+  notificationUrl = NOTIFICATION_SERVICE_URL,
+): Promise<CancellationSweepResult> {
+  const voidedTickets = await voidTickets();
+  // Without a notification service nothing could be sent, so there is nothing to look for.
+  const orderIds = notificationUrl ? await findOrders(limit) : [];
+  let notifiedOrders = 0;
+  // Sequential on purpose, like the confirmation emails: one SMTP account.
+  for (const orderId of orderIds) {
+    if (await notify(orderId)) notifiedOrders += 1;
+  }
+  return { voidedTickets, matchedOrders: orderIds.length, notifiedOrders };
+}
+
 let reconciliationRunning = false;
 
 async function runPaidOrderReconciliation(): Promise<void> {
@@ -641,6 +772,14 @@ async function runPaidOrderReconciliation(): Promise<void> {
     }
   } catch (error) {
     console.error('paid order ticket reconciliation sweep failed', error);
+  }
+  try {
+    const result = await reconcileCancelledEvents();
+    if (result.voidedTickets > 0 || result.matchedOrders > 0) {
+      console.log(JSON.stringify({ svc: SERVICE, operation: 'event-cancellation', ...result }));
+    }
+  } catch (error) {
+    console.error('cancelled event sweep failed', error);
   } finally {
     reconciliationRunning = false;
   }
@@ -824,7 +963,7 @@ app.get('/customers/me/tickets', async (req, res) => {
      FROM tickets t
      INNER JOIN event_inventory.events e ON e.event_id = t.event_id
      LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
-     WHERE t.customer_sub = ?
+     WHERE t.customer_sub = ? AND t.status <> 'VOID'
      ORDER BY e.starts_at ASC, t.ticket_id ASC`,
     [caller.sub],
   );
@@ -865,7 +1004,7 @@ app.get('/customers/me/orders/:orderId/confirmation', async (req, res) => {
       [orderId],
     );
     const [emails] = await database.query<mysql.RowDataPacket[]>(
-      'SELECT status, COUNT(*) AS count FROM notification.email_notifications WHERE order_id = ? AND customer_sub = ? GROUP BY status',
+      "SELECT status, COUNT(*) AS count FROM notification.email_notifications WHERE order_id = ? AND customer_sub = ? AND type = 'ORDER_CONFIRMATION' GROUP BY status",
       [orderId, caller.sub],
     );
     const countOf = (status: string) => Number(emails.find((row) => row.status === status)?.count ?? 0);
@@ -917,7 +1056,7 @@ app.get('/customers/me/tickets', async (req, res) => {
        FROM tickets t
        JOIN event_inventory.events e ON e.event_id = t.event_id
        LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
-       WHERE t.customer_sub = ?
+       WHERE t.customer_sub = ? AND t.status <> 'VOID'
        ORDER BY e.starts_at DESC, t.ticket_id`,
       [caller.sub],
     );

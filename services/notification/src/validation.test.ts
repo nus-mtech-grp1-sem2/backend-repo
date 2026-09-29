@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateOrderConfirmation } from "./validation.js";
+import { validateEventCancellation, validateOrderConfirmation } from "./validation.js";
 
 const validPayload = {
   orderId: 123,
@@ -84,5 +84,45 @@ describe("validateOrderConfirmation", () => {
 
   it("rejects a payload where tickets is not an array", () => {
     expect(validateOrderConfirmation({ ...validPayload, tickets: "not-an-array" })).toBeNull();
+  });
+});
+
+describe("validateEventCancellation", () => {
+  const cancellation = {
+    orderId: 123,
+    eventId: 45,
+    customerSub: "cognito-sub-1",
+    customerEmail: "buyer@example.com",
+    event: { title: "Concert Night", venue: "Esplanade", startsAt: "2026-10-01T19:00:00Z" },
+    ticketCount: 2,
+    refund: { amountCents: 10000, currency: "SGD" },
+  };
+
+  it("accepts a fully-formed payload and passes fields through unchanged", () => {
+    expect(validateEventCancellation(cancellation)).toEqual(cancellation);
+  });
+
+  it("accepts a free order, which is refunded nothing", () => {
+    const free = { ...cancellation, refund: { amountCents: 0, currency: "SGD" } };
+    expect(validateEventCancellation(free)).toEqual(free);
+  });
+
+  it("rejects a payload missing ids, customer, event or refund", () => {
+    const { orderId: _orderId, ...noOrder } = cancellation;
+    const { customerEmail: _email, ...noEmail } = cancellation;
+    const { event: _event, ...noEvent } = cancellation;
+    const { refund: _refund, ...noRefund } = cancellation;
+    for (const payload of [noOrder, noEmail, noEvent, noRefund, null, "text"]) {
+      expect(validateEventCancellation(payload)).toBeNull();
+    }
+  });
+
+  it("rejects a negative, fractional or non-numeric ticket count or refund amount", () => {
+    for (const ticketCount of [-1, 1.5, "2"]) {
+      expect(validateEventCancellation({ ...cancellation, ticketCount })).toBeNull();
+    }
+    for (const amountCents of [-1, 10.5, "100"]) {
+      expect(validateEventCancellation({ ...cancellation, refund: { amountCents, currency: "SGD" } })).toBeNull();
+    }
   });
 });

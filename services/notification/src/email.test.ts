@@ -12,9 +12,10 @@ vi.mock("qrcode", () => ({
   default: { toBuffer: toBufferMock },
 }));
 
-const { EmailService, formatStartsAt, ticketConfirmationSubject } = await import("./email.js");
+const { EmailService, eventCancellationSubject, formatAmount, formatStartsAt, ticketConfirmationSubject } =
+  await import("./email.js");
 const { default: nodemailerMock } = await import("nodemailer");
-import type { OrderConfirmationRequest } from "./types.js";
+import type { EventCancellationRequest, OrderConfirmationRequest } from "./types.js";
 
 const payload: OrderConfirmationRequest = {
   orderId: 1,
@@ -144,6 +145,64 @@ describe("EmailService", () => {
     expect(call.html).toContain("&lt;script&gt;");
   });
 
+  describe("sendEventCancellation", () => {
+    const cancellation: EventCancellationRequest = {
+      orderId: 1,
+      eventId: 2,
+      customerSub: "cognito-sub-1",
+      customerEmail: "buyer@example.com",
+      event: { title: "Concert Night", venue: "Esplanade", startsAt: "2026-10-01T19:00:00Z" },
+      ticketCount: 2,
+      refund: { amountCents: 10000, currency: "SGD" },
+    };
+
+    it("sends one email to the customer, with no QR code", async () => {
+      await new EmailService().sendEventCancellation(cancellation);
+      expect(sendMailMock).toHaveBeenCalledTimes(1);
+      const call = sendMailMock.mock.calls[0]![0];
+      expect(call.to).toBe("buyer@example.com");
+      expect(call.subject).toBe("Event cancelled: Concert Night — Order #1");
+      expect(call.attachments).toBeUndefined();
+      expect(toBufferMock).not.toHaveBeenCalled();
+    });
+
+    it("says the tickets are void and shows the refund amount and status", async () => {
+      await new EmailService().sendEventCancellation(cancellation);
+      const call = sendMailMock.mock.calls[0]![0];
+      expect(call.text).toBe(
+        [
+          "We're sorry — this event has been cancelled by the organiser. Your tickets are no longer valid and cannot be used for entry.",
+          "",
+          "Event Name: Concert Night",
+          "Location: Esplanade",
+          "Date/Time: Fri 2 Oct 2026, 3:00 AM",
+          "Order: #1 (2 tickets)",
+          "",
+          "Refund Amount: SGD 100.00",
+          "Refund Status: Refund initiated",
+          "A full refund will be returned to your original payment method.",
+        ].join("\n"),
+      );
+      expect(call.html).toContain("Refund Amount: SGD 100.00");
+      expect(call.html).toContain("Refund Status: Refund initiated");
+    });
+
+    it("says ticket, not tickets, for an order of one", async () => {
+      await new EmailService().sendEventCancellation({ ...cancellation, ticketCount: 1 });
+      expect(sendMailMock.mock.calls[0]![0].text).toContain("Order: #1 (1 ticket)");
+    });
+
+    it("escapes HTML in event text", async () => {
+      await new EmailService().sendEventCancellation({
+        ...cancellation,
+        event: { ...cancellation.event, venue: "<img src=x onerror=alert(1)>" },
+      });
+      const call = sendMailMock.mock.calls[0]![0];
+      expect(call.html).not.toContain("<img src=x");
+      expect(call.html).toContain("&lt;img src=x");
+    });
+  });
+
   it("propagates a transport failure to the caller", async () => {
     sendMailMock.mockRejectedValue(new Error("smtp exploded"));
     const service = new EmailService();
@@ -177,5 +236,19 @@ describe("formatStartsAt", () => {
 
   it("returns an unparseable value unchanged instead of throwing", () => {
     expect(formatStartsAt("not a date")).toBe("not a date");
+  });
+});
+
+describe("eventCancellationSubject", () => {
+  it("names the event and the order", () => {
+    expect(eventCancellationSubject(7, "Concert Night")).toBe("Event cancelled: Concert Night — Order #7");
+  });
+});
+
+describe("formatAmount", () => {
+  it("shows the currency code and two decimal places", () => {
+    expect(formatAmount(5000, "SGD")).toBe("SGD 50.00");
+    expect(formatAmount(1999, "sgd")).toBe("SGD 19.99");
+    expect(formatAmount(0, "SGD")).toBe("SGD 0.00");
   });
 });

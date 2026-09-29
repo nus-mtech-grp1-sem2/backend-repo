@@ -482,14 +482,68 @@ app.post('/events/:eventId/publish', async (req, res) => {
   }
 });
 
+interface CancellationImpact {
+  readonly customers: number;
+  readonly ticketsSold: number;
+}
+
+/** Who has bought tickets to the event: every paid order, whether or not its tickets are issued yet. */
+async function loadCancellationImpact(executor: mysql.Pool | mysql.PoolConnection, eventId: number): Promise<CancellationImpact> {
+  const [[row]] = await executor.query<mysql.RowDataPacket[]>(
+    `SELECT COUNT(DISTINCT o.customer_sub) AS customers, COALESCE(SUM(oi.quantity), 0) AS tickets_sold
+       FROM checkout.orders o
+       JOIN checkout.order_items oi ON oi.order_id = o.order_id
+      WHERE o.event_id = ? AND o.status = 'PAID'`,
+    [eventId],
+  );
+  return { customers: Number(row?.customers ?? 0), ticketsSold: Number(row?.tickets_sold ?? 0) };
+}
+
+/** What the organiser is warned about before cancelling: the app confirms with them when anyone has bought tickets. */
+app.get('/events/:eventId/cancellation-impact', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
+  const impact = await loadCancellationImpact(database, eventId);
+  res.set('Cache-Control', 'no-store').json({ eventId, ...impact, requiresConfirmation: impact.ticketsSold > 0 });
+});
+
+/**
+ * Cancels the event and voids every ticket sold for it, so none can be scanned or
+ * shown to its customer again. Once anyone has bought tickets, the organiser must
+ * send { confirm: true }; without it the answer is 409 with who would be affected.
+ * The ticket service then emails each paid order about the cancellation and refund.
+ */
 app.post('/events/:eventId/cancel', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const caller = await requireAuthenticated(req, res);
   const eventId = Number(req.params.eventId);
   if (!caller) return;
   if (!Number.isSafeInteger(eventId) || !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
-  await database.execute("UPDATE events SET status = 'CANCELLED' WHERE event_id = ?", [eventId]);
-  res.status(204).end();
+  const confirmed = (req.body as { confirm?: unknown } | undefined)?.confirm === true;
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    // Locking the event row makes a concurrent publish or edit wait until the cancel is decided.
+    await connection.query('SELECT event_id FROM events WHERE event_id = ? FOR UPDATE', [eventId]);
+    const impact = await loadCancellationImpact(connection, eventId);
+    if (impact.ticketsSold > 0 && !confirmed) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'cancellation_confirmation_required', ...impact });
+    }
+    await connection.execute("UPDATE events SET status = 'CANCELLED' WHERE event_id = ?", [eventId]);
+    await connection.execute("UPDATE ticketing.tickets SET status = 'VOID' WHERE event_id = ? AND status <> 'VOID'", [eventId]);
+    await connection.commit();
+    res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to cancel event', error);
+    res.status(502).json({ error: 'event_cancel_failed' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.delete('/events/:eventId', async (req, res) => {

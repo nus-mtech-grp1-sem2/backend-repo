@@ -793,6 +793,7 @@ app.get('/customers/me/orders', async (req, res) => {
   if (!caller) return;
   if (!requireDatabase(res)) return;
   await expireReservations({ customerSub: caller.sub });
+  // A cancelled event's orders are refunded and its tickets void, so the customer no longer sees them.
   const [orders] = await database.query<mysql.RowDataPacket[]>(
     `SELECT o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
       o.total_amount_cents, o.currency, o.created_at, o.paid_at,
@@ -803,7 +804,7 @@ app.get('/customers/me/orders', async (req, res) => {
      INNER JOIN event_inventory.events e ON e.event_id = o.event_id
      INNER JOIN event_inventory.inventory_holds h ON h.hold_id = o.hold_id
      LEFT JOIN order_items i ON i.order_id = o.order_id
-     WHERE o.customer_sub = ?
+     WHERE o.customer_sub = ? AND e.status <> 'CANCELLED'
      GROUP BY o.order_id, o.event_id, o.customer_email, o.hold_id, o.status,
        o.total_amount_cents, o.currency, o.created_at, o.paid_at, h.expires_at,
        e.title, e.venue, e.starts_at
