@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "biome lint services",
+    "build": "tsc --project tsconfig.build.json",
+    "test": "npm run test:unit",
+    "test:unit": "node scripts/run-unit-tests.mjs",
     "dev": "docker compose -f infrastructure/docker-compose.yml --env-file .env up --build",
     "dev:aws": "docker compose -f infrastructure/docker-compose.yml --env-file variables.env up --build",
     "db:check": "node scripts/check-db.mjs",
@@ -35,6 +38,7 @@
     "services/auth"
   ],
   "devDependencies": {
+    "@biomejs/biome": "2.5.14",
     "@types/express": "^5.0.6",
     "@types/node": "^26.2.0",
     "@types/qrcode": "^1.5.5",

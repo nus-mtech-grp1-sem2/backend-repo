@@ -81,3 +81,15 @@ plugins:
       header_name: X-Request-Id
       generator: uuid
       echo_downstream: true
+
+  # Bound traffic to each upstream service without constraining the existing
+  # 8 req/s scaling demo. The local policy is compatible with DB-less Kong;
+  # each gateway instance maintains its own counter, so aggregate capacity
+  # scales with Kong.
+  - name: rate-limiting
+    config:
+      minute: 1000
+      limit_by: service
+      policy: local
+      fault_tolerant: true
+      hide_client_headers: false

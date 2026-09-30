@@ -99,8 +99,9 @@ curl http://localhost:8001/routes | jq '.data[].paths'
 docker compose -f infrastructure/docker-compose.yml restart kong
 ```
 
-Auth and rate limiting belong here rather than in each service — add the
-`key-auth`, `jwt`, or `rate-limiting` plugin to the routes that need it.
+Auth and rate limiting belong here rather than in each service. Kong currently
+limits each upstream service to 1,000 requests per minute per gateway instance;
+add route-specific `key-auth` or `jwt` plugins here when those are needed.
 
 ## Notes
 
