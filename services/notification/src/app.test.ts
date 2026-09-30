@@ -20,10 +20,10 @@ vi.mock("./notificationRepository.js", () => ({
 }));
 
 vi.mock("./email.js", () => ({
-  EmailService: vi.fn().mockImplementation(() => ({
-    sendTicketConfirmation: sendTicketConfirmationMock,
-    sendEventCancellation: sendEventCancellationMock,
-  })),
+  EmailService: class {
+    sendTicketConfirmation = sendTicketConfirmationMock;
+    sendEventCancellation = sendEventCancellationMock;
+  },
   ticketConfirmationSubject: (orderId: number, ticketNumber: number, total: number) =>
     `subject order ${orderId} ticket ${ticketNumber}/${total}`,
   eventCancellationSubject: (orderId: number, title: string) => `cancelled ${title} order ${orderId}`,
