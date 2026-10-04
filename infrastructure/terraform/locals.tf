@@ -3,7 +3,7 @@ locals {
 
   # Schema each service owns in the shared MySQL instance — mirrors
   # docker-compose.yml's per-service DB_NAME and the one-instance/five-schemas
-  # split documented in database/onestage-system-design.md. `inventory`
+  # split documented in the docs repo (architecture/04-persistence-design.md). `inventory`
   # shares `event_inventory` with `event` because both read/write the same
   # tables (events, inventory_items, seats, holds). `notification` owns the
   # `notification` schema (email_notifications, one row per ticket email) and
