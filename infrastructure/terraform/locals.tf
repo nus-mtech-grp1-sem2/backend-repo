@@ -35,7 +35,21 @@ locals {
         max_count             = 4
         service_connect_alias = "kong"
         attach_to_alb         = true
-        extra_env             = {}
+        # Kong's peer is always an ALB node, so without these the per-IP
+        # rate limit in kong.yml would key every client to 2-3 ALB IPs.
+        # CloudFront appends the viewer IP to X-Forwarded-For and the ALB
+        # appends the edge IP; reading the header right to left and skipping
+        # trusted hops (ALB inside the VPC, CloudFront's origin-facing
+        # ranges) lands on the viewer, and anything a client forged further
+        # left is never reached.
+        extra_env = {
+          KONG_REAL_IP_HEADER    = "X-Forwarded-For"
+          KONG_REAL_IP_RECURSIVE = "on"
+          KONG_TRUSTED_IPS = join(",", concat(
+            [var.vpc_cidr],
+            [for entry in data.aws_ec2_managed_prefix_list.cloudfront.entries : entry.cidr],
+          ))
+        }
         # The kong:3.9 image is minimal Ubuntu with no wget/curl — `kong
         # health` is Kong's own built-in CLI healthcheck (checks the nginx
         # workers directly, no HTTP call needed). wget here always failed
