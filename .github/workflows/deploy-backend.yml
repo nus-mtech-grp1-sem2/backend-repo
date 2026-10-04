@@ -9,10 +9,20 @@ on:
       - "package-lock.json"
       - "infrastructure/Dockerfile.prod"
       - "infrastructure/kong/**"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Emergency only: deploy even if lint, build or unit tests fail (they still run)"
+        type: boolean
+        default: false
+      force_reason:
+        description: "Why the deploy must go out despite failing checks (required with force_deploy)"
+        type: string
+        default: ""
 
+# id-token: write is granted per job below, so the test job never gets AWS
+# credentials.
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -20,11 +30,52 @@ env:
   ECS_CLUSTER: onestage-cluster
 
 jobs:
+  # Lint, build and unit tests on the commit being deployed. They always run,
+  # forced deploy or not, so a forced deploy still records what failed.
+  quality:
+    uses: ./.github/workflows/backend-quality.yml
+
   build-and-push:
+    needs: quality
+    # A failed quality run blocks the deploy unless someone forces it by hand
+    # (workflow_dispatch with force_deploy). A push to main can never force.
+    # !cancelled() lets this job run after a failed `quality` at all, which
+    # GitHub would otherwise skip outright.
+    if: >-
+      ${{ !cancelled() && (
+        needs.quality.result == 'success' ||
+        (github.event_name == 'workflow_dispatch' && inputs.force_deploy)
+      ) }}
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     outputs:
       sha: ${{ github.sha }}
     steps:
+      - name: Record forced deploy
+        if: github.event_name == 'workflow_dispatch' && inputs.force_deploy
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          FORCE_REASON: ${{ inputs.force_reason }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "${FORCE_REASON// /}" ]; then
+            echo "::error::force_deploy needs a force_reason"
+            exit 1
+          fi
+          echo "::warning::Forced deploy by $ACTOR (quality: $QUALITY_RESULT): $FORCE_REASON"
+          {
+            echo "## Forced deploy"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Triggered by | $ACTOR |"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+            echo "| Quality result | $QUALITY_RESULT |"
+            echo "| Reason | $FORCE_REASON |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
 
       - name: Configure AWS credentials via OIDC
@@ -59,7 +110,13 @@ jobs:
 
   deploy:
     needs: build-and-push
+    # Without this, GitHub skips the job whenever `quality` failed, even when
+    # build-and-push ran because the deploy was forced.
+    if: ${{ !cancelled() && needs.build-and-push.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     # No `environment: production` — that key changes the OIDC subject
     # claim from the ref-based form to "repo:org/repo:environment:<name>",
     # which the trust policy doesn't grant (and this repo has no actual
