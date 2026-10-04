@@ -1,0 +1,22 @@
+// Dependency audit policy for the SAST/SCA job in .github/workflows/security.yml.
+// Fails on HIGH or CRITICAL advisories, like the plain `npm audit
+// --audit-level=high` it replaces, except for the accepted risks below.
+//
+// Each allowlist entry is scoped to one dependency path, so the same advisory
+// reached through any other package still fails, and it stops applying after
+// its expiry date. Accepted risks need an owner, expiry, compensating controls
+// and a tracking issue (onestage-ai-engineering/rules/dependencies.md).
+{
+  "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+  "high": true,
+  "report-type": "important",
+  "allowlist": [
+    {
+      "GHSA-vfj7-8cjw-p6xm|nodemon>chokidar>braces": {
+        "active": true,
+        "expiry": "2026-12-31",
+        "notes": "Owner: @SongMingLaw. Tracking: #106. No patched braces exists (<= 3.0.3 affected) and nodemon 3.1.14, the latest, needs chokidar 3; overriding chokidar to v4 breaks nodemon's --legacy-watch polling. nodemon is the dev-only watcher for local Docker hot reload: the production image starts services with tsx, and nodemon only expands glob patterns from our own Dockerfile command, never user input."
+      }
+    }
+  ]
+}

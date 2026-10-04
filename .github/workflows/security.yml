@@ -23,6 +23,7 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/security.yml"
+      - "audit-ci.jsonc"
       - ".zap/**"
   pull_request:
     branches: [ main ]
@@ -56,13 +57,13 @@ jobs:
 
       # 1. Dependency / SCA scan ------------------------------------------------
       # npm audit resolves package-lock.json directly; no install needed.
-      # The full report is always archived; the build fails on HIGH or above.
-      # --audit-level accepts: info | low | moderate | high | critical.
+      # The full report is always archived; the build fails on HIGH or above,
+      # except for the path-scoped, expiring accepted risks in audit-ci.jsonc.
       - name: Node dependency audit (full report)
         run: npm audit --audit-level=low --json > npm-audit.json || true
 
       - name: Node dependency audit (fail on high or above)
-        run: npm audit --audit-level=high
+        run: npx --yes audit-ci@7.1.0 --config audit-ci.jsonc
 
       - name: Upload dependency audit report
         if: always()
