@@ -2,6 +2,9 @@ name: OneStage backend quality
 
 on:
   push:
+  # deploy-backend.yml calls this as its first job, so a deploy only goes out
+  # once lint, build and unit tests have passed on the same commit.
+  workflow_call: {}
 
 permissions: {contents: read}
 
