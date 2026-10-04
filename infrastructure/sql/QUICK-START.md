@@ -73,4 +73,4 @@ DESCRIBE events;
 DESCRIBE event_team_memberships;
 ```
 
-See [`database/onestage-system-design.md`](../../database/onestage-system-design.md) for schema ownership across the four services, and [`infrastructure/docker-compose.yml`](../docker-compose.yml) for the local MySQL container.
+See the [Persistence Design](https://github.com/nus-mtech-grp1-sem2/docs/blob/main/architecture/04-persistence-design.md) in the `docs` repository for schema ownership across the services, and [`infrastructure/docker-compose.yml`](../docker-compose.yml) for the local MySQL container.
