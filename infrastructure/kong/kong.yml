@@ -8,6 +8,27 @@
 # the event service as /events.
 _format_version: "3.0"
 
+# Per-client limit on the write paths a bot would hammer (queue join, order
+# create, payment, cancel), attached to the *-write-route routes below. It is
+# not global: a limit shared by all clients throttles everyone together once
+# the total is hit, and would cap the k6 scaling demo instead of measuring the
+# platform.
+#
+# The client IP is the real viewer's, not the ALB's: in AWS, Kong runs with
+# KONG_REAL_IP_HEADER=X-Forwarded-For and KONG_TRUSTED_IPS set to the VPC and
+# CloudFront origin-facing ranges (infrastructure/terraform/locals.tf), so it
+# skips the ALB and edge hops and ignores anything a client forged further
+# left in the header.
+#
+# 60/min is far above what a person does by hand but leaves room for many
+# buyers behind one NAT and for the full-stack e2e suite, which runs from a
+# single IP. The local policy keeps a counter per Kong task (DB-less Kong has
+# no shared store), so with N tasks one client can get up to N x 60/min. A
+# shared Redis counter would remove that, at the cost of another component.
+#
+# The plugin is defined once, on queue-write-route (&per-ip-write-limit), and
+# reused on order-write-route (*per-ip-write-limit).
+
 services:
   - name: event
     url: http://event:3001
@@ -32,6 +53,24 @@ services:
         paths:
           - /api/queue
         strip_path: true
+      # POSTs (join, admit-next) match this route instead of queue-route:
+      # Kong prefers the route that also matches on method. Only writes are
+      # rate limited, so GET polling of a customer's queue position is not.
+      - name: queue-write-route
+        paths:
+          - /api/queue
+        methods:
+          - POST
+        strip_path: true
+        plugins:
+          - &per-ip-write-limit
+            name: rate-limiting
+            config:
+              minute: 60
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
 
   - name: order
     url: http://order:3004
@@ -40,6 +79,15 @@ services:
         paths:
           - /api/order
         strip_path: true
+      # Order creation, payment and cancel, rate limited as for the queue.
+      - name: order-write-route
+        paths:
+          - /api/order
+        methods:
+          - POST
+        strip_path: true
+        plugins:
+          - *per-ip-write-limit
 
   - name: ticket
     url: http://ticket:3005
@@ -81,15 +129,3 @@ plugins:
       header_name: X-Request-Id
       generator: uuid
       echo_downstream: true
-
-  # Bound traffic to each upstream service without constraining the existing
-  # 8 req/s scaling demo. The local policy is compatible with DB-less Kong;
-  # each gateway instance maintains its own counter, so aggregate capacity
-  # scales with Kong.
-  - name: rate-limiting
-    config:
-      minute: 1000
-      limit_by: service
-      policy: local
-      fault_tolerant: true
-      hide_client_headers: false
