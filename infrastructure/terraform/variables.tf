@@ -43,10 +43,14 @@ variable "frontend_repo_name" {
   default = "core-frontend"
 }
 
-variable "alert_email" {
-  description = "Email address for AWS Budgets alerts."
-  type        = string
-  default     = "smlaw485@gmail.com"
+variable "alert_emails" {
+  description = "Email addresses AWS Budgets alerts go to (set in terraform.tfvars)."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.alert_emails) >= 1 && length(var.alert_emails) <= 10
+    error_message = "AWS Budgets allows 1 to 10 email subscribers per notification."
+  }
 }
 
 variable "budget_target_usd" {
