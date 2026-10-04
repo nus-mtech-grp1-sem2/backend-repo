@@ -62,8 +62,13 @@ jobs:
       - name: Node dependency audit (full report)
         run: npm audit --audit-level=low --json > npm-audit.json || true
 
+      # audit-ci is installed outside the workspace with lifecycle scripts off
+      # (npx would install on demand and run them), so it never touches the
+      # repo's lockfile or the image.
       - name: Node dependency audit (fail on high or above)
-        run: npx --yes audit-ci@7.1.0 --config audit-ci.jsonc
+        run: |
+          npm install --prefix "$RUNNER_TEMP/audit-ci" --no-save --ignore-scripts --no-audit --no-fund audit-ci@7.1.0
+          "$RUNNER_TEMP/audit-ci/node_modules/.bin/audit-ci" --config audit-ci.jsonc
 
       - name: Upload dependency audit report
         if: always()
