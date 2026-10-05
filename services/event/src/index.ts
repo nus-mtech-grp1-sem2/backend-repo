@@ -627,7 +627,7 @@ app.get('/events/:eventId/team-members', async (req, res) => {
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!(await requireEventOrganiser(req, res, eventId))) return;
   const [members] = await database.query<mysql.RowDataPacket[]>(
-    "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? ORDER BY role, user_email",
+    "SELECT membership_id, user_sub, user_email, role, invite_status, granted_by_sub, granted_at, responded_at FROM event_team_memberships WHERE event_id = ? AND invite_status <> 'REVOKED' ORDER BY role, user_email",
     [eventId],
   );
   // Owners of events created before the email was stored have user_email
@@ -653,7 +653,7 @@ app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
   );
   if (events.length === 0) return res.status(404).json({ error: 'event_not_found' });
   const [members] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT role FROM event_team_memberships WHERE event_id = ? AND user_sub = ? LIMIT 1',
+    "SELECT role FROM event_team_memberships WHERE event_id = ? AND user_sub = ? AND invite_status <> 'REVOKED' LIMIT 1",
     [eventId, memberSub],
   );
   if (members.length === 0) return res.status(404).json({ error: 'team_member_not_found' });
@@ -661,7 +661,12 @@ app.delete('/events/:eventId/team-members/:userSub', async (req, res) => {
   const member = members[0]!;
   if (member.role === 'ORGANISER' && event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
   if (member.role === 'HELPER' && !(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
-  await database.execute('DELETE FROM event_team_memberships WHERE event_id = ? AND user_sub = ?', [eventId, memberSub]);
+  // Revoke rather than delete, so the row records who had which role and who
+  // removed them when. Every access check requires invite_status 'ACCEPTED'.
+  await database.execute(
+    "UPDATE event_team_memberships SET invite_status = 'REVOKED', revoked_at = CURRENT_TIMESTAMP, revoked_by_sub = ? WHERE event_id = ? AND user_sub = ? AND invite_status <> 'REVOKED'",
+    [caller.sub, eventId, memberSub],
+  );
   res.status(204).end();
 });
 
@@ -682,7 +687,7 @@ app.patch('/events/:eventId/team-members/:userSub', async (req, res) => {
   if (event.organiser_sub !== caller.sub) return res.status(403).json({ error: 'event_owner_required' });
   if (memberSub === event.organiser_sub) return res.status(400).json({ error: 'cannot_change_owner_role' });
   const [result] = await database.execute<mysql.ResultSetHeader>(
-    'UPDATE event_team_memberships SET role = ? WHERE event_id = ? AND user_sub = ?',
+    "UPDATE event_team_memberships SET role = ? WHERE event_id = ? AND user_sub = ? AND invite_status <> 'REVOKED'",
     [role, eventId, memberSub],
   );
   if (result.affectedRows === 0) return res.status(404).json({ error: 'team_member_not_found' });
@@ -716,6 +721,14 @@ app.post('/events/:eventId/invitations', async (req, res) => {
     const userSub = attribute(userAttributes, 'sub');
     const userEmail = attribute(userAttributes, 'email');
     if (!userSub || !userEmail) return res.status(400).json({ error: 'invited_user_missing_identity' });
+    // Someone removed earlier keeps their revoked row (uq_event_team_member),
+    // so re-inviting them reopens that row as a fresh pending invitation. Their
+    // revoked_at / revoked_by_sub stay as the record of the last removal.
+    const [reopened] = await database.execute<mysql.ResultSetHeader>(
+      "UPDATE event_team_memberships SET user_email = ?, role = ?, invite_status = 'PENDING', granted_by_sub = ?, granted_at = CURRENT_TIMESTAMP, responded_at = NULL WHERE event_id = ? AND user_sub = ? AND invite_status = 'REVOKED'",
+      [userEmail, role, eventOwnerSub, eventId, userSub],
+    );
+    if (reopened.affectedRows > 0) return res.status(201).json({ invited: true });
     await database.execute(
       "INSERT INTO event_team_memberships (event_id, user_sub, user_email, role, invite_status, granted_by_sub) VALUES (?, ?, ?, ?, 'PENDING', ?)",
       [eventId, userSub, userEmail, role, eventOwnerSub],

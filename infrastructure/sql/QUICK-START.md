@@ -47,6 +47,7 @@ Get-Content ..\..\database\12-add-event-image-and-seat-tags.sql | mysql -h $env:
 Get-Content ..\..\database\13-add-inventory-grid-position.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\14-add-grid-customization.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\15-email-notifications-per-ticket.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_NOTIFICATION
+Get-Content ..\..\database\17-add-event-team-soft-revoke.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 ```
 
 - `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
@@ -61,6 +62,7 @@ Get-Content ..\..\database\15-email-notifications-per-ticket.sql | mysql -h $env
 - `13-add-inventory-grid-position.sql` adds a virtual row/column position per zone/section for the drag-and-drop venue map.
 - `14-add-grid-customization.sql` adds a per-event custom grid size and multi-cell zone/section spans.
 - `15-email-notifications-per-ticket.sql` moves `email_notifications` from one row per order to one row per ticket.
+- `17-add-event-team-soft-revoke.sql` keeps removed team members as `REVOKED` rows with `revoked_at`/`revoked_by_sub`, instead of deleting them. Apply before deploying the event service that uses it.
 
 Do not rerun an upgrade after it has been applied: MySQL will reject a duplicate column or index.
 

@@ -614,9 +614,12 @@ describe('organiser endpoints', () => {
   });
 
   describe('team members', () => {
+    // Revoked members are kept as a record of past access, but are not on the team.
+    const ROSTER = /FROM event_team_memberships WHERE event_id = \? AND invite_status <> 'REVOKED' ORDER BY role/;
+
     it("fills in an owner's missing email from Cognito, keeping stored emails", async () => {
       isOrganiser();
-      on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, [
+      on(ROSTER, [
         { membership_id: 1, user_sub: 'alice', user_email: '', role: 'ORGANISER' },
         { membership_id: 2, user_sub: 'bob', user_email: 'bob@example.com', role: 'HELPER' },
       ]);
@@ -644,7 +647,7 @@ describe('organiser endpoints', () => {
     it('lists the team to an organiser and rejects a bad event id or a non-organiser', async () => {
       const members = [{ membership_id: 1, user_sub: 'bob', user_email: 'bob@example.com', role: 'HELPER' }];
       isOrganiser();
-      on(/FROM event_team_memberships WHERE event_id = \? ORDER BY role/, members);
+      on(ROSTER, members);
       // The route enriches each row with a `name` looked up from Cognito
       // (mocked to `{}` above, so `AdminGetUserCommand` resolves with no
       // UserAttributes and the looked-up name falls back to '').
@@ -664,9 +667,32 @@ describe('organiser endpoints', () => {
       const scriptTeam = (owner: string, memberRole: string | null) => {
         on(/SELECT organiser_sub FROM events/, [{ organiser_sub: owner }]);
         on(/SELECT role FROM event_team_memberships/, memberRole ? [{ role: memberRole }] : []);
-        on(/DELETE FROM event_team_memberships/, {});
+        on(REVOKE, { affectedRows: 1 });
       };
-      const removed = () => sqlMatching(/DELETE FROM event_team_memberships/).length === 1;
+      const REVOKE = /UPDATE event_team_memberships SET invite_status = 'REVOKED'/;
+      const removed = () => sqlMatching(REVOKE).length === 1;
+
+      it('revokes the membership, recording who removed them and when, instead of deleting it', async () => {
+        scriptTeam('owner', 'HELPER');
+        isOrganiser();
+
+        assert.equal((await request('DELETE', '/events/5/team-members/bob', { token: 'alice' })).status, 204);
+
+        assert.equal(sqlMatching(/DELETE FROM event_team_memberships/).length, 0);
+        const revoke = sqlMatching(REVOKE)[0];
+        assert.match(revoke?.sql ?? '', /revoked_at = CURRENT_TIMESTAMP, revoked_by_sub = \?/);
+        assert.deepEqual(revoke?.params, ['alice', 5, 'bob']);
+      });
+
+      it('treats an already-revoked member as not on the team', async () => {
+        scriptTeam('owner', null);
+        assert.deepEqual(await request('DELETE', '/events/5/team-members/bob', { token: 'owner' }), {
+          status: 404,
+          body: { error: 'team_member_not_found' },
+        });
+        assert.match(sqlMatching(/SELECT role FROM event_team_memberships/)[0]?.sql ?? '', /invite_status <> 'REVOKED'/);
+        assert.equal(removed(), false);
+      });
 
       it('will not let an organiser remove themselves', async () => {
         const response = await request('DELETE', '/events/5/team-members/alice', { token: 'alice' });
@@ -696,7 +722,7 @@ describe('organiser endpoints', () => {
         scriptTeam('owner', 'ORGANISER');
         const allowed = await request('DELETE', '/events/5/team-members/carol', { token: 'owner' });
         assert.equal(allowed.status, 204);
-        assert.deepEqual(sqlMatching(/DELETE FROM event_team_memberships/)[0]?.params, [5, 'carol']);
+        assert.deepEqual(sqlMatching(REVOKE)[0]?.params, ['owner', 5, 'carol']);
       });
 
       it('lets an accepted organiser remove a helper, but nobody else', async () => {
@@ -712,12 +738,24 @@ describe('organiser endpoints', () => {
         assert.equal(removed(), false);
       });
     });
+
+    it('will not change the role of a revoked member', async () => {
+      on(/SELECT organiser_sub FROM events/, [{ organiser_sub: 'owner' }]);
+      on(/UPDATE event_team_memberships SET role = \?/, { affectedRows: 0 });
+
+      const response = await request('PATCH', '/events/5/team-members/bob', { token: 'owner', body: { role: 'ORGANISER' } });
+
+      assert.deepEqual(response, { status: 404, body: { error: 'team_member_not_found' } });
+      assert.match(calls.at(-1)?.sql ?? '', /AND invite_status <> 'REVOKED'$/);
+    });
   });
 
   describe('POST /events/:eventId/invitations', () => {
-    const scriptInvite = () => {
+    const REOPEN = /UPDATE event_team_memberships SET user_email = \?, role = \?, invite_status = 'PENDING'/;
+    const scriptInvite = (revokedRows = 0) => {
       isOrganiser();
       on(/SELECT organiser_sub FROM events/, [{ organiser_sub: 'owner' }]);
+      on(REOPEN, { affectedRows: revokedRows });
       on(/INSERT INTO event_team_memberships/, {});
     };
     const invite = (body: unknown, token = 'alice') =>
@@ -812,9 +850,26 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/INSERT INTO event_team_memberships/).length, 0);
     });
 
+    it('re-invites a removed member by reopening their revoked row as pending', async () => {
+      scriptInvite(1);
+      cognitoSend.mock.mockImplementation(async () => ({
+        Users: [{ Attributes: attributes('sub-bob', 'bob@example.com') }],
+      }));
+
+      const response = await invite({ email: 'bob@example.com', role: 'ORGANISER' });
+
+      assert.deepEqual(response, { status: 201, body: { invited: true } });
+      const reopen = sqlMatching(REOPEN)[0];
+      assert.match(reopen?.sql ?? '', /responded_at = NULL WHERE event_id = \? AND user_sub = \? AND invite_status = 'REVOKED'$/);
+      assert.doesNotMatch(reopen?.sql ?? '', /revoked_at|revoked_by_sub/, 'the last removal stays recorded');
+      assert.deepEqual(reopen?.params, ['bob@example.com', 'ORGANISER', 'owner', 5, 'sub-bob']);
+      assert.equal(sqlMatching(/INSERT INTO event_team_memberships/).length, 0);
+    });
+
     it('reports 409 when the user is already invited or a member', async () => {
       isOrganiser();
       on(/SELECT organiser_sub FROM events/, [{ organiser_sub: 'owner' }]);
+      on(REOPEN, { affectedRows: 0 });
       on(
         /INSERT INTO event_team_memberships/,
         Object.assign(new Error('Duplicate entry'), { code: 'ER_DUP_ENTRY' }),
