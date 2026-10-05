@@ -122,7 +122,7 @@ locals {
             DB_USER     = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_USER::"
             DB_PASSWORD = "${aws_secretsmanager_secret.mysql.arn}:MYSQL_PASSWORD::"
           } : {},
-          contains(["order", "queue"], name) ? {
+          contains(["order", "queue", "ticket", "notification"], name) ? {
             INTERNAL_API_TOKEN = "${aws_secretsmanager_secret.mysql.arn}:INTERNAL_API_TOKEN::"
           } : {},
           name == "ticket" ? {

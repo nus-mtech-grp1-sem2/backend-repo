@@ -97,13 +97,8 @@ services:
           - /api/ticket
         strip_path: true
 
-  - name: notification
-    url: http://notification:3006
-    routes:
-      - name: notification-route
-        paths:
-          - /api/notification
-        strip_path: true
+  # No notification route: only the ticket service calls it, over Service
+  # Connect, so it is not reachable from the internet.
 
   - name: auth
     url: http://auth:3007

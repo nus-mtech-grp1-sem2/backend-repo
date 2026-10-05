@@ -176,11 +176,12 @@ describe('booking confirmation email hook', () => {
       return new Response(JSON.stringify({ orderId: 42, notifications: [{ ticketId: 1, status: 'SENT' }] }), { status: 201 });
     }) as typeof fetch;
 
-    const sent = await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006/', requester);
+    const sent = await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006/', requester, 1_000, 'internal-token');
 
     assert.equal(sent, true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.url, 'http://notification:3006/notifications/order-confirmation');
+    assert.equal(new Headers(calls[0]?.init.headers).get('x-internal-token'), 'internal-token');
     assert.equal(calls[0]?.init.method, 'POST');
     assert.deepEqual(JSON.parse(String(calls[0]?.init.body)), payload);
   });
@@ -272,9 +273,10 @@ describe('event cancellation email hook', () => {
       return new Response(JSON.stringify({ orderId: 42, notification: { status: 'SENT' } }), { status: 201 });
     }) as typeof fetch;
 
-    assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006/', requester), true);
+    assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006/', requester, 1_000, 'internal-token'), true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.url, 'http://notification:3006/notifications/event-cancellation');
+    assert.equal(new Headers(calls[0]?.init.headers).get('x-internal-token'), 'internal-token');
     assert.equal(calls[0]?.init.method, 'POST');
     assert.deepEqual(JSON.parse(String(calls[0]?.init.body)), payload);
   });

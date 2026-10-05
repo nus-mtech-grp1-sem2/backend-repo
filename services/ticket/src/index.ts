@@ -19,6 +19,8 @@ const SCANNER_SESSION_SECRET = process.env.SCANNER_SESSION_SECRET ?? '';
 const SCANNER_SESSION_TTL_MIN = Number(process.env.SCANNER_SESSION_TTL_MIN ?? 480);
 const TICKET_INTERNAL_SHARED_SECRET = process.env.TICKET_INTERNAL_SHARED_SECRET ?? '';
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL ?? '';
+// Sent as x-internal-token; the notification service refuses requests without it.
+const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN ?? '';
 // The notification service sends one email per ticket, one after another, before it replies.
 const NOTIFICATION_TIMEOUT_MS = Math.max(
   1_000,
@@ -546,6 +548,7 @@ export async function notifyOrderConfirmed(
   notificationUrl = NOTIFICATION_SERVICE_URL,
   requester: typeof fetch = fetch,
   timeoutMs = NOTIFICATION_TIMEOUT_MS,
+  internalApiToken = INTERNAL_API_TOKEN,
 ): Promise<boolean> {
   if (!notificationUrl) return false;
   try {
@@ -553,7 +556,7 @@ export async function notifyOrderConfirmed(
     if (!payload) return false;
     const response = await requester(`${notificationUrl.replace(/\/$/, '')}/notifications/order-confirmation`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-internal-token': internalApiToken },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -725,6 +728,7 @@ export async function notifyEventCancelled(
   notificationUrl = NOTIFICATION_SERVICE_URL,
   requester: typeof fetch = fetch,
   timeoutMs = NOTIFICATION_TIMEOUT_MS,
+  internalApiToken = INTERNAL_API_TOKEN,
 ): Promise<boolean> {
   if (!notificationUrl) return false;
   try {
@@ -732,7 +736,7 @@ export async function notifyEventCancelled(
     if (!payload) return false;
     const response = await requester(`${notificationUrl.replace(/\/$/, '')}/notifications/event-cancellation`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-internal-token': internalApiToken },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
     });

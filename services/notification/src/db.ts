@@ -14,7 +14,11 @@ export const pool = mysql.createPool({
   database: requireEnv("DB_NAME"),
   user: requireEnv("DB_USER"),
   password: requireEnv("DB_PASSWORD"),
-  ...(process.env.DB_SSL === "true" ? { ssl: {} } : {}),
+  // DB_SSL_REJECT_UNAUTHORIZED=false is for local dev against the shared MySQL,
+  // whose certificate is self-signed. Certificates are verified by default.
+  ...(process.env.DB_SSL === "true"
+    ? { ssl: { rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false" } }
+    : {}),
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT ?? 10),
   connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10000),
   timezone: "Z",

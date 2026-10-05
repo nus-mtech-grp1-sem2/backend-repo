@@ -18,6 +18,10 @@ resource "random_password" "scanner_session_secret" {
   special = false
 }
 
+# AWS-managed key: re-encrypting with a customer-managed key means giving the ECS
+# execution role kms:Decrypt on it, and a mistake there stops every service from
+# starting. Revisit with a reviewed key policy if the project outlives the course.
+#tfsec:ignore:aws-ssm-secret-use-customer-key
 resource "aws_secretsmanager_secret" "mysql" {
   name = "${local.name_prefix}/mysql"
 
