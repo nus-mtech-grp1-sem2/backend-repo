@@ -76,6 +76,10 @@ data "aws_security_group" "efs_lookup" {
   }
 }
 
+# Outbound 443 and 465 to 0.0.0.0/0: there is no NAT gateway or VPC endpoints
+# (cost), so tasks reach ECR, Secrets Manager, CloudWatch, Cognito and SQS over
+# their public endpoints, and Gmail SMTP has no fixed IP range to allow-list.
+#tfsec:ignore:aws-ec2-no-public-egress-sgr
 resource "aws_security_group" "ecs_tasks" {
   name        = "${local.name_prefix}-ecs-tasks"
   description = "ECS tasks: ingress from ALB (Kong) and from each other (Service Connect)"

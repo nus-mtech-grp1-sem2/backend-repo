@@ -95,6 +95,9 @@ resource "aws_s3_bucket_policy" "access_logs" {
 
 # --- VPC Flow Logs ----------------------------------------------------------
 
+# AWS-managed encryption rather than a customer-managed KMS key (~US$1/month and
+# a key policy to maintain) for flow-log metadata.
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/vpc/${local.name_prefix}/flow-logs"
   retention_in_days = 90 # investigation window; storage cost at this log volume is negligible either way
@@ -117,6 +120,9 @@ resource "aws_iam_role" "vpc_flow_logs" {
   assume_role_policy = data.aws_iam_policy_document.vpc_flow_logs_trust.json
 }
 
+# The :* suffix is the log streams inside this one log group, which is the
+# narrowest ARN CreateLogStream/PutLogEvents accept.
+#tfsec:ignore:aws-iam-no-policy-wildcards
 data "aws_iam_policy_document" "vpc_flow_logs_permissions" {
   statement {
     effect = "Allow"

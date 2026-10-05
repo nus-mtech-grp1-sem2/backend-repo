@@ -1,5 +1,11 @@
 # Only 2 repos, not 8 — all 7 Node services share one image, selected by the
 # SERVICE env var at container start (see infrastructure/Dockerfile).
+# Mutable tags: the deploy workflow pushes :latest and task definitions point at
+# it (every image is also tagged with its commit SHA). AES256 rather than KMS:
+# changing encryption forces the repository to be replaced, which
+# prevent_destroy blocks, and a customer-managed key adds cost for no gain here.
+#tfsec:ignore:aws-ecr-enforce-immutable-repository
+#tfsec:ignore:aws-ecr-repository-customer-key
 resource "aws_ecr_repository" "backend" {
   name                 = "${local.name_prefix}-backend"
   image_tag_mutability = "MUTABLE"
@@ -13,6 +19,9 @@ resource "aws_ecr_repository" "backend" {
   }
 }
 
+# Same as backend: mutable :latest tag, AES256 encryption.
+#tfsec:ignore:aws-ecr-enforce-immutable-repository
+#tfsec:ignore:aws-ecr-repository-customer-key
 resource "aws_ecr_repository" "kong" {
   name                 = "${local.name_prefix}-kong"
   image_tag_mutability = "MUTABLE"

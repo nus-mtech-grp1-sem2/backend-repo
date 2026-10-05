@@ -13,6 +13,12 @@ resource "aws_cloudfront_function" "spa_routing" {
   code    = file("${path.module}/functions/spa-routing.js")
 }
 
+# No WAF: ~US$6+/month for a course demo; Kong rate-limits the API instead.
+# Minimum TLS version cannot be raised while using the default *.cloudfront.net
+# certificate (it needs a custom domain and ACM certificate); viewers are still
+# redirected to HTTPS on every behavior.
+#tfsec:ignore:aws-cloudfront-enable-waf
+#tfsec:ignore:aws-cloudfront-use-secure-tls-policy
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   default_root_object = "index.html"

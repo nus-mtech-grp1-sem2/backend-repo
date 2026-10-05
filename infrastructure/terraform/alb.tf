@@ -1,3 +1,6 @@
+# Public by design: it is CloudFront's origin, and alb_from_cloudfront only
+# admits CloudFront's managed prefix list, so clients cannot reach it directly.
+#tfsec:ignore:aws-elb-alb-not-public
 resource "aws_lb" "main" {
   name               = "${local.name_prefix}-alb"
   internal           = false
@@ -37,6 +40,10 @@ resource "aws_lb_target_group" "kong" {
   deregistration_delay = 30
 }
 
+# HTTP only: there is no custom domain to issue an ACM certificate for. TLS
+# terminates at CloudFront (viewers are redirected to HTTPS), and the hop to
+# this listener is CloudFront-only (see aws_lb.main).
+#tfsec:ignore:aws-elb-http-not-used
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80

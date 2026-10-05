@@ -1,3 +1,5 @@
+# Container Insights is off for cost (see the setting below).
+#tfsec:ignore:aws-ecs-enable-container-insight
 resource "aws_ecs_cluster" "main" {
   name = "${local.name_prefix}-cluster"
 

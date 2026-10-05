@@ -22,6 +22,10 @@ resource "aws_internet_gateway" "main" {
   tags   = { Name = "${local.name_prefix}-igw" }
 }
 
+# Public IPs on launch: tasks run in public subnets with no NAT gateway (cost),
+# so a public IP is how they reach AWS APIs. Inbound is still limited by the
+# security groups: nothing but CloudFront -> ALB -> Kong is reachable.
+#tfsec:ignore:aws-ec2-no-public-ip-subnet
 resource "aws_subnet" "public" {
   count                   = length(var.public_subnet_cidrs)
   vpc_id                  = aws_vpc.main.id

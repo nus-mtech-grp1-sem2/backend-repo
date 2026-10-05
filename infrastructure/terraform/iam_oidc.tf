@@ -135,6 +135,8 @@ resource "aws_iam_role" "github_deploy_frontend" {
   assume_role_policy = data.aws_iam_policy_document.github_frontend_trust.json
 }
 
+# Object actions need the bucket's /* ARN; it is scoped to the frontend bucket only.
+#tfsec:ignore:aws-iam-no-policy-wildcards
 data "aws_iam_policy_document" "github_deploy_frontend_permissions" {
   statement {
     sid       = "S3Sync"

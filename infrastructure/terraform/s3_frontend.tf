@@ -21,6 +21,9 @@ resource "aws_s3_bucket_versioning" "frontend" {
   }
 }
 
+# SSE-S3 rather than KMS: the bucket only holds the public SPA bundle, and SSE-KMS
+# would need a key policy for CloudFront's OAC plus ~US$1/month.
+#tfsec:ignore:aws-s3-encryption-customer-key
 resource "aws_s3_bucket_server_side_encryption_configuration" "frontend" {
   bucket = aws_s3_bucket.frontend.id
   rule {
