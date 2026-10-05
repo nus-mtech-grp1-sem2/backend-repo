@@ -23,6 +23,7 @@ function run(command, args, options = {}) {
 
 const nodeTestFiles = [
   source('event', 'src', 'index.test.ts'),
+  source('event', 'src', 'team-membership-access.test.ts'),
   source('inventory', 'src', 'index.test.ts'),
   source('queue', 'src', 'index.test.ts'),
   source('queue', 'src', 'purchase-window.test.ts'),
