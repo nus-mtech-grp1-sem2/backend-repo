@@ -20,6 +20,8 @@ services:
       - ../database/12-add-event-image-and-seat-tags.sql:/docker-entrypoint-initdb.d/10-add-event-image-and-seat-tags.sql:ro
       - ../database/13-add-inventory-grid-position.sql:/docker-entrypoint-initdb.d/11-add-inventory-grid-position.sql:ro
       - ../database/14-add-grid-customization.sql:/docker-entrypoint-initdb.d/12-add-grid-customization.sql:ro
+      - ../database/16-add-event-cancellation-notification-type.sql:/docker-entrypoint-initdb.d/13-add-event-cancellation-notification-type.sql:ro
+      - ../database/17-add-event-team-soft-revoke.sql:/docker-entrypoint-initdb.d/14-add-event-team-soft-revoke.sql:ro
     networks:
       - backend
     healthcheck:
