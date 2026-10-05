@@ -74,7 +74,10 @@ const cancellationRecord = (status: string) => ({
   status,
 });
 
-const app = createApp();
+const INTERNAL_TOKEN = "test-internal-token";
+const app = createApp(INTERNAL_TOKEN);
+// The ticket service always sends the internal token; requests without it are tested separately.
+const api = request.agent(app).set("x-internal-token", INTERNAL_TOKEN);
 
 describe("notification service app", () => {
   beforeEach(() => {
@@ -103,16 +106,48 @@ describe("notification service app", () => {
     expect(res.body).toEqual({ status: "ok", service: "notification" });
   });
 
+  describe("internal token", () => {
+    const routes = [
+      ["post", "/notifications/order-confirmation"],
+      ["post", "/notifications/event-cancellation"],
+      ["get", "/notifications/123"],
+    ] as const;
+
+    it.each(routes)("%s %s without the token is 401 and does nothing", async (method, path) => {
+      const res = await request(app)[method](path).send(validPayload);
+      expect(res.status).toBe(401);
+      expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
+      expect(sendEventCancellationMock).not.toHaveBeenCalled();
+      expect(listByOrderIdMock).not.toHaveBeenCalled();
+    });
+
+    it.each(routes)("%s %s with the wrong token is 401", async (method, path) => {
+      const res = await request(app)[method](path).set("x-internal-token", "wrong-token").send(validPayload);
+      expect(res.status).toBe(401);
+      expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses every request when no token is configured, even an empty header", async () => {
+      const unconfigured = createApp("");
+      const res = await request(unconfigured)
+        .post("/notifications/order-confirmation")
+        .set("x-internal-token", "")
+        .send(validPayload);
+      expect(res.status).toBe(401);
+      expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe("POST /notifications/order-confirmation", () => {
     it("rejects an invalid payload without touching the repository or email", async () => {
-      const res = await request(app).post("/notifications/order-confirmation").send({});
+      const res = await api.post("/notifications/order-confirmation").send({});
       expect(res.status).toBe(400);
       expect(sendTicketConfirmationMock).not.toHaveBeenCalled();
       expect(upsertOutcomeMock).not.toHaveBeenCalled();
     });
 
     it("sends the email and inserts a SENT row for a single ticket", async () => {
-      const res = await request(app)
+      const res = await api
         .post("/notifications/order-confirmation")
         .send(validPayload);
 
@@ -132,7 +167,7 @@ describe("notification service app", () => {
     });
 
     it("sends one email and inserts one row per ticket", async () => {
-      const res = await request(app)
+      const res = await api
         .post("/notifications/order-confirmation")
         .send(twoTickets);
 
@@ -163,7 +198,7 @@ describe("notification service app", () => {
     it("is idempotent: tickets already SENT are not re-emailed", async () => {
       findByTicketIdMock.mockImplementation(async (ticketId: number) => record(ticketId, "SENT"));
 
-      const res = await request(app)
+      const res = await api
         .post("/notifications/order-confirmation")
         .send(twoTickets);
 
@@ -178,7 +213,7 @@ describe("notification service app", () => {
         ticketId === 1 ? record(1, "SENT") : null,
       );
 
-      const res = await request(app)
+      const res = await api
         .post("/notifications/order-confirmation")
         .send(twoTickets);
 
@@ -196,7 +231,7 @@ describe("notification service app", () => {
     it("retries a previously FAILED ticket instead of treating it as already sent", async () => {
       findByTicketIdMock.mockResolvedValue(record(1, "FAILED"));
 
-      await request(app).post("/notifications/order-confirmation").send(validPayload);
+      await api.post("/notifications/order-confirmation").send(validPayload);
 
       expect(sendTicketConfirmationMock).toHaveBeenCalledTimes(1);
     });
@@ -204,7 +239,7 @@ describe("notification service app", () => {
     it("records FAILED but still emails the other tickets when one send throws", async () => {
       sendTicketConfirmationMock.mockRejectedValueOnce(new Error("smtp exploded"));
 
-      const res = await request(app)
+      const res = await api
         .post("/notifications/order-confirmation")
         .send(twoTickets);
 
@@ -223,14 +258,14 @@ describe("notification service app", () => {
 
   describe("POST /notifications/event-cancellation", () => {
     it("rejects an invalid payload without touching the repository or email", async () => {
-      const res = await request(app).post("/notifications/event-cancellation").send({ orderId: 123 });
+      const res = await api.post("/notifications/event-cancellation").send({ orderId: 123 });
       expect(res.status).toBe(400);
       expect(claimCancellationMock).not.toHaveBeenCalled();
       expect(sendEventCancellationMock).not.toHaveBeenCalled();
     });
 
     it("records a PENDING row, sends one email for the order, then marks it SENT", async () => {
-      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+      const res = await api.post("/notifications/event-cancellation").send(cancellationPayload);
 
       expect(claimCancellationMock).toHaveBeenCalledWith({
         orderId: 123,
@@ -253,7 +288,7 @@ describe("notification service app", () => {
       for (const status of ["SENT", "FAILED", "PENDING"]) {
         findCancellationByOrderIdMock.mockResolvedValue(cancellationRecord(status));
 
-        const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+        const res = await api.post("/notifications/event-cancellation").send(cancellationPayload);
 
         expect(res.status).toBe(200);
         expect(res.body.notification).toEqual(cancellationRecord(status));
@@ -266,7 +301,7 @@ describe("notification service app", () => {
       claimCancellationMock.mockRejectedValue(new Error("Data truncated for column 'type'"));
       const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+      const res = await api.post("/notifications/event-cancellation").send(cancellationPayload);
 
       expect(res.status).toBe(500);
       expect(sendEventCancellationMock).not.toHaveBeenCalled();
@@ -276,7 +311,7 @@ describe("notification service app", () => {
     it("records FAILED when the email cannot be sent", async () => {
       sendEventCancellationMock.mockRejectedValue(new Error("smtp exploded"));
 
-      const res = await request(app).post("/notifications/event-cancellation").send(cancellationPayload);
+      const res = await api.post("/notifications/event-cancellation").send(cancellationPayload);
 
       expect(recordOutcomeMock).toHaveBeenCalledWith(900, "FAILED", "smtp exploded");
       expect(res.status).toBe(201);
@@ -286,21 +321,21 @@ describe("notification service app", () => {
 
   describe("GET /notifications/:orderId", () => {
     it("rejects a non-integer orderId", async () => {
-      const res = await request(app).get("/notifications/abc");
+      const res = await api.get("/notifications/abc");
       expect(res.status).toBe(400);
       expect(listByOrderIdMock).not.toHaveBeenCalled();
     });
 
     it("returns 404 when no notification exists for the order", async () => {
       listByOrderIdMock.mockResolvedValue([]);
-      const res = await request(app).get("/notifications/999");
+      const res = await api.get("/notifications/999");
       expect(res.status).toBe(404);
     });
 
     it("returns every ticket's record for the order", async () => {
       const records = [record(1, "SENT"), record(2, "FAILED")];
       listByOrderIdMock.mockResolvedValue(records);
-      const res = await request(app).get("/notifications/123");
+      const res = await api.get("/notifications/123");
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ orderId: 123, notifications: records });
     });

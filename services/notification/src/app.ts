@@ -1,4 +1,5 @@
-import express, { type Request, type Response } from "express";
+import { timingSafeEqual } from "node:crypto";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { EmailService, eventCancellationSubject, ticketConfirmationSubject } from "./email.js";
 import {
   claimCancellation,
@@ -23,13 +24,32 @@ function getEmailService(): EmailService {
   return emailService;
 }
 
-export function createApp() {
+/**
+ * Only the ticket service calls /notifications/*, over Service Connect, and it
+ * sends INTERNAL_API_TOKEN as x-internal-token. With no token configured every
+ * request is refused, so a missing secret cannot leave the routes open.
+ */
+function requireInternalToken(expected: string) {
+  const expectedBytes = Buffer.from(expected);
+  return (req: Request, res: Response, next: NextFunction) => {
+    const given = Buffer.from(req.header("x-internal-token") ?? "");
+    if (!expected || given.length !== expectedBytes.length || !timingSafeEqual(given, expectedBytes)) {
+      res.status(401).json({ error: "internal token required" });
+      return;
+    }
+    next();
+  };
+}
+
+export function createApp(internalApiToken = process.env.INTERNAL_API_TOKEN ?? "") {
   const app = express();
   app.use(express.json());
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", service: SERVICE });
   });
+
+  app.use("/notifications", requireInternalToken(internalApiToken));
 
   // Called by the ticket service once payment is confirmed and tickets are
   // issued. Sends one email per ticket, each carrying only that ticket's QR
@@ -141,7 +161,7 @@ export function createApp() {
   });
 
   // Express only recognizes an error handler by its four-argument arity.
-  app.use((err: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     console.error(err);
     res.status(500).json({ error: "internal error" });
   });

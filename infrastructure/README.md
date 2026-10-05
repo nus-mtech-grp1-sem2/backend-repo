@@ -70,7 +70,9 @@ routed by path prefix, which Kong strips before forwarding:
 | `/api/queue/...`            | queue service                |
 | `/api/order/...`            | order service                |
 | `/api/ticket/...`           | ticket service               |
-| `/api/notification/...`     | notification service         |
+
+The notification service has no route: only the ticket service calls it, with
+`x-internal-token: $INTERNAL_API_TOKEN`.
 
 The services themselves are **not** reachable from the host — they only listen
 on the internal compose network. To debug one directly, add a `ports:` entry to

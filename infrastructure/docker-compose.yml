@@ -152,6 +152,8 @@ services:
       TICKET_INTERNAL_SHARED_SECRET: ${TICKET_INTERNAL_SHARED_SECRET:?TICKET_INTERNAL_SHARED_SECRET not set in variables.env}
       # Booking confirmation emails (QR codes) are sent by the notification service.
       NOTIFICATION_SERVICE_URL: ${NOTIFICATION_SERVICE_URL:-http://notification:3006}
+      # Sent as x-internal-token; the notification service refuses requests without it.
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
       ORDER_EVENTS_QUEUE_URL: ${ORDER_EVENTS_QUEUE_URL:-}
@@ -175,9 +177,12 @@ services:
       DB_USER: ${DB_USER:-onestage}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set in .env}
       DB_SSL: ${DB_SSL:-false}
+      DB_SSL_REJECT_UNAUTHORIZED: ${DB_SSL_REJECT_UNAUTHORIZED:-true}
       # Gmail SMTP sender for booking confirmation emails.
       SMTP_USER: ${SMTP_USER:-onestagecontacts@gmail.com}
       SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:?SMTP_APP_PASSWORD not set in .env}
+      # Every /notifications route requires this as x-internal-token (from ticket).
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
 
   auth:
     <<: *service
