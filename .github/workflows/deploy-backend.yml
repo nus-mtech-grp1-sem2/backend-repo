@@ -11,6 +11,10 @@ on:
       - "infrastructure/kong/**"
   workflow_dispatch:
     inputs:
+      run_load_test:
+        description: "Run the read-only Grafana Cloud k6 gate after deployment"
+        type: boolean
+        default: false
       force_deploy:
         description: "Emergency only: deploy even if lint, build or unit tests fail (they still run)"
         type: boolean
@@ -147,3 +151,82 @@ jobs:
           aws ecs wait services-stable \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "onestage-${{ matrix.service }}"
+
+  k6-read-only:
+    needs: deploy
+    if: >-
+      ${{ !cancelled() &&
+        needs.deploy.result == 'success' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.run_load_test }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Grafana Cloud k6 configuration
+        env:
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+          K6_BASE_URL: ${{ vars.K6_BASE_URL }}
+          K6_CLOUD_PROJECT_ID: ${{ vars.K6_CLOUD_PROJECT_ID }}
+          K6_CLOUD_STACK_ID: ${{ vars.K6_CLOUD_STACK_ID }}
+          K6_LOAD_ZONE: ${{ vars.K6_LOAD_ZONE }}
+        run: |
+          missing=0
+          for name in K6_CLOUD_TOKEN K6_BASE_URL K6_CLOUD_PROJECT_ID K6_CLOUD_STACK_ID K6_LOAD_ZONE; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not configured"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: v2.3.0
+
+      # The load runs only after every ECS service has stabilized. A failed
+      # threshold makes this workflow red but does not roll back the deployment.
+      - name: Run read-only deployment gate
+        id: k6
+        continue-on-error: true
+        uses: grafana/run-k6-action@4082a08c7e40cf6d65863911077dfb60ae0a4f04 # v1.5.0
+        env:
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+          K6_BASE_URL: ${{ vars.K6_BASE_URL }}
+          K6_CLOUD_PROJECT_ID: ${{ vars.K6_CLOUD_PROJECT_ID }}
+          K6_CLOUD_STACK_ID: ${{ vars.K6_CLOUD_STACK_ID }}
+          K6_LOAD_ZONE: ${{ vars.K6_LOAD_ZONE }}
+        with:
+          path: k6/deployment-gate.js
+          cloud-run-locally: false
+          cloud-comment-on-pr: false
+          fail-fast: true
+          flags: >-
+            --env K6_BASE_URL=${{ vars.K6_BASE_URL }}
+            --env K6_CLOUD_PROJECT_ID=${{ vars.K6_CLOUD_PROJECT_ID }}
+            --env K6_CLOUD_STACK_ID=${{ vars.K6_CLOUD_STACK_ID }}
+            --env K6_LOAD_ZONE=${{ vars.K6_LOAD_ZONE }}
+
+      - name: Record k6 result
+        if: always()
+        env:
+          OUTCOME: ${{ steps.k6.outcome }}
+          TEST_RUN_IDS: ${{ steps.k6.outputs.testRunIds }}
+        run: |
+          {
+            echo "## Grafana Cloud k6 deployment gate"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Outcome | $OUTCOME |"
+            echo "| Test run IDs | ${TEST_RUN_IDS:-unavailable} |"
+            echo "| Deployment | retained; no automatic rollback |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce k6 result
+        if: steps.k6.outcome == 'failure'
+        run: |
+          echo "::error::Grafana Cloud k6 deployment gate failed; deployment was retained"
+          exit 1
