@@ -23,7 +23,7 @@ function positiveInteger(value, fallback) {
 
 function baseUrl() {
   const value = (__ENV.K6_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
-  if (!/^https:\/\//.test(value) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(value)) {
+  if (!value.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(value)) {
     throw new Error("K6_BASE_URL must use HTTPS unless it targets localhost");
   }
   return value;
@@ -140,10 +140,9 @@ function requestParams(endpointType, name, token = null, expectedStatuses = null
 
 function jsonRequestParams(endpointType, name, token = null, expectedStatuses = null) {
   const params = requestParams(endpointType, name, token, expectedStatuses);
-  params.headers = {
-    ...(params.headers || {}),
-    "Content-Type": "application/json",
-  };
+  params.headers = params.headers
+    ? { ...params.headers, "Content-Type": "application/json" }
+    : { "Content-Type": "application/json" };
   return params;
 }
 
@@ -196,7 +195,7 @@ function authenticateCredential(credential, index) {
   );
   cognitoAuthDuration.add(Date.now() - startedAt);
   const body = parseJson(response);
-  const token = body && body.AuthenticationResult && body.AuthenticationResult.AccessToken;
+  const token = body?.AuthenticationResult?.AccessToken;
   const ok = response.status === 200 && typeof token === "string" && token.length > 0;
   cognitoAuthSuccess.add(ok, { user_index: String(index + 1) });
   check(response, { "Cognito authentication succeeds": () => ok });
@@ -207,7 +206,7 @@ function authenticateCredential(credential, index) {
 export async function setup() {
   const rawSecret = await secrets.get(COGNITO_SECRET_NAME);
   const credentials = validateCredentials(rawSecret);
-  const tokens = credentials.map(authenticateCredential);
+  const tokens = credentials.map((credential, index) => authenticateCredential(credential, index));
 
   const response = http.get(
     `${baseUrl()}/api/event/events`,
@@ -277,8 +276,8 @@ function authenticatedJourney(data, token) {
   if (data.seatedEventId) recordResponse(responses[2], 200, "seat inventory");
 
   const tickets = parseJson(responses[0]);
-  const firstTicket = tickets && Array.isArray(tickets.tickets) ? tickets.tickets[0] : null;
-  if (firstTicket && firstTicket.ticket_id) {
+  const firstTicket = Array.isArray(tickets?.tickets) ? tickets.tickets[0] : null;
+  if (firstTicket?.ticket_id) {
     const detail = http.get(
       `${baseUrl()}/api/ticket/tickets/${firstTicket.ticket_id}`,
       requestParams("authenticated", "ticket_detail", token, [200]),

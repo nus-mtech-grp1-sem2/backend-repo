@@ -1,5 +1,5 @@
-import readOnlySuite, { deploymentOptions, setup as suiteSetup } from "./read-only.js";
+import readOnlySuite, { deploymentOptions } from "./read-only.js";
 
 export const options = deploymentOptions();
-export const setup = suiteSetup;
+export { setup } from "./read-only.js";
 export default readOnlySuite;
