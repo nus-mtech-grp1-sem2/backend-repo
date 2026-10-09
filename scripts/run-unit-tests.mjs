@@ -1,3 +1,4 @@
+import { mkdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +53,10 @@ const coverageArgs =
         '--test-reporter-destination=coverage/node.lcov',
       ]
     : [];
+
+if (process.env.COVERAGE === '1') {
+  await mkdir(path.join(repositoryRoot, 'coverage'), { recursive: true });
+}
 
 let exitCode = await run(process.execPath, [
   ...coverageArgs,
