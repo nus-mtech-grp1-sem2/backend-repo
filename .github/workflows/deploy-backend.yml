@@ -184,7 +184,7 @@ jobs:
       - name: Install k6
         uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
         with:
-          k6-version: v2.3.0
+          k6-version: 2.3.0
 
       # The load runs only after every ECS service has stabilized. A failed
       # threshold is reported but does not fail or roll back the deployment.
