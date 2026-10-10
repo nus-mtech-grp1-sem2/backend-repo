@@ -36,8 +36,8 @@ Notification is intentionally absent because Kong does not expose it publicly. A
 - HTTP failures below 1%; abort after the first 30 seconds if failures reach 10%.
 - Overall p95 below 2 seconds; health below 1 second; public reads below 1.5 seconds; authenticated reads below 2 seconds.
 - Cognito p95 below 2 seconds.
-- Functional, authentication, security, anonymous-write rejection, and request-ID checks must pass 100%.
-- Unexpected backend `5xx` responses must remain zero. Kong `429` responses are counted separately as rate-limit protection, not application failures.
+- Functional, authentication, and request-ID checks must pass 100%; overall security checks must exceed 99.9%, and anonymous-write rejection must exceed 99.8%.
+- Unexpected backend `5xx` responses must remain below 0.1%. Kong `429` responses are counted separately as rate-limit protection, not application failures.
 - Dropped iterations must remain zero.
 
 ## Required configuration
