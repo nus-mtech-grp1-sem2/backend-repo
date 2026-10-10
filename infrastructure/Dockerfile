@@ -22,4 +22,4 @@ ENV SERVICE=event
 # on the host would never trigger a reload. nodemon's --legacy-watch polls the
 # mounted directory instead, which does see host edits. It only supervises the
 # process; tsx still does the TypeScript execution.
-CMD ["sh", "-c", "./node_modules/.bin/nodemon --legacy-watch --quiet --watch services/$SERVICE/src --ext ts,json --exec \"./node_modules/.bin/tsx services/$SERVICE/src/index.ts\""]
+CMD ["sh", "-c", "./node_modules/.bin/nodemon --legacy-watch --polling-interval 100 --quiet --watch services/$SERVICE/src --ext ts,json --exec \"./node_modules/.bin/tsx services/$SERVICE/src/index.ts\""]
