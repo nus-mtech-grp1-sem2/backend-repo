@@ -2,7 +2,7 @@ import exec from "k6/execution";
 import http from "k6/http";
 import secrets from "k6/secrets";
 import { check, sleep } from "k6";
-import { Rate, Trend } from "k6/metrics";
+import { Counter, Rate, Trend } from "k6/metrics";
 
 const DEFAULT_BASE_URL = "https://d3vlw6jnm44c4l.cloudfront.net";
 const COGNITO_REGION = "ap-southeast-1";
@@ -15,6 +15,9 @@ const securitySuccess = new Rate("security_success");
 const correlationIdSuccess = new Rate("correlation_id_success");
 const cognitoAuthSuccess = new Rate("cognito_auth_success");
 const cognitoAuthDuration = new Trend("cognito_auth_duration", true);
+const unauthorizedWriteRejected = new Rate("unauthorized_write_rejected");
+const rateLimitedRequests = new Counter("rate_limited_requests");
+const unexpectedServerError = new Rate("unexpected_server_error");
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
@@ -54,6 +57,8 @@ const thresholds = {
   "http_req_duration{endpoint_type:authenticated}": ["p(95)<2000"],
   functional_success: ["rate==1"],
   security_success: ["rate==1"],
+  unauthorized_write_rejected: ["rate==1"],
+  unexpected_server_error: ["rate==0"],
   correlation_id_success: ["rate==1"],
   cognito_auth_success: ["rate==1"],
   cognito_auth_duration: ["p(95)<2000"],
@@ -67,7 +72,8 @@ export function deploymentOptions() {
     scenarios: {
       read_only: {
         executor: "ramping-vus",
-        startVUs: 0,
+        exec: "readOnlyJourney",
+        startVUs: 1,
         gracefulStop: "0s",
         gracefulRampDown: "0s",
         stages: [
@@ -77,6 +83,15 @@ export function deploymentOptions() {
           { target: 50, duration: "2m" },
           { target: 0, duration: "30s" },
         ],
+      },
+      security_probe: {
+        executor: "constant-arrival-rate",
+        exec: "securityProbe",
+        rate: 1,
+        timeUnit: "1s",
+        duration: "5m",
+        preAllocatedVUs: 2,
+        maxVUs: 5,
       },
     },
     thresholds,
@@ -90,16 +105,27 @@ export function manualOptions() {
     scenarios: {
       read_only: {
         executor: "ramping-vus",
-        startVUs: 0,
+        exec: "readOnlyJourney",
+        startVUs: 1,
         gracefulStop: "0s",
         gracefulRampDown: "0s",
         stages: [
+          { target: 1, duration: "30s" },
           { target: 10, duration: "1m" },
           { target: 10, duration: "2m" },
-          { target: 50, duration: "2m" },
-          { target: 50, duration: "8m" },
-          { target: 0, duration: "2m" },
+          { target: 50, duration: "1m" },
+          { target: 50, duration: "3m" },
+          { target: 0, duration: "1m" },
         ],
+      },
+      security_probe: {
+        executor: "constant-arrival-rate",
+        exec: "securityProbe",
+        rate: 1,
+        timeUnit: "1s",
+        duration: "8m30s",
+        preAllocatedVUs: 2,
+        maxVUs: 5,
       },
     },
     thresholds,
@@ -116,13 +142,15 @@ function parseJson(response) {
   }
 }
 
-function recordResponse(response, expectedStatus, label, metric = functionalSuccess) {
-  const statusOk = response.status === expectedStatus;
+function recordResponse(response, expectedStatuses, label, metric = functionalSuccess) {
+  const acceptedStatuses = Array.isArray(expectedStatuses) ? expectedStatuses : [expectedStatuses];
+  const statusOk = acceptedStatuses.includes(response.status);
   const requestIdOk = Boolean(response.headers["X-Request-Id"]);
   metric.add(statusOk, { check: label });
+  unexpectedServerError.add(response.status >= 500, { check: label });
   correlationIdSuccess.add(requestIdOk, { check: label });
   check(response, {
-    [`${label}: status ${expectedStatus}`]: () => statusOk,
+    [`${label}: status ${acceptedStatuses.join(" or ")}`]: () => statusOk,
     [`${label}: request id returned`]: () => requestIdOk,
   });
   return statusOk;
@@ -286,21 +314,28 @@ function authenticatedJourney(data, token) {
   }
 }
 
+function recordUnauthorizedWrite(response, label) {
+  const rejected = response.status === 401 || response.status === 429;
+  unauthorizedWriteRejected.add(rejected, { check: label });
+  if (response.status === 429) rateLimitedRequests.add(1, { check: label });
+  return recordResponse(response, [401, 429], label, securitySuccess);
+}
+
 function queueBookingGuardJourney(data, token) {
   const emptyBody = JSON.stringify({});
   const responses = http.batch([
     ["GET", `${baseUrl()}/api/queue/events/not-an-event/queue/me`, null, requestParams("security", "queue_me_invalid_event", token, [400])],
-    ["POST", `${baseUrl()}/api/queue/events/${data.eventId}/queue/join`, emptyBody, jsonRequestParams("security", "queue_join_unauthenticated", null, [401])],
-    ["POST", `${baseUrl()}/api/inventory/events/${data.eventId}/holds`, emptyBody, jsonRequestParams("security", "hold_unauthenticated", null, [401])],
-    ["POST", `${baseUrl()}/api/order/orders`, emptyBody, jsonRequestParams("security", "order_create_unauthenticated", null, [401])],
-    ["POST", `${baseUrl()}/api/order/orders/1/payment`, emptyBody, jsonRequestParams("security", "payment_unauthenticated", null, [401])],
+    ["POST", `${baseUrl()}/api/queue/events/${data.eventId}/queue/join`, emptyBody, jsonRequestParams("security", "queue_join_unauthenticated", null, [401, 429])],
+    ["POST", `${baseUrl()}/api/inventory/events/${data.eventId}/holds`, emptyBody, jsonRequestParams("security", "hold_unauthenticated", null, [401, 429])],
+    ["POST", `${baseUrl()}/api/order/orders`, emptyBody, jsonRequestParams("security", "order_create_unauthenticated", null, [401, 429])],
+    ["POST", `${baseUrl()}/api/order/orders/1/payment`, emptyBody, jsonRequestParams("security", "payment_unauthenticated", null, [401, 429])],
     ["GET", `${baseUrl()}/api/order/orders/not-an-order`, null, requestParams("security", "order_detail_invalid_id", token, [400])],
   ]);
   recordResponse(responses[0], 400, "queue position rejects invalid event", securitySuccess);
-  recordResponse(responses[1], 401, "queue join rejects anonymous", securitySuccess);
-  recordResponse(responses[2], 401, "hold rejects anonymous", securitySuccess);
-  recordResponse(responses[3], 401, "order creation rejects anonymous", securitySuccess);
-  recordResponse(responses[4], 401, "payment rejects anonymous", securitySuccess);
+  recordUnauthorizedWrite(responses[1], "queue join rejects anonymous");
+  recordUnauthorizedWrite(responses[2], "hold rejects anonymous");
+  recordUnauthorizedWrite(responses[3], "order creation rejects anonymous");
+  recordUnauthorizedWrite(responses[4], "payment rejects anonymous");
   recordResponse(responses[5], 400, "order detail rejects invalid ID", securitySuccess);
 }
 
@@ -313,13 +348,19 @@ function securityJourney() {
   recordResponse(responses[1], 401, "tickets reject anonymous", securitySuccess);
 }
 
-export default function readOnlySuite(data) {
+export function readOnlyJourney(data) {
   const token = data.tokens[(__VU - 1) % data.tokens.length];
-  const journey = exec.scenario.iterationInTest % 5;
+  const journey = exec.scenario.iterationInTest % 4;
   if (journey === 0) healthJourney();
   else if (journey === 1) publicJourney(data);
   else if (journey === 2) authenticatedJourney(data, token);
-  else if (journey === 3) securityJourney();
-  else queueBookingGuardJourney(data, token);
+  else securityJourney();
   sleep(1);
 }
+
+export function securityProbe(data) {
+  const token = data.tokens[(__VU - 1) % data.tokens.length];
+  queueBookingGuardJourney(data, token);
+}
+
+export default readOnlyJourney;
