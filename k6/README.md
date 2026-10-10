@@ -6,8 +6,8 @@ This suite exercises the deployed public and customer read paths without creatin
 
 | Profile | Trigger | Shape | Maximum |
 |---|---|---|---|
-| Deployment | `Deploy backend` workflow dispatch with `run_load_test=true` | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 5 minutes, about 2.75 VUh |
-| Manual | Grafana Cloud k6 website | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 8.5 minutes, about 4.13 VUh |
+| Deployment | `Deploy backend` workflow dispatch with `run_load_test=true` | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 5 minutes, up to about 4.6 VUh |
+| Manual | Grafana Cloud k6 website | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 8.5 minutes, Grafana estimate 7.8 VUh |
 | Disposable concurrency | Pull request or manual GitHub Action | 20 VUs race 50 one-ticket holds against 10 tickets | Local CI only, under 30 seconds, no AWS usage |
 
 The Grafana project quota remains the hard monthly control and should stay at 200 VUh. The script does not modify Grafana billing or quota configuration.
@@ -84,7 +84,7 @@ The k6 scenario sends 50 one-ticket hold attempts from 20 VUs against a 10-ticke
 4. Paste the complete contents of `k6/read-only.js`. It is standalone and defaults to the manual profile.
 5. Save it as `OneStage read-only manual`. Select **Create** to retain it without running, or **Create and run** when a test is intended.
 
-Do not set `K6_PROFILE=deployment` on the website test; that value is reserved for the GitHub gate. Confirm the Singapore load zone and estimated VUh in the run preview before starting.
+The website profile is deliberately a static export so Grafana can show its VUh estimate before starting. The separate `k6/deployment-gate.js` entry point selects the shorter GitHub profile. Confirm the Singapore load zone and estimated VUh in the run preview before starting.
 
 ## Static validation
 

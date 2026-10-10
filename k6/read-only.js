@@ -98,41 +98,47 @@ export function deploymentOptions() {
   };
 }
 
-export function manualOptions() {
-  return {
-    cloud: cloudOptions("OneStage read-only manual"),
-    discardResponseBodies: false,
-    scenarios: {
-      read_only: {
-        executor: "ramping-vus",
-        exec: "readOnlyJourney",
-        startVUs: 1,
-        gracefulStop: "0s",
-        gracefulRampDown: "0s",
-        stages: [
-          { target: 1, duration: "30s" },
-          { target: 10, duration: "1m" },
-          { target: 10, duration: "2m" },
-          { target: 50, duration: "1m" },
-          { target: 50, duration: "3m" },
-          { target: 0, duration: "1m" },
-        ],
-      },
-      security_probe: {
-        executor: "constant-arrival-rate",
-        exec: "securityProbe",
-        rate: 1,
-        timeUnit: "1s",
-        duration: "8m30s",
-        preAllocatedVUs: 2,
-        maxVUs: 5,
-      },
+// Keep the website profile as a literal export. Grafana's editor can then
+// validate the load shape and display the VUh estimate before a run starts.
+// The deployment workflow uses deployment-gate.js and deploymentOptions().
+export const options = {
+  cloud: {
+    name: "OneStage read-only manual",
+    stackID: 1607186,
+    projectID: 8484325,
+    distribution: {
+      singapore: { loadZone: "amazon:sg:singapore", percent: 100 },
     },
-    thresholds,
-  };
-}
-
-export const options = __ENV.K6_PROFILE === "deployment" ? deploymentOptions() : manualOptions();
+  },
+  discardResponseBodies: false,
+  scenarios: {
+    read_only: {
+      executor: "ramping-vus",
+      exec: "readOnlyJourney",
+      startVUs: 1,
+      gracefulStop: "0s",
+      gracefulRampDown: "0s",
+      stages: [
+        { target: 1, duration: "30s" },
+        { target: 10, duration: "1m" },
+        { target: 10, duration: "2m" },
+        { target: 50, duration: "1m" },
+        { target: 50, duration: "3m" },
+        { target: 0, duration: "1m" },
+      ],
+    },
+    security_probe: {
+      executor: "constant-arrival-rate",
+      exec: "securityProbe",
+      rate: 1,
+      timeUnit: "1s",
+      duration: "8m30s",
+      preAllocatedVUs: 2,
+      maxVUs: 5,
+    },
+  },
+  thresholds,
+};
 
 function parseJson(response) {
   try {
