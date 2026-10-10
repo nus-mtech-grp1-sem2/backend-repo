@@ -42,7 +42,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.2.0",
     "@types/qrcode": "^1.5.5",
-    "concurrently": "^10.0.4",
+    "concurrently": "^10.0.6",
     "cross-env": "^10.1.0",
     "nodemon": "^3.1.14",
     "tsx": "^4.23.12",
@@ -51,5 +51,10 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "mysql2": "^3.23.3"
+  },
+  "overrides": {
+    "nodemon": {
+      "chokidar": "^4.0.3"
+    }
   }
 }
