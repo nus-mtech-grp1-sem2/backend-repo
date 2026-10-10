@@ -36,7 +36,7 @@ if (!Number.isSafeInteger(eventId) || eventId <= 0 || !Number.isSafeInteger(inve
   throw new Error("K6_EVENT_ID and K6_INVENTORY_ITEM_ID must be positive integers");
 }
 
-export default function () {
+export default function oversellRace() {
   const customer = `k6-${exec.vu.idInTest}-${exec.scenario.iterationInTest}`;
   const response = http.post(
     `${baseUrl}/events/${eventId}/holds`,

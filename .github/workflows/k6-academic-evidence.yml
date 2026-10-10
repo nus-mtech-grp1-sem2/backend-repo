@@ -23,7 +23,7 @@ jobs:
       mysql:
         image: mysql:8.4
         env:
-          MYSQL_ROOT_PASSWORD: k6-ci-only
+          MYSQL_ROOT_PASSWORD: k6-ci-${{ github.run_id }}-${{ github.run_attempt }}
         ports:
           - 3306:3306
         options: >-
@@ -35,7 +35,7 @@ jobs:
       DB_HOST: 127.0.0.1
       DB_PORT: 3306
       DB_USER: root
-      DB_PASSWORD: k6-ci-only
+      DB_PASSWORD: k6-ci-${{ github.run_id }}-${{ github.run_attempt }}
       DB_SSL: 'false'
       K6_FIXTURE_ENV_FILE: /tmp/onestage-k6-fixture.env
       K6_FIXTURE_PID_FILE: /tmp/onestage-k6-fixture.pid
