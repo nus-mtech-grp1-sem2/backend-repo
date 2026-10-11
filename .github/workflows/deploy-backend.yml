@@ -37,6 +37,9 @@ jobs:
   # Lint, build and unit tests on the commit being deployed. They always run,
   # forced deploy or not, so a forced deploy still records what failed.
   quality:
+    permissions:
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/backend-quality.yml
 
   build-and-push:
