@@ -7,6 +7,7 @@
     "build": "tsc --project tsconfig.build.json",
     "test": "npm run test:unit",
     "test:unit": "node scripts/run-unit-tests.mjs",
+    "test:coverage": "cross-env COVERAGE=1 node scripts/run-unit-tests.mjs && node scripts/merge-lcov.mjs",
     "dev": "docker compose -f infrastructure/docker-compose.yml --env-file .env up --build",
     "dev:aws": "docker compose -f infrastructure/docker-compose.yml --env-file variables.env up --build",
     "db:check": "node scripts/check-db.mjs",
