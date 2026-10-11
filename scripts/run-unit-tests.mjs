@@ -25,6 +25,8 @@ const nodeTestFiles = [
   source('event', 'src', 'index.test.ts'),
   source('event', 'src', 'team-membership-access.test.ts'),
   source('inventory', 'src', 'index.test.ts'),
+  source('inventory', 'src', 'inventory.test.ts'),
+  source('inventory', 'src', 'holds.test.ts'),
   source('queue', 'src', 'index.test.ts'),
   source('queue', 'src', 'purchase-window.test.ts'),
   source('order', 'src', 'index.test.ts'),
