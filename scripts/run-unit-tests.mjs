@@ -41,6 +41,7 @@ const nodeTestFiles = [
   source('ticket', 'src', 'attendees.test.ts'),
   source('ticket', 'src', 'orders-summary.test.ts'),
   source('ticket', 'src', 'tickets.test.ts'),
+  source('ticket', 'src', 'scanner.test.ts'),
 ];
 
 const coverageArgs =
