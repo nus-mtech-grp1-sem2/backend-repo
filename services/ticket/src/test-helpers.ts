@@ -75,8 +75,8 @@ export async function createEventFixture(): Promise<EventFixture> {
   const suffix = uniqueSuffix();
   const organiserSub = `tdd-organiser-${suffix}`;
   const [eventResult] = await eventInventoryPool.execute<mysql.ResultSetHeader>(
-    "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
-      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 'TIER1_GA', 'PUBLISHED')",
+    "INSERT INTO events (organiser_sub, title, venue, starts_at, total_seats, tier, status) " +
+      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 0, 'TIER1_GA', 'PUBLISHED')",
     [organiserSub, `TDD-TEST-EVENT-${suffix}`],
   );
   const eventId = eventResult.insertId;

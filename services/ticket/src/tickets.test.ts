@@ -12,7 +12,9 @@ import {
   createEventFixture,
   createTicketFixture,
   destroyFixture,
+  checkoutPool,
   eventInventoryPool,
+  queuePool,
   ticketingPool,
 } from './test-helpers.js';
 import { app, database, __setVerifierForTests } from './index.js';
@@ -35,7 +37,7 @@ after(async () => {
   // until the keep-alive socket times out; force it closed immediately instead.
   server.closeAllConnections();
   await closed;
-  await Promise.all([eventInventoryPool.end(), ticketingPool.end(), database.end()]);
+  await Promise.all([eventInventoryPool.end(), ticketingPool.end(), checkoutPool.end(), queuePool.end(), database.end()]);
 });
 
 test('customer can fetch their own issued tickets, but not another customer\'s', async () => {
