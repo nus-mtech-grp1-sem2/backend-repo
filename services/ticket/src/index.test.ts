@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, describe, it, mock } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   app,
@@ -209,6 +210,29 @@ describe('booking confirmation email hook', () => {
     }
   });
 
+  it('aborts a timed-out confirmation request and returns false without throwing', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    let requestSignal: AbortSignal | null | undefined;
+    try {
+      const requester: typeof fetch = async (_url, init) => {
+        requestSignal = init?.signal;
+        assert.ok(requestSignal instanceof AbortSignal);
+        await delay(20);
+        requestSignal.throwIfAborted();
+        return new Response('{}', { status: 201 });
+      };
+
+      assert.equal(await notifyOrderConfirmed(42, async () => payload, 'http://notification:3006', requester, 1), false);
+      assert.ok(requestSignal?.aborted);
+      assert.equal(requestSignal.reason.name, 'TimeoutError');
+      assert.equal(logged.mock.callCount(), 1);
+      assert.equal(logged.mock.calls[0]?.arguments[0], 'order confirmation email request failed');
+      assert.equal(logged.mock.calls[0]?.arguments[1].orderId, 42);
+    } finally {
+      logged.mock.restore();
+    }
+  });
+
   it('does nothing when no notification service is configured', async () => {
     let loaded = false;
     const sent = await notifyOrderConfirmed(
@@ -290,6 +314,29 @@ describe('event cancellation email hook', () => {
         })) as typeof fetch;
       assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006', requester), true);
       assert.deepEqual(logged.mock.calls[0]?.arguments[1], { orderId: 42, reason: 'smtp exploded' });
+    } finally {
+      logged.mock.restore();
+    }
+  });
+
+  it('aborts a timed-out cancellation request and returns false without throwing', async () => {
+    const logged = mock.method(console, 'error', () => undefined);
+    let requestSignal: AbortSignal | null | undefined;
+    try {
+      const requester: typeof fetch = async (_url, init) => {
+        requestSignal = init?.signal;
+        assert.ok(requestSignal instanceof AbortSignal);
+        await delay(20);
+        requestSignal.throwIfAborted();
+        return new Response('{}', { status: 201 });
+      };
+
+      assert.equal(await notifyEventCancelled(42, async () => payload, 'http://notification:3006', requester, 1), false);
+      assert.ok(requestSignal?.aborted);
+      assert.equal(requestSignal.reason.name, 'TimeoutError');
+      assert.equal(logged.mock.callCount(), 1);
+      assert.equal(logged.mock.calls[0]?.arguments[0], 'event cancellation email request failed');
+      assert.equal(logged.mock.calls[0]?.arguments[1].orderId, 42);
     } finally {
       logged.mock.restore();
     }

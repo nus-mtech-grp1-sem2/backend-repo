@@ -174,6 +174,7 @@ export interface TicketFixtureInput {
   readonly seatId?: number | null;
   readonly status?: 'ISSUED' | 'CHECKED_IN' | 'VOID';
   readonly orderId?: number;
+  readonly orderItemId?: number;
 }
 
 /** Inserts a ticket directly into `ticketing.tickets`, bypassing the order
@@ -186,9 +187,10 @@ export async function createTicketFixture(input: TicketFixtureInput): Promise<nu
   const [result] = await ticketingPool.execute<mysql.ResultSetHeader>(
     `INSERT INTO tickets
        (order_id, order_item_id, event_id, customer_sub, customer_email, seat_id, qr_token, status)
-     VALUES (?, 1, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.orderId ?? 1,
+      input.orderItemId ?? 1,
       input.eventId,
       input.customerSub,
       `${input.customerSub}@test.example`,
@@ -210,7 +212,15 @@ export async function destroyFixture(eventId: number): Promise<void> {
     await queuePool.execute('DELETE FROM queue_entries WHERE queue_session_id = ?', [row.queue_session_id]);
   }
   await queuePool.execute('DELETE FROM queue_sessions WHERE event_id = ?', [eventId]);
+  await ticketingPool.execute(
+    'DELETE FROM check_in_logs WHERE ticket_id IN (SELECT ticket_id FROM tickets WHERE event_id = ?)',
+    [eventId],
+  );
   await ticketingPool.execute('DELETE FROM tickets WHERE event_id = ?', [eventId]);
+  await checkoutPool.execute(
+    'DELETE FROM order_items WHERE order_id IN (SELECT order_id FROM orders WHERE event_id = ?)',
+    [eventId],
+  );
   await checkoutPool.execute('DELETE FROM orders WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM inventory_items WHERE event_id = ?', [eventId]);
   await eventInventoryPool.execute('DELETE FROM event_team_memberships WHERE event_id = ?', [eventId]);
