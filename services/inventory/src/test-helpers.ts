@@ -53,8 +53,8 @@ export interface GaFixture {
 export async function createGaFixture(totalQty = 10): Promise<GaFixture> {
   const suffix = uniqueSuffix();
   const [eventResult] = await testPool.execute<mysql.ResultSetHeader>(
-    "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
-      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 'TIER1_GA', 'PUBLISHED')",
+    "INSERT INTO events (organiser_sub, title, venue, starts_at, total_seats, tier, status) " +
+      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 0, 'TIER1_GA', 'PUBLISHED')",
     [`tdd-organiser-${suffix}`, `TDD-TEST-EVENT-${suffix}`],
   );
   const eventId = eventResult.insertId;
@@ -74,8 +74,8 @@ export interface SeatedFixture {
 export async function createSeatedFixture(seatCount = 4): Promise<SeatedFixture> {
   const suffix = uniqueSuffix();
   const [eventResult] = await testPool.execute<mysql.ResultSetHeader>(
-    "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
-      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 'TIER2_SEATED', 'PUBLISHED')",
+    "INSERT INTO events (organiser_sub, title, venue, starts_at, total_seats, tier, status) " +
+      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 0, 'TIER2_SEATED', 'PUBLISHED')",
     [`tdd-organiser-${suffix}`, `TDD-TEST-EVENT-${suffix}`],
   );
   const eventId = eventResult.insertId;
@@ -114,8 +114,8 @@ export async function createEventFixture(
   const suffix = uniqueSuffix();
   const organiserSub = `tdd-organiser-${suffix}`;
   const [eventResult] = await testPool.execute<mysql.ResultSetHeader>(
-    "INSERT INTO events (organiser_sub, title, venue, starts_at, tier, status) " +
-      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), ?, ?)",
+    "INSERT INTO events (organiser_sub, title, venue, starts_at, total_seats, tier, status) " +
+      "VALUES (?, ?, 'Test Venue', DATE_ADD(NOW(), INTERVAL 7 DAY), 0, ?, ?)",
     [organiserSub, `TDD-TEST-EVENT-${suffix}`, tier, status],
   );
   const eventId = eventResult.insertId;
