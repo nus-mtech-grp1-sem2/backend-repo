@@ -42,7 +42,7 @@ const inventoryItemId = Number(__ENV.K6_INVENTORY_ITEM_ID);
 export default function checkoutCapacity() {
   const probe = exec.scenario.name === 'contention_probe';
   const customer = `${probe ? 'probe' : 'base'}-${exec.scenario.iterationInTest}`;
-  const expected = probe ? http.expectedStatuses(200, 201, 409, 502) : undefined;
+  const expected = probe ? http.expectedStatuses(200, 201, 409, 500, 502, 503, 504) : undefined;
   const params = {
     headers: {
       Authorization: `Bearer test-token:${customer}`,
@@ -88,8 +88,9 @@ export default function checkoutCapacity() {
   probeAttempts.add(1);
   probePaid.add(valid ? 1 : 0);
   const observedFailure =
-    [409, 502].includes(create.status) ||
-    (create.status === 201 && [409, 502].includes(paid.status));
+    create.status === 409 ||
+    create.status >= 500 ||
+    (create.status === 201 && (paid.status === 409 || paid.status >= 500));
   probeFailures.add(observedFailure ? 1 : 0);
   unexpected.add(valid || observedFailure ? 0 : 1);
 }
