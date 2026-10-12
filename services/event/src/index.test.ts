@@ -262,6 +262,31 @@ describe('organiser endpoints', () => {
     });
   });
 
+  describe('GET /events/:eventId', () => {
+    const EVENT_DETAIL = /FROM events LEFT JOIN \( SELECT event_id, MIN\(price_cents\)/;
+
+    it('prices the event from its cheapest zone and counts seats across every zone, whatever the zones are called', async () => {
+      const row = { event_id: 5, title: 'New Year Party 2027', price_cents: 100, remaining_qty: 400 };
+      on(EVENT_DETAIL, [row]);
+
+      const response = await request('GET', '/events/5');
+
+      assert.deepEqual(response, { status: 200, body: { event: row } });
+      const [query] = calls;
+      assert.deepEqual(query?.params, [5, 5]);
+      assert.match(query?.sql ?? '', /SUM\(total_qty - reserved_qty - sold_qty\) AS remaining_qty FROM inventory_items WHERE event_id = \? GROUP BY event_id/);
+      assert.doesNotMatch(query?.sql ?? '', /General Admission/);
+    });
+
+    it('reports 404 for an event that does not exist', async () => {
+      on(EVENT_DETAIL, []);
+
+      const response = await request('GET', '/events/5');
+
+      assert.deepEqual(response, { status: 404, body: { error: 'event_not_found' } });
+    });
+  });
+
   describe('POST /events', () => {
     it('rejects an invalid event without touching the database', async () => {
       const response = await request('POST', '/events', { token: 'alice', body: { ...newEvent, title: '' } });
