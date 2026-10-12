@@ -299,21 +299,20 @@ app.get('/events/:eventId', async (req, res) => {
   const [rows] = await database.query<mysql.RowDataPacket[]>(
     `SELECT events.event_id, events.organiser_sub, events.title, events.description,
       events.venue, events.starts_at, events.total_seats, events.available_buyers,
-      events.tier, events.status, inventory_items.price_cents,
+      events.tier, events.status, inventory.price_cents,
       CASE WHEN events.tier = 'TIER2_SEATED'
         THEN (SELECT COUNT(*) FROM seats s
           WHERE s.event_id = events.event_id AND s.status = 'AVAILABLE')
-        ELSE COALESCE(
-          inventory_items.total_qty - inventory_items.reserved_qty - inventory_items.sold_qty,
-          0
-        )
+        ELSE CAST(COALESCE(inventory.remaining_qty, 0) AS SIGNED)
       END AS remaining_qty
      FROM events
-     LEFT JOIN inventory_items
-       ON inventory_items.event_id = events.event_id
-       AND inventory_items.name = 'General Admission'
+     LEFT JOIN (
+       SELECT event_id, MIN(price_cents) AS price_cents,
+         SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty
+       FROM inventory_items WHERE event_id = ? GROUP BY event_id
+     ) AS inventory ON inventory.event_id = events.event_id
      WHERE events.event_id = ? LIMIT 1`,
-    [eventId],
+    [eventId, eventId],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });
   res.json({ event: rows[0] });
