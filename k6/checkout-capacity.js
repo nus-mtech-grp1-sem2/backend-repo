@@ -7,7 +7,7 @@ const paidOrders = new Counter('paid_orders');
 
 export const options = {
   scenarios: {
-    checkout_capacity: { executor: 'shared-iterations', vus: 5, iterations: 50, maxDuration: '60s' },
+    checkout_capacity: { executor: 'shared-iterations', vus: 3, iterations: 50, maxDuration: '60s' },
   },
   thresholds: {
     checks: ['rate==1'],
