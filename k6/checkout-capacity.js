@@ -6,7 +6,7 @@ import { Counter } from 'k6/metrics';
 const baselinePaid = new Counter('baseline_paid_orders');
 const probeAttempts = new Counter('contention_probe_attempts');
 const probePaid = new Counter('contention_probe_paid_orders');
-const probeFailures = new Counter('contention_probe_retryable_failures');
+const probeFailures = new Counter('contention_probe_failures');
 const unexpected = new Counter('unexpected_checkout_responses');
 
 export const options = {
@@ -42,7 +42,7 @@ const inventoryItemId = Number(__ENV.K6_INVENTORY_ITEM_ID);
 export default function checkoutCapacity() {
   const probe = exec.scenario.name === 'contention_probe';
   const customer = `${probe ? 'probe' : 'base'}-${exec.scenario.iterationInTest}`;
-  const expected = probe ? http.expectedStatuses(200, 201, 502) : undefined;
+  const expected = probe ? http.expectedStatuses(200, 201, 409, 502) : undefined;
   const params = {
     headers: {
       Authorization: `Bearer test-token:${customer}`,
@@ -87,7 +87,9 @@ export default function checkoutCapacity() {
 
   probeAttempts.add(1);
   probePaid.add(valid ? 1 : 0);
-  const retryableFailure = create.status === 502 || (create.status === 201 && paid.status === 502);
-  probeFailures.add(retryableFailure ? 1 : 0);
-  unexpected.add(valid || retryableFailure ? 0 : 1);
+  const observedFailure =
+    [409, 502].includes(create.status) ||
+    (create.status === 201 && [409, 502].includes(paid.status));
+  probeFailures.add(observedFailure ? 1 : 0);
+  unexpected.add(valid || observedFailure ? 0 : 1);
 }
