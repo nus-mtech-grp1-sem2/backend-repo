@@ -6,16 +6,131 @@ on:
     paths:
       - '.github/workflows/k6-academic-evidence.yml'
       - 'k6/disposable-concurrency.js'
+      - 'k6/queue-capacity.js'
+      - 'k6/checkout-capacity.js'
+      - 'k6/buyer-journey.js'
       - 'k6/fixtures/inventory-schema.sql'
       - 'scripts/init-k6-database.mjs'
       - 'scripts/start-k6-inventory-fixture.mjs'
       - 'scripts/verify-k6-inventory.mjs'
+      - 'scripts/start-k6-buyer-fixture.mjs'
+      - 'scripts/verify-k6-buyer-fixture.mjs'
+      - 'scripts/run-payment-drain-capacity.mjs'
       - 'services/inventory/**'
+      - 'services/queue/**'
+      - 'services/order/**'
 
 permissions:
   contents: read
 
 jobs:
+  buyer-capacity:
+    name: ${{ matrix.mode }} capacity evidence
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: queue
+            script: queue-capacity.js
+          - mode: checkout
+            script: checkout-capacity.js
+          - mode: journey
+            script: buyer-journey.js
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: k6-ci-${{ github.run_id }}-${{ github.run_attempt }} # NOSONAR -- ephemeral per-run credential
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3307
+      DB_USER: root
+      DB_PASSWORD: k6-ci-${{ github.run_id }}-${{ github.run_attempt }} # NOSONAR -- matches disposable service
+      DB_SSL: 'false'
+      K6_FIXTURE_ENV_FILE: /tmp/onestage-k6-${{ matrix.mode }}.env
+      K6_FIXTURE_PID_FILE: /tmp/onestage-k6-${{ matrix.mode }}.pid
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Initialize disposable full schema
+        run: node scripts/initialize-test-db.mjs
+      - name: Start ${{ matrix.mode }} fixture
+        run: |
+          node --import tsx scripts/start-k6-buyer-fixture.mjs "${{ matrix.mode }}" &
+          echo "$!" > "$K6_FIXTURE_PID_FILE"
+          for attempt in {1..30}; do
+            if [ -s "$K6_FIXTURE_ENV_FILE" ]; then
+              cat "$K6_FIXTURE_ENV_FILE" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::${{ matrix.mode }} fixture did not become ready"
+          exit 1
+      - name: Install k6
+        uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: 2.3.0
+      - name: Run ${{ matrix.mode }} capacity test
+        run: |
+          mkdir -p k6-results
+          k6 run --summary-export "k6-results/${{ matrix.mode }}.json" "k6/${{ matrix.script }}"
+      - name: Verify database invariants
+        run: node scripts/verify-k6-buyer-fixture.mjs "${{ matrix.mode }}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-${{ matrix.mode }}-${{ github.run_id }}
+          path: k6-results/${{ matrix.mode }}.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean up fixture
+        if: always()
+        run: |
+          if [ -s "$K6_FIXTURE_PID_FILE" ]; then
+            kill "$(cat "$K6_FIXTURE_PID_FILE")" || true
+          fi
+
+  payment-drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Measure serial payment-worker drain
+        env:
+          PAYMENT_DRAIN_RESULT_FILE: k6-results/payment-drain.json
+        run: |
+          mkdir -p k6-results
+          node --import tsx scripts/run-payment-drain-capacity.mjs
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-payment-drain-${{ github.run_id }}
+          path: k6-results/payment-drain.json
+          retention-days: 14
+
   no-oversell:
     runs-on: ubuntu-latest
     timeout-minutes: 10

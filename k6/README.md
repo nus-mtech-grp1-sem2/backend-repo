@@ -9,6 +9,10 @@ This suite exercises the deployed public and customer read paths without creatin
 | Deployment | `Deploy backend` workflow dispatch with `run_load_test=true` | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 5 minutes, up to about 4.6 VUh |
 | Manual | Grafana Cloud k6 website | 1 → 10 VUs, then 10 → 50 VUs, steady at 50, ramp down; one security probe/second | 50 read VUs, 8.5 minutes, Grafana estimate 7.8 VUh |
 | Disposable concurrency | Pull request or manual GitHub Action | 20 VUs race 50 one-ticket holds against 10 tickets | Local CI only, under 30 seconds, no AWS usage |
+| B1 queue capacity | Pull request or manual GitHub Action | 100 unique joins from 20 VUs | Disposable full-schema MySQL; no Cognito or AWS |
+| B2 checkout capacity | Pull request or manual GitHub Action | 50 order-and-simulated-payment journeys from 5 VUs | Disposable full-schema MySQL; no payment provider, email, ticket service, or AWS |
+| B3 payment drain | Pull request or manual GitHub Action | 40 messages through the production serial consumer with 25 ms synthetic processing | In-memory SQS contract; no AWS |
+| A small end-to-end | Pull request or manual GitHub Action | 10 sequential queue → admission → seat → order → simulated-payment journeys | Disposable full-schema MySQL; no external side effects |
 
 The Grafana project quota remains the hard monthly control and should stay at 200 VUh. The script does not modify Grafana billing or quota configuration.
 
@@ -27,6 +31,10 @@ The Grafana project quota remains the hard monthly control and should stay at 20
 | Queue guards | Invalid authenticated queue-position lookup returns `400`; anonymous queue join is rejected by auth (`401`) or Kong throttling (`429`) | None |
 | Booking guards | Anonymous hold, order, and payment attempts are rejected by auth (`401`) or Kong throttling (`429`); invalid authenticated order detail returns `400` | None |
 | No-oversell evidence | 50 concurrent authenticated hold attempts race for 10 tickets; exactly 10 must succeed and 40 must be safely rejected | Disposable CI MySQL only; fixture is deleted after verification |
+| Queue capacity | 100 synthetic buyers join the real queue handler; SQL verifies 100 unique customer entries | Disposable CI MySQL only |
+| Checkout capacity | 50 synthetic buyers create and pay orders; SQL reconciles paid orders, payments, holds, and sold inventory | Disposable CI MySQL only |
+| Payment drain | The real payment consumer drains 40 valid in-memory SQS messages and reports elapsed time and throughput | Memory only |
+| Small end-to-end | 10 buyers traverse queue admission, reserved-seat checkout, and simulated payment; SQL reconciles queue release and sold seats | Disposable CI MySQL only |
 | Traceability | Every Kong response includes `X-Request-Id` | None |
 
 Notification is intentionally absent because Kong does not expose it publicly. Authenticated queue status/position and order list/detail are excluded because those nominal `GET` handlers can open queue sessions, expire admissions or reservations, and release queue capacity. Successful queue joins, inventory holds, order/payment creation, ticket issuance/check-in, event management, and notifications remain excluded from the cloud suite. Its non-GET requests are deliberately unauthenticated contract checks: `401` proves application auth rejection, while `429` proves Kong rejected the request before the application mutation path. These probes run in a separate, fixed-rate scenario so they do not dominate the read-load profile.
@@ -75,6 +83,16 @@ The load test starts only after all ECS deployment matrix jobs report stable. Th
 The `k6 academic concurrency evidence` workflow starts MySQL inside the GitHub runner, loads only the inventory tables needed by the real inventory service, and injects a test-only Cognito verifier into that process. It does not call Cognito or any other AWS service.
 
 The k6 scenario sends 50 one-ticket hold attempts from 20 VUs against a 10-ticket fixture. It requires exactly 10 `201` responses, 40 safe `409` responses, no unexpected response, and no `5xx`. A separate SQL verifier then proves `reserved_qty + sold_qty <= total_qty` and reconciles successful responses with active hold rows. The fixture process deletes its event, inventory, and hold rows on shutdown; the entire MySQL service is discarded with the job. The JSON k6 summary is retained as a GitHub artifact for 14 days.
+
+## Isolated buyer capacity evidence
+
+The same workflow has independent B1, B2, B3, and A jobs. Each MySQL-backed job receives a new GitHub service container, applies the production schema, injects deterministic `test-token:<sub>` identities only after `NODE_ENV=test`, and starts the real Express handlers in-process. No AWS credentials are configured. Payment uses the existing `simulated` token; ticket issuance, notifications, SQS URLs, and queue-refill callbacks remain disabled.
+
+The profiles intentionally separate capacity from integration correctness. B1 exercises queue-join concurrency. B2 stays at five concurrent buyers because local exploratory validation at ten buyers exhausted the order service's default eight-connection pool: request handlers retain a transaction connection while loading the response through another pool connection. A is sequential because an exploratory five-VU integrated run completed 9/10 journeys and exposed a deadlock between payment completion and queue release. Those observations are useful evidence, but changing production transaction/locking behavior is outside this test-only change.
+
+Queue validation asserts 100 unique customers rather than unique stored `position` values. Local concurrency validation accepted all 100 buyers but produced only 13 distinct stored positions because concurrent joins calculate `MAX(position) + 1` without a uniqueness constraint. The workflow records position cardinality in its log so the ordering defect is visible without making unrelated API changes.
+
+The B3 test uses the production `consumePayments` loop with a bounded in-memory SQS implementation. It is a deterministic worker-capacity measurement, not an AWS SQS performance claim. Its JSON artifact reports message count, synthetic processing delay, wall-clock drain time, throughput, and the current single-worker concurrency.
 
 ## Manual website test
 
