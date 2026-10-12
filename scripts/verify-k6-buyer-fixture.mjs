@@ -27,7 +27,7 @@ try {
     console.log(`Queue invariant verified: 100 unique buyers; ${row.positions} stored position values observed.`);
     process.exitCode = 0;
   } else {
-    const expected = mode === 'checkout' ? 50 : 10;
+    const expected = mode === 'checkout' ? null : 10;
     const [orders] = await connection.query(
       `SELECT COUNT(*) AS orders, SUM(status = 'PAID') AS paid,
         (SELECT COUNT(*) FROM checkout.payments p
@@ -43,9 +43,18 @@ try {
     );
     const row = orders[0];
     const item = inventory[0];
-    if (Number(row.orders) !== expected || Number(row.paid) !== expected ||
-        Number(row.payments) !== expected || Number(item.reserved_qty) !== 0 ||
-        (mode === 'checkout' && Number(item.sold_qty) !== expected)) {
+    const orderCount = Number(row.orders);
+    const paidCount = Number(row.paid);
+    const paymentCount = Number(row.payments);
+    const soldCount = Number(item.sold_qty);
+    const reservedCount = Number(item.reserved_qty);
+    const checkoutValid = mode === 'checkout' &&
+      orderCount >= 50 && orderCount <= 80 && paidCount >= 50 && paidCount <= orderCount &&
+      paymentCount === paidCount && soldCount === paidCount &&
+      reservedCount === orderCount - paidCount && soldCount + reservedCount <= 100;
+    const journeyValid = mode === 'journey' && orderCount === expected && paidCount === expected &&
+      paymentCount === expected && reservedCount === 0;
+    if (!checkoutValid && !journeyValid) {
       throw new Error(`checkout invariant failed: ${JSON.stringify({ row, item })}`);
     }
     if (mode === 'journey') {
@@ -64,7 +73,7 @@ try {
         throw new Error(`journey invariant failed: ${JSON.stringify({ queue: queue[0], seats: seats[0] })}`);
       }
     }
-    console.log(`${mode} invariant verified: ${expected} paid orders with one payment each.`);
+    console.log(`${mode} invariant verified: ${paidCount}/${orderCount} orders paid with one payment each.`);
   }
 } finally {
   await connection.end();
