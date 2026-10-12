@@ -9,6 +9,13 @@ const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 3001);
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
+// starts_at and every other DATETIME hold UTC, the same as order and notification,
+// whatever zone the host runs in.
+const DATABASE_TIMEZONE = 'Z';
+// A datetime-local input sends a time with no zone. Venues are in Singapore,
+// which is UTC+8 all year, so such a time is read as Singapore time.
+const VENUE_UTC_OFFSET = '+08:00';
+const STARTS_AT_PATTERN = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d(?::\d\d)?)(?:\.\d{1,3})?(Z|[+-]\d\d:\d\d)?$/;
 const configured = USER_POOL_ID.length > 0 && CLIENT_ID.length > 0;
 let verifier = configured
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
@@ -55,6 +62,7 @@ const database = mysql.createPool({
   database: process.env.DB_NAME ?? process.env.DB_NAME_EVENT_INVENTORY ?? '',
   user: process.env.DB_USER ?? '',
   password: process.env.DB_PASSWORD ?? '',
+  timezone: DATABASE_TIMEZONE,
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT ?? 4),
   connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT ?? 10000),
@@ -116,18 +124,33 @@ function parsePriceCents(price: unknown): number | null {
   return Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
 }
 
+/**
+ * The start time as a UTC 'YYYY-MM-DD HH:MM:SS' for starts_at, which order,
+ * queue and inventory compare with UTC_TIMESTAMP(). A time with no zone is
+ * venue (Singapore) time; a time with Z or an offset keeps that zone.
+ */
+function parseStartsAt(value: unknown): string | null {
+  const match = typeof value === 'string' ? STARTS_AT_PATTERN.exec(value.trim()) : null;
+  if (!match) return null;
+  const [, date, time, zone = VENUE_UTC_OFFSET] = match;
+  const instant = Date.parse(`${date}T${time}${zone}`);
+  // Date.parse rolls 30 February over into March instead of refusing it.
+  if (Number.isNaN(instant) || new Date(`${date}T00:00Z`).toISOString().slice(0, 10) !== date) return null;
+  return new Date(instant).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 /** Total seats is never read from the body: it comes from the zones in Configure inventory. */
 function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; availableBuyers: number | null; tier: string; priceCents: number | null } | null {
   const title = typeof input.title === 'string' ? input.title.trim() : '';
   const description = typeof input.description === 'string' ? input.description.trim() || null : null;
   const venue = typeof input.venue === 'string' ? input.venue.trim() : '';
-  const startsAt = typeof input.startsAt === 'string' ? input.startsAt.trim() : '';
+  const startsAt = parseStartsAt(input.startsAt);
   const availableBuyers = input.availableBuyers === undefined || input.availableBuyers === null || input.availableBuyers === ''
     ? null
     : typeof input.availableBuyers === 'number' ? input.availableBuyers : Number.NaN;
   const tier = input.tier === 'TIER1_GA' || input.tier === 'TIER2_SEATED' ? input.tier : '';
   const priceCents = input.price === undefined ? (input.priceCents === undefined ? null : typeof input.priceCents === 'number' ? input.priceCents : Number.NaN) : parsePriceCents(input.price);
-  if (!title || title.length > 255 || !venue || venue.length > 255 || !tier || Number.isNaN(Date.parse(startsAt))) return null;
+  if (!title || title.length > 255 || !venue || venue.length > 255 || !tier || !startsAt) return null;
   if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > 1_000_000)) return null;
   if (priceCents !== null && (!Number.isSafeInteger(priceCents) || priceCents < 0 || priceCents > 100_000_000)) return null;
   // parsePriceCents answers null for both "no price" and "invalid price"; a price that was given but does not parse is invalid.
@@ -276,21 +299,20 @@ app.get('/events/:eventId', async (req, res) => {
   const [rows] = await database.query<mysql.RowDataPacket[]>(
     `SELECT events.event_id, events.organiser_sub, events.title, events.description,
       events.venue, events.starts_at, events.total_seats, events.available_buyers,
-      events.tier, events.status, inventory_items.price_cents,
+      events.tier, events.status, inventory.price_cents,
       CASE WHEN events.tier = 'TIER2_SEATED'
         THEN (SELECT COUNT(*) FROM seats s
           WHERE s.event_id = events.event_id AND s.status = 'AVAILABLE')
-        ELSE COALESCE(
-          inventory_items.total_qty - inventory_items.reserved_qty - inventory_items.sold_qty,
-          0
-        )
+        ELSE CAST(COALESCE(inventory.remaining_qty, 0) AS SIGNED)
       END AS remaining_qty
      FROM events
-     LEFT JOIN inventory_items
-       ON inventory_items.event_id = events.event_id
-       AND inventory_items.name = 'General Admission'
+     LEFT JOIN (
+       SELECT event_id, MIN(price_cents) AS price_cents,
+         SUM(total_qty - reserved_qty - sold_qty) AS remaining_qty
+       FROM inventory_items WHERE event_id = ? GROUP BY event_id
+     ) AS inventory ON inventory.event_id = events.event_id
      WHERE events.event_id = ? LIMIT 1`,
-    [eventId],
+    [eventId, eventId],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'event_not_found' });
   res.json({ event: rows[0] });
@@ -773,4 +795,4 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-export { app, database, parseEventInput, parsePriceCents, validEventId };
+export { app, database, DATABASE_TIMEZONE, parseEventInput, parsePriceCents, parseStartsAt, validEventId };

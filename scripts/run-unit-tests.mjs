@@ -1,3 +1,4 @@
+import { mkdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +26,8 @@ const nodeTestFiles = [
   source('event', 'src', 'index.test.ts'),
   source('event', 'src', 'team-membership-access.test.ts'),
   source('inventory', 'src', 'index.test.ts'),
+  source('inventory', 'src', 'inventory.test.ts'),
+  source('inventory', 'src', 'holds.test.ts'),
   source('queue', 'src', 'index.test.ts'),
   source('queue', 'src', 'purchase-window.test.ts'),
   source('order', 'src', 'index.test.ts'),
@@ -35,9 +38,32 @@ const nodeTestFiles = [
   source('ticket', 'src', 'index.test.ts'),
   source('ticket', 'src', 'confirmation-status.test.ts'),
   source('ticket', 'src', 'issuance-delay.test.ts'),
+  source('ticket', 'src', 'attendees.test.ts'),
+  source('ticket', 'src', 'orders-summary.test.ts'),
+  source('ticket', 'src', 'tickets.test.ts'),
+  source('ticket', 'src', 'scanner.test.ts'),
 ];
 
+const coverageArgs =
+  process.env.COVERAGE === '1'
+    ? [
+        '--experimental-test-coverage',
+        '--test-coverage-exclude=services/**/*.test.ts',
+        '--test-coverage-exclude=services/**/test-helpers.ts',
+        '--test-coverage-exclude=services/test-support/**',
+        '--test-reporter=spec',
+        '--test-reporter-destination=stdout',
+        '--test-reporter=lcov',
+        '--test-reporter-destination=coverage/node.lcov',
+      ]
+    : [];
+
+if (process.env.COVERAGE === '1') {
+  await mkdir(path.join(repositoryRoot, 'coverage'), { recursive: true });
+}
+
 let exitCode = await run(process.execPath, [
+  ...coverageArgs,
   '--import',
   'tsx',
   '--experimental-test-module-mocks',
@@ -46,11 +72,19 @@ let exitCode = await run(process.execPath, [
 ]);
 
 if (exitCode === 0) {
-  exitCode = await run(
-    process.execPath,
-    [path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs'), 'run'],
-    { cwd: source('notification') },
-  );
+  const notificationArgs = [
+    path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+    'run',
+  ];
+  if (process.env.COVERAGE === '1') {
+    notificationArgs.push(
+      '--coverage.enabled',
+      '--coverage.provider=v8',
+      '--coverage.reporter=lcov',
+      '--coverage.reportsDirectory=../../coverage/notification',
+    );
+  }
+  exitCode = await run(process.execPath, notificationArgs, { cwd: source('notification') });
 }
 
 process.exitCode = exitCode;
