@@ -516,12 +516,14 @@ app.get('/events/:eventId/zones', async (req, res) => {
 
   const gridDims = await fetchGridSettings(eventId);
 
-  const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
+  const [allItemRows] = await database.query<mysql.RowDataPacket[]>(
     'SELECT inventory_item_id, name, price_cents, color, total_qty, reserved_qty, sold_qty, ' +
       'grid_row, grid_col, grid_row_span, grid_col_span ' +
       'FROM inventory_items WHERE event_id = ? ORDER BY inventory_item_id',
     [eventId],
   );
+  const zoneRows = allItemRows.filter((r) => r.name !== STAGE_SENTINEL);
+  const stagePieceRows = allItemRows.filter((r) => r.name === STAGE_SENTINEL);
 
   res.json({
     gridRows: gridDims.gridRows,
@@ -536,6 +538,12 @@ app.get('/events/:eventId/zones', async (req, res) => {
       gridCol: zone.grid_col,
       gridRowSpan: zone.grid_row_span,
       gridColSpan: zone.grid_col_span,
+    })),
+    stagePieces: stagePieceRows.map((p) => ({
+      gridRow: p.grid_row,
+      gridCol: p.grid_col,
+      gridRowSpan: p.grid_row_span,
+      gridColSpan: p.grid_col_span,
     })),
   });
 });
