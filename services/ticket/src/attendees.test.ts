@@ -13,6 +13,7 @@ import {
   destroyFixture,
   checkoutPool,
   eventInventoryPool,
+  queuePool,
   ticketingPool,
 } from './test-helpers.js';
 import { app, database, __setVerifierForTests } from './index.js';
@@ -33,7 +34,7 @@ after(async () => {
   const closed = new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   server.closeAllConnections();
   await closed;
-  await Promise.all([eventInventoryPool.end(), ticketingPool.end(), checkoutPool.end(), database.end()]);
+  await Promise.all([eventInventoryPool.end(), ticketingPool.end(), checkoutPool.end(), queuePool.end(), database.end()]);
 });
 
 test('event organiser can view attendee contact info and order details for their own event', async () => {

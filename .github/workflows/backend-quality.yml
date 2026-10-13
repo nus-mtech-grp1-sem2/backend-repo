@@ -2,16 +2,44 @@ name: OneStage backend quality
 
 on:
   push:
+  pull_request:
+    branches: [main]
   # deploy-backend.yml calls this as its first job, so a deploy only goes out
   # once lint, build and unit tests have passed on the same commit.
   workflow_call: {}
 
-permissions: {contents: read}
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3307
+      DB_NAME_EVENT_INVENTORY: event_inventory
+      DB_NAME_QUEUE: queue
+      DB_NAME_CHECKOUT: checkout
+      DB_NAME_TICKETING: ticketing
+      DB_NAME_NOTIFICATION: notification
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_SSL: "false"
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=rootpassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=30s
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -23,11 +51,36 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Initialize test database
+        run: node scripts/initialize-test-db.mjs
+
       - name: Lint
         run: npm run lint
 
       - name: Build
         run: npm run build
 
-      - name: Unit tests
-        run: npm test
+      - name: Unit tests and LCOV coverage
+        run: npm run test:coverage
+
+      - name: Detect SonarCloud credentials
+        id: sonar
+        if: github.event_name != 'workflow_call'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SonarCloud scan
+        if: github.event_name != 'workflow_call' && steps.sonar.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Report skipped SonarCloud scan
+        if: github.event_name != 'workflow_call' && steps.sonar.outputs.enabled != 'true'
+        run: echo "::warning::Coverage was generated at coverage/lcov.info, but SonarCloud scan was skipped because SONAR_TOKEN is not configured."

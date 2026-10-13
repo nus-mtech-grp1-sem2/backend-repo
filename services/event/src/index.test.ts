@@ -27,7 +27,34 @@ mock.module('@aws-sdk/client-cognito-identity-provider', {
   },
 });
 
-const { app, parseEventInput, parsePriceCents, validEventId } = await import('./index.js');
+const { app, DATABASE_TIMEZONE, parseEventInput, parsePriceCents, parseStartsAt, validEventId } = await import('./index.js');
+
+describe('database timezone', () => {
+  it('reads DATETIME columns as UTC whatever zone the host runs in', () => {
+    assert.equal(DATABASE_TIMEZONE, 'Z');
+  });
+});
+
+describe('parseStartsAt', () => {
+  it('reads a datetime-local value with no zone as Singapore time and stores it in UTC', () => {
+    assert.equal(parseStartsAt('2026-10-12T23:13'), '2026-10-12 15:13:00');
+    assert.equal(parseStartsAt('2027-09-17T00:23'), '2027-09-16 16:23:00');
+    assert.equal(parseStartsAt(' 2027-09-17 00:23:45 '), '2027-09-16 16:23:45');
+  });
+
+  it('keeps the zone of a time sent with Z or an offset', () => {
+    assert.equal(parseStartsAt('2026-10-12T15:13:00.000Z'), '2026-10-12 15:13:00');
+    assert.equal(parseStartsAt('2026-10-12T23:13:00+08:00'), '2026-10-12 15:13:00');
+    assert.equal(parseStartsAt('2026-10-12T10:13-05:00'), '2026-10-12 15:13:00');
+  });
+
+  it('refuses text, a date with no time, and a day the month does not have', () => {
+    for (const value of ['someday', '', '2027-09-17', '2027-02-30T10:00', '2027-13-01T10:00', '2027-09-17T10:00 PM', 1_790_000_000_000, undefined]) {
+      assert.equal(parseStartsAt(value), null, String(value));
+    }
+    assert.equal(parseStartsAt('2028-02-29T10:00'), '2028-02-29 02:00:00', 'a leap day is a real day');
+  });
+});
 
 describe('parsePriceCents', () => {
   it('converts dollars to cents', () => {
@@ -71,12 +98,12 @@ describe('parseEventInput', () => {
     price: 25,
   };
 
-  it('accepts a complete event and converts the price to cents', () => {
+  it('accepts a complete event, converts the price to cents and the start time to UTC', () => {
     assert.deepEqual(parseEventInput(valid), {
       title: 'Event NUS',
       description: 'A night',
       venue: 'NUS ISS',
-      startsAt: '2027-09-17T00:23',
+      startsAt: '2027-09-16 16:23:00',
       availableBuyers: 10,
       tier: 'TIER1_GA',
       priceCents: 2500,
@@ -235,6 +262,31 @@ describe('organiser endpoints', () => {
     });
   });
 
+  describe('GET /events/:eventId', () => {
+    const EVENT_DETAIL = /FROM events LEFT JOIN \( SELECT event_id, MIN\(price_cents\)/;
+
+    it('prices the event from its cheapest zone and counts seats across every zone, whatever the zones are called', async () => {
+      const row = { event_id: 5, title: 'New Year Party 2027', price_cents: 100, remaining_qty: 400 };
+      on(EVENT_DETAIL, [row]);
+
+      const response = await request('GET', '/events/5');
+
+      assert.deepEqual(response, { status: 200, body: { event: row } });
+      const [query] = calls;
+      assert.deepEqual(query?.params, [5, 5]);
+      assert.match(query?.sql ?? '', /SUM\(total_qty - reserved_qty - sold_qty\) AS remaining_qty FROM inventory_items WHERE event_id = \? GROUP BY event_id/);
+      assert.doesNotMatch(query?.sql ?? '', /General Admission/);
+    });
+
+    it('reports 404 for an event that does not exist', async () => {
+      on(EVENT_DETAIL, []);
+
+      const response = await request('GET', '/events/5');
+
+      assert.deepEqual(response, { status: 404, body: { error: 'event_not_found' } });
+    });
+  });
+
   describe('POST /events', () => {
     it('rejects an invalid event without touching the database', async () => {
       const response = await request('POST', '/events', { token: 'alice', body: { ...newEvent, title: '' } });
@@ -261,7 +313,7 @@ describe('organiser endpoints', () => {
         assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
         const [insert] = sqlMatching(/INSERT INTO events /);
         assert.match(insert!.sql, /VALUES \(\?, \?, \?, \?, \?, 0, NULL, \?\)/, 'no seats and no buyer limit until inventory exists');
-        assert.deepEqual(insert!.params, ['alice', 'Event NUS', 'A night', 'NUS ISS', '2027-09-17T00:23', tier]);
+        assert.deepEqual(insert!.params, ['alice', 'Event NUS', 'A night', 'NUS ISS', '2027-09-16 16:23:00', tier], 'starts_at is stored in UTC');
         assert.equal(sqlMatching(/inventory_items|INSERT INTO seats/).length, 0, 'zones and seats come from Configure inventory');
         const membership = sqlMatching(/INSERT INTO event_team_memberships/)[0];
         assert.match(membership?.sql ?? '', /'ORGANISER', 'ACCEPTED'/);
@@ -350,7 +402,7 @@ describe('organiser endpoints', () => {
       assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
       const [update] = sqlMatching(/UPDATE events SET title/);
       assert.doesNotMatch(update!.sql, /total_seats/);
-      assert.deepEqual(update!.params, ['Event NUS', 'A night', 'NUS ISS', '2027-09-17T00:23', 2, 'TIER1_GA', 5]);
+      assert.deepEqual(update!.params, ['Event NUS', 'A night', 'NUS ISS', '2027-09-16 16:23:00', 2, 'TIER1_GA', 5], 'starts_at is stored in UTC');
       assert.equal(sqlMatching(/inventory_items/).length, 0);
     });
 

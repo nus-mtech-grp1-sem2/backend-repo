@@ -16,9 +16,14 @@ const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN ?? '';
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID ?? '';
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID ?? '';
 const CUSTOMER_ADMITTED_QUEUE_URL = process.env.CUSTOMER_ADMITTED_QUEUE_URL ?? '';
-const verifier = USER_POOL_ID && CLIENT_ID
+let verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
+
+export function __setVerifierForTests(fake: typeof verifier): void {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test verifier can only be set in test mode');
+  verifier = fake;
+}
 const sqs = new SQSClient({});
 
 const databaseConfigured = Boolean(
@@ -711,4 +716,5 @@ export {
   positiveInteger,
   publishCustomerAdmitted,
   runAdmissionSweep,
+  database,
 };
