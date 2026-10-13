@@ -26,9 +26,14 @@ const RESERVATION_SWEEP_INTERVAL_MS = Math.min(
   Math.max(Number(process.env.RESERVATION_SWEEP_INTERVAL_MS) || 1_000, 250),
   60_000,
 );
-const verifier = USER_POOL_ID && CLIENT_ID
+let verifier = USER_POOL_ID && CLIENT_ID
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
   : null;
+
+export function __setVerifierForTests(fake: typeof verifier): void {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test verifier can only be set in test mode');
+  verifier = fake;
+}
 const sqs = new SQSClient({ requestHandler: { connectionTimeout: 3_000, requestTimeout: 25_000 }, maxAttempts: 2 });
 const databaseConfigured = Boolean(
   process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER && process.env.DB_PASSWORD,
@@ -872,4 +877,4 @@ if (process.env.NODE_ENV !== 'test') {
   process.once('SIGINT', stop);
 }
 
-export { app, parseCreateOrder, positiveInteger };
+export { app, database, parseCreateOrder, positiveInteger };
