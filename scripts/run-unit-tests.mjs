@@ -28,6 +28,7 @@ const nodeTestFiles = [
   source('inventory', 'src', 'index.test.ts'),
   source('inventory', 'src', 'inventory.test.ts'),
   source('inventory', 'src', 'holds.test.ts'),
+  source('inventory', 'src', 'seat-switch.test.ts'),
   source('queue', 'src', 'index.test.ts'),
   source('queue', 'src', 'purchase-window.test.ts'),
   source('order', 'src', 'index.test.ts'),

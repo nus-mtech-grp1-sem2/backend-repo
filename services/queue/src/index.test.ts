@@ -54,12 +54,17 @@ describe('queue input validation', () => {
     }), {
       opensAt: new Date('2026-10-01T04:00:00.000Z'), admissionBatchSize: 20, admissionIntervalSec: 30,
     });
+    assert.equal(
+      parseConfig({ opensAt: '2026-10-01T04:00:00.000Z', admissionBatchSize: 100_000, admissionIntervalSec: 30 })
+        ?.admissionBatchSize,
+      100_000,
+    );
   });
 
   it('rejects malformed identifiers and unsafe admission settings', () => {
     assert.equal(positiveInteger('1 OR 1=1'), null);
     assert.equal(parseConfig({ opensAt: 'never', admissionBatchSize: 0, admissionIntervalSec: 30 }), null);
-    assert.equal(parseConfig({ opensAt: '2026-10-01', admissionBatchSize: 10_001, admissionIntervalSec: 30 }), null);
+    assert.equal(parseConfig({ opensAt: '2026-10-01', admissionBatchSize: 10, admissionIntervalSec: 86_401 }), null);
   });
 });
 

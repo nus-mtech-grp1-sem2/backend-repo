@@ -421,6 +421,67 @@ app.put('/events/:eventId', async (req, res) => {
   res.status(204).end();
 });
 
+interface AvailableBuyersInput {
+  readonly availableBuyers?: unknown;
+}
+
+/**
+ * Waiting-room concurrency remains adjustable while an event is on sale,
+ * without reopening the rest of the published event details for editing.
+ */
+app.put('/events/:eventId/available-buyers', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const caller = await requireAuthenticated(req, res);
+  const eventId = Number(req.params.eventId);
+  const raw = (req.body as AvailableBuyersInput).availableBuyers;
+  const availableBuyers = raw === null || raw === ''
+    ? null
+    : typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 1 && raw <= 1_000_000
+      ? raw
+      : undefined;
+  if (!caller) return;
+  if (!Number.isSafeInteger(eventId) || eventId < 1 || availableBuyers === undefined) {
+    return res.status(400).json({ error: 'invalid_available_buyers' });
+  }
+  if (!(await isEventOrganiser(eventId, caller.sub))) {
+    return res.status(403).json({ error: 'event_organiser_required' });
+  }
+
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [events] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT status, total_seats, starts_at < UTC_TIMESTAMP() AS has_started FROM events WHERE event_id = ? FOR UPDATE',
+      [eventId],
+    );
+    const event = events[0];
+    if (!event) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'event_not_found' });
+    }
+    if (!['DRAFT', 'PUBLISHED'].includes(String(event.status)) || Number(event.has_started) === 1) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'event_not_editable' });
+    }
+    if (availableBuyers !== null && availableBuyers > Number(event.total_seats)) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'available_buyers_above_total_seats' });
+    }
+    await connection.execute(
+      'UPDATE events SET available_buyers = ? WHERE event_id = ?',
+      [availableBuyers, eventId],
+    );
+    await connection.commit();
+    return res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to update available buyers', error);
+    return res.status(502).json({ error: 'available_buyers_update_failed' });
+  } finally {
+    connection.release();
+  }
+});
+
 const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 

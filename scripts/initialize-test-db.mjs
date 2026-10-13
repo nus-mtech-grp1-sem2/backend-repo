@@ -16,6 +16,8 @@ const migrations = [
   '14-add-grid-customization.sql',
   '16-add-event-cancellation-notification-type.sql',
   '17-add-event-team-soft-revoke.sql',
+  '18-add-ga-section-seat-numbers.sql',
+  '19-backfill-ga-section-seat-numbers.sql',
 ];
 
 const host = process.env.DB_HOST;

@@ -48,6 +48,8 @@ Get-Content ..\..\database\13-add-inventory-grid-position.sql | mysql -h $env:DB
 Get-Content ..\..\database\14-add-grid-customization.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\15-email-notifications-per-ticket.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_NOTIFICATION
 Get-Content ..\..\database\17-add-event-team-soft-revoke.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
+Get-Content ..\..\database\18-add-ga-section-seat-numbers.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_TICKETING
+Get-Content ..\..\database\19-backfill-ga-section-seat-numbers.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_TICKETING
 ```
 
 - `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
@@ -56,6 +58,8 @@ Get-Content ..\..\database\17-add-event-team-soft-revoke.sql | mysql -h $env:DB_
 - `07-add-queue-order-idempotency.sql` adds unique event-session and hold-order keys so queue configuration and order creation are idempotent.
 - `08-ticket-checkin-attempts.sql` adds check-in audit logging support.
 - `09-add-customer-name.sql` preserves the attendee display name for helper lookup and organiser rosters.
+- `18-add-ga-section-seat-numbers.sql` adds persistent per-section numbers for newly issued general-admission tickets.
+- `19-backfill-ga-section-seat-numbers.sql` assigns deterministic section numbers to older general-admission tickets and advances each section counter.
 - `10-add-event-available-buyers.sql` adds the nullable concurrent-buyer limit and its capacity check.
 - `11-add-inventory-layout.sql` adds `inventory_items.section_code`/`layout_config` and `seats.row_label`/`seat_number`/`pos_x`/`pos_y`, used by the organiser inventory/seat-map configuration UI.
 - `12-add-event-image-and-seat-tags.sql` adds the event photo, per-zone colour, and seat tag columns (rollback: `12-add-event-image-and-seat-tags.rollback.sql`).

@@ -243,7 +243,10 @@ function parseConfig(input: QueueConfigInput): {
   const opensAt = new Date(opensAtValue);
   const admissionBatchSize = positiveInteger(input.admissionBatchSize);
   const admissionIntervalSec = positiveInteger(input.admissionIntervalSec);
-  if (!opensAtValue || Number.isNaN(opensAt.getTime()) || !admissionBatchSize || admissionBatchSize > 10_000 ||
+  // The submitted batch size is retained for backwards-compatible request
+  // validation, but the server derives the effective limit from the event's
+  // capacity/available_buyers. Large GA events can legitimately exceed 10,000.
+  if (!opensAtValue || Number.isNaN(opensAt.getTime()) || !admissionBatchSize ||
       !admissionIntervalSec || admissionIntervalSec > 86_400) return null;
   return { opensAt, admissionBatchSize, admissionIntervalSec };
 }
@@ -345,10 +348,8 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
   const [events] = await database.query<mysql.RowDataPacket[]>(
     'SELECT tier, total_seats, available_buyers FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
   );
-  if (!events[0]) 
+  if (!events[0])
     return res.status(404).json({ error: 'event_not_found' });
-  if (events[0].tier !== 'TIER2_SEATED') 
-    return res.status(409).json({ error: 'queue_only_supported_for_tier2' });
 
   const status = input.opensAt.getTime() <= Date.now() ? 'OPEN' : 'CLOSED';
   await database.execute(

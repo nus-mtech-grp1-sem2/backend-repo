@@ -641,29 +641,48 @@ test('inventory PUT leaves existing stage pieces untouched', async () => {
   }
 });
 
-test('grid dimensions up to 100x100 are accepted; 101 in either axis is rejected', async () => {
+test('reserved grid dimensions up to 20x20 are accepted; 21 in either axis is rejected', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {
     const ok = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
-      body: JSON.stringify({ gridRows: 100, gridCols: 100, zones: [] }),
+      body: JSON.stringify({ gridRows: 20, gridCols: 20, zones: [] }),
     });
     assert.equal(ok.status, 204);
 
     const tooWide = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
-      body: JSON.stringify({ gridRows: 100, gridCols: 101, zones: [] }),
+      body: JSON.stringify({ gridRows: 20, gridCols: 21, zones: [] }),
     });
     assert.equal(tooWide.status, 400);
 
     const tooTall = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
-      body: JSON.stringify({ gridRows: 101, gridCols: 100, zones: [] }),
+      body: JSON.stringify({ gridRows: 21, gridCols: 20, zones: [] }),
     });
     assert.equal(tooTall.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('reserved seating accepts exactly 400 seats', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const request = (zones: object[]) => fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 20, gridCols: 20, zones }),
+    });
+    const mainZone = {
+      name: 'Reserved', price: 50, color: '#2563EB',
+      gridRow: 0, gridCol: 0, gridRowSpan: 20, gridColSpan: 20,
+    };
+
+    assert.equal((await request([mainZone])).status, 204);
   } finally {
     await destroyFixture(fixture.eventId);
   }

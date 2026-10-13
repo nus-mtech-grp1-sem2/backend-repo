@@ -13,6 +13,11 @@ process.env.NODE_ENV = 'test';
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 
+// The repository .env may use DB_NAME for a deployment secret identifier.
+// The ticket service's own pool must use the ticketing schema; the fixture
+// pools below continue to use their explicit per-service schema variables.
+process.env.DB_NAME = process.env.DB_NAME_TICKETING ?? '';
+
 const poolOptions = {
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),

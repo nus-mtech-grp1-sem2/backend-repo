@@ -55,6 +55,8 @@ const database = mysql.createPool({
 // A single PUT can define at most this many priced zones; seat count is
 // naturally bounded by the grid dimensions below (one seat per cell).
 const MAX_ZONES = 50;
+/** Reserved seating creates one database seat per occupied cell. */
+export const MAX_RESERVED_SEATS = 400;
 
 // Stage pieces are stored as inventory_items rows with this sentinel name.
 // They are non-sellable (price_cents=0, total_qty=0) and kept separate from
@@ -68,7 +70,10 @@ const MAX_STAGE_PIECES = 5;
 const DEFAULT_GRID_ROWS = 6;
 const DEFAULT_GRID_COLS = 8;
 const MIN_GRID_DIM = 1;
-const MAX_GRID_DIM = 100;
+export const MAX_RESERVED_GRID_DIM = 20;
+/** General admission has no seats per cell, so its map has no practical size limit;
+ * this only guards against nonsense (the columns are SMALLINT UNSIGNED). */
+const MAX_GA_GRID_DIM = 10_000;
 
 // A Hold reserves inventory ahead of payment (see CONTEXT.md). It expires on
 // its own if the customer never checks out, so nothing gets stuck reserved.
@@ -122,6 +127,12 @@ interface GridDims {
   readonly gridCols: number;
 }
 
+export function reservedSeatCount(
+  zones: readonly Pick<ParsedZone, 'gridRowSpan' | 'gridColSpan'>[],
+): number {
+  return zones.reduce((total, zone) => total + zone.gridRowSpan * zone.gridColSpan, 0);
+}
+
 const HEX_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/;
 
 /** Zone colour is mandatory (it's how seats get "painted"), unlike the old
@@ -131,11 +142,15 @@ function parseRequiredColor(raw: unknown): string | null {
   return raw.toUpperCase();
 }
 
-function parseGridDims(raw: { gridRows?: unknown; gridCols?: unknown }, fallback: GridDims): GridDims | null {
+export function parseGridDims(
+  raw: { gridRows?: unknown; gridCols?: unknown },
+  fallback: GridDims,
+  maxDim = MAX_RESERVED_GRID_DIM,
+): GridDims | null {
   const gridRows = raw.gridRows === undefined ? fallback.gridRows : raw.gridRows;
   const gridCols = raw.gridCols === undefined ? fallback.gridCols : raw.gridCols;
-  if (typeof gridRows !== 'number' || !Number.isInteger(gridRows) || gridRows < MIN_GRID_DIM || gridRows > MAX_GRID_DIM) return null;
-  if (typeof gridCols !== 'number' || !Number.isInteger(gridCols) || gridCols < MIN_GRID_DIM || gridCols > MAX_GRID_DIM) return null;
+  if (typeof gridRows !== 'number' || !Number.isInteger(gridRows) || gridRows < MIN_GRID_DIM || gridRows > maxDim) return null;
+  if (typeof gridCols !== 'number' || !Number.isInteger(gridCols) || gridCols < MIN_GRID_DIM || gridCols > maxDim) return null;
   return { gridRows, gridCols };
 }
 
@@ -377,6 +392,45 @@ app.get('/events/:eventId/seats', async (req, res) => {
   });
 });
 
+/** Most seats one request can switch on or off: a whole 100 x 100 map. */
+const MAX_SEAT_SWITCH = 10_000;
+
+/**
+ * Switches many seats on or off at once, for the organiser's seat selection.
+ * Off is BLOCKED (never sold, tagged MAINTENANCE); on is AVAILABLE with no tag.
+ * Sold and held seats are left alone, so a sale is never undone.
+ */
+app.patch('/events/:eventId/seats', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_request' });
+  const event = await fetchEvent(eventId);
+  if (!event) return res.status(404).json({ error: 'event_not_found' });
+  if (!(await requireEventOrganiser(req, res, eventId))) return;
+  if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_cancelled' });
+  if (event.status === 'PUBLISHED' && Number(event.has_started) === 1) {
+    return res.status(409).json({ error: 'event_completed' });
+  }
+
+  const body = (req.body ?? {}) as { seatIds?: unknown; available?: unknown };
+  const seatIds: unknown[] = Array.isArray(body.seatIds) ? body.seatIds : [];
+  if (typeof body.available !== 'boolean' || seatIds.length === 0 || seatIds.length > MAX_SEAT_SWITCH ||
+      !seatIds.every((id) => typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) {
+    return res.status(400).json({ error: 'invalid_seat_switch' });
+  }
+  const [status, tag, from] = body.available ? ['AVAILABLE', 'NONE', 'BLOCKED'] : ['BLOCKED', 'MAINTENANCE', 'AVAILABLE'];
+  try {
+    const [result] = await database.query<mysql.ResultSetHeader>(
+      'UPDATE seats SET status = ?, tag = ? WHERE event_id = ? AND status = ? AND seat_id IN (?)',
+      [status, tag, eventId, from, seatIds],
+    );
+    return res.json({ updated: result.affectedRows });
+  } catch (error) {
+    console.error('failed to switch seats', error);
+    return res.status(502).json({ error: 'seat_switch_failed' });
+  }
+});
+
 /**
  * Per-seat tagging for the seat map. MAINTENANCE actually blocks the seat
  * from being booked (status -> BLOCKED); ACCESSIBLE is informational only
@@ -563,11 +617,18 @@ app.put('/events/:eventId/inventory', async (req, res) => {
     return res.status(409).json({ error: 'event_completed' });
   }
 
-  const gridDims = parseGridDims(req.body as { gridRows?: unknown; gridCols?: unknown }, await fetchGridSettings(eventId));
+  const gridDims = parseGridDims(
+    req.body as { gridRows?: unknown; gridCols?: unknown },
+    await fetchGridSettings(eventId),
+    event.tier === 'TIER1_GA' ? MAX_GA_GRID_DIM : MAX_RESERVED_GRID_DIM,
+  );
   if (!gridDims) return res.status(400).json({ error: 'invalid_inventory_payload' });
 
   const zones = parseZones((req.body as { zones?: unknown }).zones, gridDims);
   if (!zones) return res.status(400).json({ error: 'invalid_inventory_payload' });
+  if (event.tier === 'TIER2_SEATED' && reservedSeatCount(zones) > MAX_RESERVED_SEATS) {
+    return res.status(400).json({ error: 'reserved_seat_limit_exceeded', maxSeats: MAX_RESERVED_SEATS });
+  }
 
   await putZoneInventory(eventId, event.tier, zones, gridDims, res);
 });
@@ -714,6 +775,9 @@ async function deleteDroppedZones(
   }
 }
 
+/** Seats written per INSERT when regenerating a zone (7 values each). */
+const SEAT_INSERT_BATCH = 500;
+
 /** TIER2_SEATED only: regenerates the AVAILABLE seats for each zone's
  * rectangle (one per cell); any committed seats already occupy their cells
  * and are left alone. */
@@ -732,15 +796,20 @@ async function regenerateSeatedZoneSeats(
       [zoneId],
     );
     const occupied = new Set(remainingRows.map((row) => `${row.pos_y},${row.pos_x}`));
+    const seats: (string | number)[][] = [];
     for (let r = zone.gridRow; r < zone.gridRow + zone.gridRowSpan; r += 1) {
       for (let c = zone.gridCol; c < zone.gridCol + zone.gridColSpan; c += 1) {
         if (occupied.has(`${r},${c}`)) continue;
-        const seatLabel = `${rowLabel(r)}${c + 1}`;
-        await connection.execute(
-          'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [eventId, zoneId, seatLabel, rowLabel(r), c + 1, c, r],
-        );
+        seats.push([eventId, zoneId, `${rowLabel(r)}${c + 1}`, rowLabel(r), c + 1, c, r]);
       }
+    }
+    // Many rows per statement: a 100 x 100 map is 10,000 seats, and one round trip
+    // each made saving a large map take minutes against a remote database.
+    for (let start = 0; start < seats.length; start += SEAT_INSERT_BATCH) {
+      await connection.query(
+        'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES ?',
+        [seats.slice(start, start + SEAT_INSERT_BATCH)],
+      );
     }
   }
   await connection.execute(
