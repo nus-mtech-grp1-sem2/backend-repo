@@ -453,15 +453,28 @@ test('a customer can list a GA event\'s ticket tiers with remaining capacity, wi
     assert.equal(customerRes.status, 200);
     const body = await customerRes.json();
     assert.equal(body.zones.length, 2);
+    // So the customer can render the same zone layout the organiser painted
+    // (just read-only, with no individual seats to pick) instead of a flat
+    // list with no sense of where each zone sits relative to the others.
+    assert.equal(body.gridRows, 6);
+    assert.equal(body.gridCols, 8);
 
     const ga = body.zones.find((z: { name: string }) => z.name === 'General Admission');
     assert.equal(ga.priceCents, 2000);
     assert.equal(ga.color, '#2563EB');
     assert.equal(ga.remaining, 17); // 20 capacity - 3 sold
+    assert.equal(ga.gridRow, 0);
+    assert.equal(ga.gridCol, 0);
+    assert.equal(ga.gridRowSpan, 4);
+    assert.equal(ga.gridColSpan, 5);
 
     const vip = body.zones.find((z: { name: string }) => z.name === 'VIP');
     assert.equal(vip.priceCents, 5000);
     assert.equal(vip.remaining, 8);
+    assert.equal(vip.gridRow, 4);
+    assert.equal(vip.gridCol, 0);
+    assert.equal(vip.gridRowSpan, 2);
+    assert.equal(vip.gridColSpan, 4);
   } finally {
     await destroyFixture(fixture.eventId);
   }
