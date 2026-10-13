@@ -527,6 +527,120 @@ test('listing ticket tiers requires authentication', async () => {
   }
 });
 
+test('stage pieces are stored under __STAGE__ sentinel and returned separately from zones', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Set up a zone first so we can verify stage pieces don't interfere with it.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 2, gridCol: 0, gridRowSpan: 4, gridColSpan: 6 }] }),
+    });
+
+    const stageRes = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 6 }] }),
+    });
+    assert.equal(stageRes.status, 204);
+
+    const invRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const inv = await invRes.json();
+    // Stage pieces must NOT appear in the zones array.
+    assert.equal(inv.zones.length, 1);
+    assert.equal(inv.zones[0].name, 'Stalls');
+    // Stage pieces appear in a separate stagePieces array.
+    assert.equal(inv.stagePieces.length, 1);
+    assert.equal(inv.stagePieces[0].gridRow, 0);
+    assert.equal(inv.stagePieces[0].gridRowSpan, 2);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('__STAGE__ is reserved and cannot be used as a zone name', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const res = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: '__STAGE__', price: 0, color: '#000000', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('more than 5 stage pieces are rejected; stage pieces overlapping zones are rejected', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Draw a zone at row 2.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 2, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+
+    // 6 pieces is over the cap of 5.
+    const tooMany = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        pieces: [
+          { gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 1, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 2, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 3, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 4, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 5, gridRowSpan: 1, gridColSpan: 1 },
+        ],
+      }),
+    });
+    assert.equal(tooMany.status, 400);
+
+    // A stage piece overlapping an existing zone is rejected.
+    const overlaps = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 2, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(overlaps.status, 409);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('inventory PUT leaves existing stage pieces untouched', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Place a stage piece first.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+
+    // Now do a zone PUT — it must not wipe out the stage piece.
+    const zoneRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 1, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(zoneRes.status, 204);
+
+    const inv = await (await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    })).json();
+    assert.equal(inv.stagePieces.length, 1);
+    assert.equal(inv.zones.length, 1);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('grid dimensions up to 100x100 are accepted; 101 in either axis is rejected', async () => {
   const fixture = await createEventFixture('TIER2_SEATED');
   try {
