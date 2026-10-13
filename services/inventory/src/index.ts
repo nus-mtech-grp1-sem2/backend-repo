@@ -91,12 +91,13 @@ interface ZoneInput {
   readonly gridCol?: unknown;
   readonly gridRowSpan?: unknown;
   readonly gridColSpan?: unknown;
+  readonly quantity?: unknown;
 }
 
 /** A zone is a rectangular block of grid cells (one drag gesture creates it).
  * TIER2_SEATED events get one auto-labelled seat per cell in the rectangle;
- * TIER1_GA events treat the rectangle's area as a plain capacity number and
- * never create seat rows at all — see `putZoneInventory`. */
+ * TIER1_GA events use an organiser-supplied `gaQuantity` as capacity (when
+ * present) or fall back to the rectangle area — see `putZoneInventory`. */
 interface ParsedZone {
   readonly inventoryItemId: number | null;
   readonly name: string;
@@ -107,6 +108,7 @@ interface ParsedZone {
   readonly gridCol: number;
   readonly gridRowSpan: number;
   readonly gridColSpan: number;
+  readonly gaQuantity: number | null;
 }
 
 interface GridDims {
@@ -269,7 +271,14 @@ function parseZoneEntry(entry: ZoneInput, gridDims: GridDims): ZoneFields | null
   if (typeof gridColSpan !== 'number' || !Number.isInteger(gridColSpan) || gridColSpan < 1) return null;
   if (gridRow + gridRowSpan > gridDims.gridRows || gridCol + gridColSpan > gridDims.gridCols) return null;
 
-  return { inventoryItemId, name, code, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan };
+  let gaQuantity: number | null = null;
+  if (entry.quantity !== undefined) {
+    const q = entry.quantity;
+    if (typeof q !== 'number' || !Number.isInteger(q) || q < 1) return null;
+    gaQuantity = q;
+  }
+
+  return { inventoryItemId, name, code, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan, gaQuantity };
 }
 
 /** Claims a zone's rectangle on the shared occupancy grid. Returns false
@@ -613,7 +622,7 @@ function checkCommittedZonesUnchanged(
   return { ok: true };
 }
 
-/** TIER1_GA only: a zone's capacity is its rectangle's area, and it cannot
+/** TIER1_GA only: a zone's capacity (explicit quantity or fallback area) cannot
  * shrink below the tickets already sold or currently held in it. */
 function checkGaZonesCoverAllocated(
   tier: EventTier,
@@ -625,7 +634,8 @@ function checkGaZonesCoverAllocated(
     if (zone.inventoryItemId === null) continue;
     const existing = existingZoneById.get(zone.inventoryItemId)!;
     const allocated = Number(existing.reserved_qty) + Number(existing.sold_qty);
-    if (zone.gridRowSpan * zone.gridColSpan < allocated) {
+    const capacity = zone.gaQuantity ?? zone.gridRowSpan * zone.gridColSpan;
+    if (capacity < allocated) {
       return { ok: false, status: 409, error: 'zone_below_allocated' };
     }
   }
@@ -642,7 +652,7 @@ async function upsertZoneRows(
 ): Promise<number[]> {
   const zoneUpsertIds: number[] = [];
   for (const zone of zones) {
-    const totalQty = tier === 'TIER1_GA' ? zone.gridRowSpan * zone.gridColSpan : 0;
+    const totalQty = tier === 'TIER1_GA' ? (zone.gaQuantity ?? zone.gridRowSpan * zone.gridColSpan) : 0;
     if (zone.inventoryItemId !== null) {
       await connection.execute(
         'UPDATE inventory_items SET name = ?, section_code = ?, price_cents = ?, color = ?, ' +
