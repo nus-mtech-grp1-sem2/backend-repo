@@ -85,12 +85,32 @@ if (tier === 'TIER2_SEATED') {
     );
     seatIds.push(Number(seatResult.insertId));
   }
-  await fixturePool.execute(
-    `INSERT INTO \`queue\`.queue_sessions
-       (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
-     VALUES (?, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MINUTE), 20, 1, 'OPEN')`,
-    [eventId],
-  );
+}
+
+const [sessionResult] = await fixturePool.execute(
+  `INSERT INTO \`queue\`.queue_sessions
+     (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
+   VALUES (?, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MINUTE), 20, 1, 'OPEN')`,
+  [eventId],
+);
+
+// The production checkout contract requires every direct order to carry a
+// live admission token. Seed one for each deterministic checkout VU identity
+// so this isolated test measures order/payment contention rather than queueing.
+if (mode === 'checkout') {
+  const queueSessionId = Number(sessionResult.insertId);
+  const customers = [
+    ...Array.from({ length: 50 }, (_, index) => `base-${index}`),
+    ...Array.from({ length: 30 }, (_, index) => `probe-${index}`),
+  ];
+  for (const [index, customer] of customers.entries()) {
+    await fixturePool.execute(
+      `INSERT INTO \`queue\`.queue_entries
+         (queue_session_id, customer_sub, position, status, admitted_at, admission_token, token_expires_at)
+       VALUES (?, ?, ?, 'ADMITTED', UTC_TIMESTAMP(), ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE))`,
+      [queueSessionId, customer, index + 1, `k6-admission-${customer}`],
+    );
+  }
 }
 
 if (mode === 'queue') await loadQueue();
