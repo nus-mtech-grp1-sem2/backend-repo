@@ -396,7 +396,8 @@ app.post('/orders', async (req, res) => {
     const saleBlock = saleBlockReason(event);
     if (saleBlock) { await connection.rollback(); return res.status(409).json({ error: saleBlock }); }
 
-    if (event.tier === 'TIER2_SEATED' && !input.holdId) {
+    // Both tiers sell through the queue: a direct order needs a live admission token.
+    if (!input.holdId) {
       if (!input.admissionToken) { await connection.rollback(); return res.status(403).json({ error: 'queue_admission_required' }); }
       const [entries] = await connection.query<mysql.RowDataPacket[]>(
         `SELECT e.queue_entry_id FROM \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
@@ -478,7 +479,7 @@ app.post('/orders', async (req, res) => {
       );
     }
     await connection.execute('UPDATE event_inventory.inventory_holds SET order_id = ? WHERE hold_id = ?', [insert.insertId, holdId]);
-    if (event.tier === 'TIER2_SEATED' && input.admissionToken) {
+    if (input.admissionToken) {
       await connection.execute(
         `UPDATE \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
          SET e.status = 'IN_CHECKOUT',

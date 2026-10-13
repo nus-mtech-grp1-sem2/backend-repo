@@ -3,6 +3,7 @@ import { after, describe, it, mock } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
+  alphabeticSectionLabel,
   app,
   checkinInput,
   createQrToken,
@@ -14,6 +15,15 @@ import {
   reconcilePaidOrders,
   verifyScannerSession,
 } from './index.js';
+
+describe('general-admission section labels', () => {
+  it('continues with multiple letters after Z, like reserved-seat rows', () => {
+    assert.deepEqual(
+      [0, 25, 26, 27, 51, 52].map(alphabeticSectionLabel),
+      ['A', 'Z', 'AA', 'AB', 'AZ', 'BA'],
+    );
+  });
+});
 
 describe('ticket input validation', () => {
   it('accepts one event and one opaque QR token', () => {

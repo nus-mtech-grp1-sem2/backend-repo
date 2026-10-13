@@ -14,6 +14,10 @@ import 'dotenv/config';
 import mysql from 'mysql2/promise';
 import type { CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 
+// The repository .env may use DB_NAME for a deployment secret identifier.
+// Real-DB event tests must connect to the event schema explicitly.
+process.env.DB_NAME = process.env.DB_NAME_EVENT_INVENTORY ?? '';
+
 const poolOptions = {
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),

@@ -277,3 +277,52 @@ describe('waiting room for a completed event', () => {
     });
   });
 });
+
+describe('PUT /events/:eventId/queue/config', () => {
+  let server: TestServer;
+  before(async () => { server = await startServer(app); });
+  after(() => server.close());
+  beforeEach(() => db.reset());
+
+  it('sets up a queue for a general-admission event, sized to its tickets, like a seated one', async () => {
+    on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 1 }]);
+    on(/SELECT tier, total_seats, available_buyers FROM event_inventory\.events/, [
+      { tier: 'TIER1_GA', total_seats: 200, available_buyers: 40 },
+    ]);
+    on(/INSERT INTO queue_sessions/, { affectedRows: 1 });
+    on(/FROM queue_sessions WHERE event_id = \?/, [{ queue_session_id: 9, event_id: 5 }]);
+
+    const response = await fetch(`${server.base}/events/5/queue/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer organiser' },
+      body: JSON.stringify({ opensAt: '2030-01-01T10:00:00Z', admissionBatchSize: 10, admissionIntervalSec: 30 }),
+    });
+
+    assert.equal(response.status, 200);
+    const insert = calls.find((call) => /INSERT INTO queue_sessions/.test(call.sql));
+    assert.equal(insert?.params[2], 40, 'admits at most the configured available buyers at once');
+  });
+
+  it('opens a high-capacity general-admission queue without rejecting its derived batch size', async () => {
+    on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 1 }]);
+    on(/SELECT tier, total_seats, available_buyers FROM event_inventory\.events/, [
+      { tier: 'TIER1_GA', total_seats: 1_000_000, available_buyers: null },
+    ]);
+    on(/INSERT INTO queue_sessions/, { affectedRows: 1 });
+    on(/FROM queue_sessions WHERE event_id = \?/, [{ queue_session_id: 10, event_id: 5 }]);
+
+    const response = await fetch(`${server.base}/events/5/queue/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer organiser' },
+      body: JSON.stringify({
+        opensAt: '2030-01-01T10:00:00Z',
+        admissionBatchSize: 100_000,
+        admissionIntervalSec: 60,
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    const insert = calls.find((call) => /INSERT INTO queue_sessions/.test(call.sql));
+    assert.equal(insert?.params[2], 100_000, 'uses the server-derived 10% buyer capacity');
+  });
+});

@@ -13,6 +13,10 @@ process.env.NODE_ENV = 'test';
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 
+// The repository .env may use DB_NAME for a deployment secret identifier.
+// Real-DB inventory tests must connect to the inventory schema explicitly.
+process.env.DB_NAME = process.env.DB_NAME_EVENT_INVENTORY ?? '';
+
 export const testPool = mysql.createPool({
   host: process.env.DB_HOST ?? '',
   port: Number(process.env.DB_PORT ?? 3306),

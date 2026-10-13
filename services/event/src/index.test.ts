@@ -227,6 +227,7 @@ describe('organiser endpoints', () => {
       ['GET', '/events/manage'],
       ['POST', '/events', newEvent],
       ['PUT', '/events/5', newEvent],
+      ['PUT', '/events/5/available-buyers', { availableBuyers: 2 }],
       ['POST', '/events/5/publish'],
       ['POST', '/events/5/cancel'],
       ['GET', '/events/5/cancellation-impact'],
@@ -441,6 +442,92 @@ describe('organiser endpoints', () => {
       assert.deepEqual(response, { status: 502, body: { error: 'event_update_failed' } });
       assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
       mock.restoreAll();
+    });
+  });
+
+  describe('PUT /events/:eventId/available-buyers', () => {
+    const stored = (status: string, totalSeats = 10, hasStarted = 0) =>
+      on(/SELECT status, total_seats, starts_at < UTC_TIMESTAMP/, [{
+        status,
+        total_seats: totalSeats,
+        has_started: hasStarted,
+      }]);
+
+    it('updates only waiting-room concurrency for a published event', async () => {
+      isOrganiser();
+      stored('PUBLISHED');
+      on(/UPDATE events SET available_buyers/, {});
+
+      const response = await request('PUT', '/events/5/available-buyers', {
+        token: 'alice',
+        body: { availableBuyers: 4 },
+      });
+
+      assert.equal(response.status, 204);
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'COMMIT']);
+      assert.deepEqual(sqlMatching(/UPDATE events SET available_buyers/)[0]?.params, [4, 5]);
+      assert.equal(sqlMatching(/UPDATE events SET title/).length, 0);
+    });
+
+    it('allows only an accepted event organiser', async () => {
+      isNotOrganiser();
+
+      const response = await request('PUT', '/events/5/available-buyers', {
+        token: 'mallory',
+        body: { availableBuyers: 4 },
+      });
+
+      assert.deepEqual(response, { status: 403, body: { error: 'event_organiser_required' } });
+      assert.equal(sqlMatching(/UPDATE events/).length, 0);
+    });
+
+    it('accepts blank as the automatic 10% setting', async () => {
+      isOrganiser();
+      stored('DRAFT');
+      on(/UPDATE events SET available_buyers/, {});
+
+      const response = await request('PUT', '/events/5/available-buyers', {
+        token: 'alice',
+        body: { availableBuyers: null },
+      });
+
+      assert.equal(response.status, 204);
+      assert.deepEqual(sqlMatching(/UPDATE events SET available_buyers/)[0]?.params, [null, 5]);
+    });
+
+    it('rejects invalid or excessive values', async () => {
+      const invalid = await request('PUT', '/events/5/available-buyers', {
+        token: 'alice',
+        body: { availableBuyers: 0 },
+      });
+      assert.deepEqual(invalid, { status: 400, body: { error: 'invalid_available_buyers' } });
+
+      db.reset();
+      isOrganiser();
+      stored('PUBLISHED', 3);
+      const excessive = await request('PUT', '/events/5/available-buyers', {
+        token: 'alice',
+        body: { availableBuyers: 4 },
+      });
+      assert.deepEqual(excessive, {
+        status: 409,
+        body: { error: 'available_buyers_above_total_seats' },
+      });
+      assert.equal(sqlMatching(/UPDATE events/).length, 0);
+    });
+
+    it('keeps cancelled and completed events locked', async () => {
+      for (const [status, hasStarted] of [['CANCELLED', 0], ['PUBLISHED', 1]] as const) {
+        db.reset();
+        isOrganiser();
+        stored(status, 10, hasStarted);
+        const response = await request('PUT', '/events/5/available-buyers', {
+          token: 'alice',
+          body: { availableBuyers: 2 },
+        });
+        assert.deepEqual(response, { status: 409, body: { error: 'event_not_editable' } });
+        assert.equal(sqlMatching(/UPDATE events/).length, 0);
+      }
     });
   });
 

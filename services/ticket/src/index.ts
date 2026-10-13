@@ -253,6 +253,88 @@ export function parseOrderPaid(value: unknown): OrderPaidEvent | null {
   return { type: 'OrderPaid', version: 1, orderId, eventId, customerSub, customerEmail, customerName, items };
 }
 
+/**
+ * Hands out the next seat number in a general-admission section. Runs inside the
+ * caller's transaction: the counter row stays locked until commit, so concurrent
+ * issuances in one section take turns, and a rollback gives the number back.
+ */
+async function nextSectionSeatNumber(connection: mysql.PoolConnection, inventoryItemId: number): Promise<number> {
+  await connection.execute(
+    `INSERT INTO ticketing.ga_section_counters (inventory_item_id, last_number) VALUES (?, LAST_INSERT_ID(1))
+     ON DUPLICATE KEY UPDATE last_number = LAST_INSERT_ID(last_number + 1)`,
+    [inventoryItemId],
+  );
+  const [rows] = await connection.query<mysql.RowDataPacket[]>('SELECT LAST_INSERT_ID() AS seat_number');
+  return Number(rows[0]?.seat_number);
+}
+
+/**
+ * The general-admission section each order item belongs to. Seated items are left
+ * out: they already have a real seat. Sections are numbered in id order so that
+ * orders spanning several sections always lock the counters in the same order.
+ */
+async function gaSectionsByOrderItem(
+  connection: mysql.PoolConnection,
+  orderItemIds: readonly number[],
+): Promise<Map<number, number>> {
+  const sections = new Map<number, number>();
+  if (orderItemIds.length === 0) return sections;
+  const [rows] = await connection.query<mysql.RowDataPacket[]>(
+    `SELECT order_item_id, inventory_item_id FROM checkout.order_items
+      WHERE order_item_id IN (${orderItemIds.map(() => '?').join(', ')}) AND seat_id IS NULL`,
+    [...orderItemIds],
+  );
+  for (const row of rows) sections.set(Number(row.order_item_id), Number(row.inventory_item_id));
+  return sections;
+}
+
+/**
+ * The same spreadsheet-style labels used by reserved-seat rows:
+ * 0 -> A, 25 -> Z, 26 -> AA, 27 -> AB, ...
+ */
+export function alphabeticSectionLabel(index: number): string {
+  if (!Number.isSafeInteger(index) || index < 0) return '';
+  let n = index + 1;
+  let label = '';
+  while (n > 0) {
+    const remainder = (n - 1) % 26;
+    label = String.fromCodePoint(65 + remainder) + label;
+    n = Math.floor((n - 1) / 26);
+  }
+  return label;
+}
+
+/** Stable section order within an event, excluding the stage layout sentinel. */
+const GA_SECTION_RANK_JOIN = `LEFT JOIN (
+  SELECT inventory_item_id,
+         ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY inventory_item_id) AS section_position
+    FROM event_inventory.inventory_items
+   WHERE name <> '__STAGE__'
+) gsr ON gsr.inventory_item_id = t.section_item_id`;
+
+interface TicketSeatRow extends mysql.RowDataPacket {
+  seat_label: string | null;
+  section_position?: number | null;
+  section_seat_number?: number | null;
+  ga_number_missing?: number | boolean;
+}
+
+/** A ticket's display seat: its reserved seat, or an A1/AA1-style GA number. */
+function withDisplaySeatLabels<T extends TicketSeatRow>(rows: readonly T[]): mysql.RowDataPacket[] {
+  return rows.map((row) => {
+    const { section_position, section_seat_number, ga_number_missing: _missing, ...visible } = row;
+    const position = Number(section_position);
+    const seatNumber = Number(section_seat_number);
+    const gaLabel = Number.isSafeInteger(position) && position > 0 && Number.isSafeInteger(seatNumber) && seatNumber > 0
+      ? `${alphabeticSectionLabel(position - 1)}${seatNumber}`
+      : null;
+    return { ...visible, seat_label: row.seat_label ?? gaLabel } as mysql.RowDataPacket;
+  });
+}
+
+const bySection = (sections: Map<number, number>) => (a: number, b: number) =>
+  (sections.get(a) ?? 0) - (sections.get(b) ?? 0) || a - b;
+
 export async function issueTickets(event: OrderPaidEvent): Promise<number> {
   await requireIssuanceReady(event.orderId);
   const connection = await database.getConnection();
@@ -272,16 +354,25 @@ export async function issueTickets(event: OrderPaidEvent): Promise<number> {
       const orderItemId = Number(row.order_item_id);
       issuedByItem.set(orderItemId, (issuedByItem.get(orderItemId) ?? 0) + 1);
     }
+    const sections = await gaSectionsByOrderItem(
+      connection,
+      event.items.filter((item) => item.seatId === null).map((item) => item.orderItemId),
+    );
+    const sectionOrder = bySection(sections);
+    const items = [...event.items].sort((a, b) => sectionOrder(a.orderItemId, b.orderItemId));
     let issued = 0;
-    for (const item of event.items) {
+    for (const item of items) {
       const missing = Math.max(0, item.quantity - (issuedByItem.get(item.orderItemId) ?? 0));
+      const section = sections.get(item.orderItemId) ?? null;
       for (let index = 0; index < missing; index += 1) {
+        const seatNumber = section === null ? null : await nextSectionSeatNumber(connection, section);
         await connection.execute(
           `INSERT INTO tickets
-            (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id,
+             section_item_id, section_seat_number, qr_token)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [event.orderId, item.orderItemId, event.eventId, event.customerSub, event.customerEmail, event.customerName,
-            item.seatId, randomBytes(32).toString('base64url')],
+            item.seatId, section, seatNumber, randomBytes(32).toString('base64url')],
         );
         issued += 1;
       }
@@ -437,6 +528,13 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
       'SELECT order_item_id, inventory_item_id, seat_id, description, quantity, unit_price_cents FROM checkout.order_items WHERE order_id = ? ORDER BY order_item_id',
       [orderId],
     );
+    // General-admission items (no seat) are numbered within their section, in section order.
+    const sections = new Map<number, number>();
+    for (const item of items) {
+      if (item.seat_id === null) sections.set(Number(item.order_item_id), Number(item.inventory_item_id));
+    }
+    const sectionOrder = bySection(sections);
+    items.sort((a, b) => sectionOrder(Number(a.order_item_id), Number(b.order_item_id)));
     let issued = 0;
     for (const item of items) {
       const [existing] = await connection.query<mysql.RowDataPacket[]>(
@@ -445,12 +543,15 @@ export async function issueTicketsForOrder(orderId: number): Promise<{ issued: n
       );
       const existingCount = Number(existing[0]?.count ?? 0);
       const quantity = Number(item.quantity);
+      const section = sections.get(Number(item.order_item_id)) ?? null;
       for (let unit = existingCount; unit < quantity; unit += 1) {
+        const seatNumber = section === null ? null : await nextSectionSeatNumber(connection, section);
         await connection.execute(
           `INSERT INTO ticketing.tickets
-             (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id, qr_token, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
-          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, cleanCustomerName(order.customer_name), item.seat_id ?? null, createQrToken()],
+             (order_id, order_item_id, event_id, customer_sub, customer_email, customer_name, seat_id,
+              section_item_id, section_seat_number, qr_token, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')`,
+          [orderId, item.order_item_id, order.event_id, order.customer_sub, order.customer_email, cleanCustomerName(order.customer_name), item.seat_id ?? null, section, seatNumber, createQrToken()],
         );
         issued += 1;
       }
@@ -503,15 +604,17 @@ export async function loadOrderConfirmation(orderId: number): Promise<OrderConfi
   );
   const order = orders[0];
   if (!order) return null;
-  const [tickets] = await database.query<mysql.RowDataPacket[]>(
-    `SELECT t.ticket_id, t.qr_token, oi.description, s.seat_label
+  const [ticketRows] = await database.query<TicketSeatRow[]>(
+    `SELECT t.ticket_id, t.qr_token, oi.description, s.seat_label,
+            t.section_seat_number, gsr.section_position
        FROM ticketing.tickets t
        LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
-       LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+       LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id ${GA_SECTION_RANK_JOIN}
       WHERE t.order_id = ? AND t.status <> 'VOID'
       ORDER BY t.ticket_id`,
     [orderId],
   );
+  const tickets = withDisplaySeatLabels(ticketRows);
   if (tickets.length === 0) return null;
   return {
     orderId: Number(order.order_id),
@@ -970,21 +1073,84 @@ app.post('/tickets/validate', async (req, res) => {
   }
 });
 
+function isMissingGaTicketSchema(error: unknown): boolean {
+  if (!error || typeof error !== 'object' || !('code' in error)) return false;
+  return ['ER_BAD_FIELD_ERROR', 'ER_NO_SUCH_TABLE'].includes(String(error.code));
+}
+
+/**
+ * Compatibility view for tickets issued before GA section numbers were stored.
+ * The window runs across every ticket before filtering to the caller, so the
+ * displayed number is stable and unique within the section, not per customer.
+ */
+async function loadCustomerTicketsWithDerivedGaNumbers(customerSub: string): Promise<mysql.RowDataPacket[]> {
+  const [tickets] = await database.query<TicketSeatRow[]>(
+    `SELECT ranked.ticket_id, ranked.order_id, ranked.event_id, e.title AS event_title, e.venue, e.starts_at,
+      s.seat_label, ranked.derived_section_seat_number AS section_seat_number, gsr.section_position,
+      ranked.qr_token, ranked.status, ranked.issued_at, ranked.checked_in_at
+     FROM (
+       SELECT t.ticket_id, t.order_id, t.event_id, t.customer_sub, t.seat_id, t.qr_token, t.status,
+              t.issued_at, t.checked_in_at, oi.inventory_item_id AS derived_section_item_id,
+              CASE WHEN t.seat_id IS NULL AND oi.inventory_item_id IS NOT NULL
+                THEN ROW_NUMBER() OVER (PARTITION BY oi.inventory_item_id ORDER BY t.ticket_id)
+              END AS derived_section_seat_number
+       FROM tickets t
+       LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
+     ) ranked
+     INNER JOIN event_inventory.events e ON e.event_id = ranked.event_id
+     LEFT JOIN event_inventory.seats s ON s.seat_id = ranked.seat_id
+     LEFT JOIN (
+       SELECT inventory_item_id,
+              ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY inventory_item_id) AS section_position
+         FROM event_inventory.inventory_items
+        WHERE name <> '__STAGE__'
+     ) gsr ON gsr.inventory_item_id = ranked.derived_section_item_id
+     WHERE ranked.customer_sub = ? AND ranked.status <> 'VOID'
+     ORDER BY e.starts_at ASC, ranked.ticket_id ASC`,
+    [customerSub],
+  );
+  return withDisplaySeatLabels(tickets);
+}
+
+async function loadCustomerTickets(customerSub: string): Promise<mysql.RowDataPacket[]> {
+  try {
+    const [tickets] = await database.query<TicketSeatRow[]>(
+      `SELECT t.ticket_id, t.order_id, t.event_id, e.title AS event_title, e.venue, e.starts_at,
+        s.seat_label, t.section_seat_number, gsr.section_position,
+        (t.seat_id IS NULL AND (t.section_item_id IS NULL OR t.section_seat_number IS NULL)) AS ga_number_missing,
+        t.qr_token, t.status, t.issued_at, t.checked_in_at
+       FROM tickets t
+       INNER JOIN event_inventory.events e ON e.event_id = t.event_id
+       LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id ${GA_SECTION_RANK_JOIN}
+       WHERE t.customer_sub = ? AND t.status <> 'VOID'
+       ORDER BY e.starts_at ASC, t.ticket_id ASC`,
+      [customerSub],
+    );
+    // Nullable columns let migration 18 deploy without rewriting old rows.
+    // Until migration 19 backfills them, derive the same per-section number.
+    if (tickets.some((ticket) => Boolean(ticket.ga_number_missing))) {
+      return loadCustomerTicketsWithDerivedGaNumbers(customerSub);
+    }
+    return withDisplaySeatLabels(tickets);
+  } catch (error) {
+    // Expand-first rollout compatibility: existing tickets remain readable if
+    // the service restarts before migration 18 has added GA section numbering.
+    if (!isMissingGaTicketSchema(error)) throw error;
+    console.warn('GA ticket numbering schema is not installed; deriving section numbers');
+    return loadCustomerTicketsWithDerivedGaNumbers(customerSub);
+  }
+}
+
 app.get('/customers/me/tickets', async (req, res) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
   if (!(await requireConfigured(res))) return;
-  const [tickets] = await database.query(
-    `SELECT t.ticket_id, t.order_id, t.event_id, e.title AS event_title, e.venue, e.starts_at,
-      s.seat_label, t.qr_token, t.status, t.issued_at, t.checked_in_at
-     FROM tickets t
-     INNER JOIN event_inventory.events e ON e.event_id = t.event_id
-     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
-     WHERE t.customer_sub = ? AND t.status <> 'VOID'
-     ORDER BY e.starts_at ASC, t.ticket_id ASC`,
-    [caller.sub],
-  );
-  return res.json({ tickets });
+  try {
+    return res.json({ tickets: await loadCustomerTickets(caller.sub) });
+  } catch (error) {
+    console.error('customer tickets lookup failed', error);
+    return res.status(502).json({ error: 'tickets_query_failed' });
+  }
 });
 
 export type ConfirmationEmailStatus = 'SENT' | 'FAILED' | 'PENDING';
@@ -1059,29 +1225,6 @@ app.get('/tickets/search', async (req, res) => {
   );
   console.log(JSON.stringify({ svc: SERVICE, route: '/tickets/search', eventId: session.eventId, sub: session.sub, durationMs: Date.now() - startedAt }));
   return res.json({ tickets });
-});
-
-app.get('/customers/me/tickets', async (req, res) => {
-  const caller = await requireCaller(req, res);
-  if (!caller) return;
-  if (!(await requireConfigured(res))) return;
-  try {
-    const [tickets] = await database.query<mysql.RowDataPacket[]>(
-      `SELECT t.ticket_id, t.event_id, e.title AS event_title, e.venue,
-              e.starts_at, t.qr_token, t.status, t.checked_in_at,
-              t.seat_id, oi.description AS ticket_type
-       FROM tickets t
-       JOIN event_inventory.events e ON e.event_id = t.event_id
-       LEFT JOIN checkout.order_items oi ON oi.order_item_id = t.order_item_id
-       WHERE t.customer_sub = ? AND t.status <> 'VOID'
-       ORDER BY e.starts_at DESC, t.ticket_id`,
-      [caller.sub],
-    );
-    return res.json({ tickets });
-  } catch (error) {
-    console.error('customer tickets lookup failed', error);
-    return res.status(502).json({ error: 'tickets_query_failed' });
-  }
 });
 
 app.get('/tickets/:ticketId', async (req, res) => {
@@ -1217,6 +1360,8 @@ interface AttendeeRow extends mysql.RowDataPacket {
   total_amount_cents: number;
   currency: string;
   paid_at: Date | null;
+  section_position?: number | null;
+  section_seat_number?: number | null;
 }
 
 app.get('/events/:eventId/attendees', async (req, res) => {
@@ -1227,17 +1372,19 @@ app.get('/events/:eventId/attendees', async (req, res) => {
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!(await isEventOrganiser(eventId, caller.sub))) return res.status(403).json({ error: 'event_organiser_required' });
 
-  const [rows] = await database.query<AttendeeRow[]>(
+  const [attendeeRows] = await database.query<AttendeeRow[]>(
     `SELECT
-       t.ticket_id, t.customer_sub, t.customer_email, t.customer_name, s.seat_label, t.status,
+       t.ticket_id, t.customer_sub, t.customer_email, t.customer_name, s.seat_label,
+       t.section_seat_number, gsr.section_position, t.status,
        o.order_id, o.status AS order_status, o.total_amount_cents, o.currency, o.paid_at
      FROM tickets t
-     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id
+     LEFT JOIN event_inventory.seats s ON s.seat_id = t.seat_id ${GA_SECTION_RANK_JOIN}
      JOIN checkout.orders o ON o.order_id = t.order_id
      WHERE t.event_id = ?
      ORDER BY t.ticket_id`,
     [eventId],
   );
+  const rows = withDisplaySeatLabels(attendeeRows) as AttendeeRow[];
 
   res.json({
     eventId,

@@ -53,7 +53,13 @@ export default function checkoutCapacity() {
   };
   const create = http.post(
     `${baseUrl}/orders`,
-    JSON.stringify({ eventId, inventoryItemId, quantity: 1, customerName: customer }),
+    JSON.stringify({
+      eventId,
+      inventoryItemId,
+      quantity: 1,
+      customerName: customer,
+      admissionToken: `k6-admission-${customer}`,
+    }),
     { ...params, tags: { stage: probe ? 'B2_contention_create' : 'B2_baseline_create' } },
   );
   let orderId = 0;

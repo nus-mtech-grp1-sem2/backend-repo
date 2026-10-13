@@ -26,6 +26,8 @@ describe('POST /orders sale window', () => {
   });
 
   const EVENT_QUERY = /FROM event_inventory\.events WHERE event_id = \? LIMIT 1/;
+  /** The caller's live admission, which both tiers need before ordering directly. */
+  const ADMITTED_ENTRY = /e\.status = 'ADMITTED' AND e\.admission_token = \?/;
   const scriptEvent = (overrides: Record<string, unknown> = {}) => {
     on(/h\.expires_at <= CURRENT_TIMESTAMP.*o\.event_id = \?/, []);
     on(EVENT_QUERY, [
@@ -109,11 +111,21 @@ describe('POST /orders sale window', () => {
     });
   });
 
-  it('lets an upcoming published event through to the normal stock check', async () => {
+  it('refuses a general-admission order without a queue admission, before reserving anything', async () => {
     scriptEvent();
-    on(/FROM event_inventory\.inventory_items/, []);
 
     const response = await placeOrder({ eventId: 5, quantity: 1 });
+
+    assert.deepEqual(response, { status: 403, body: { error: 'queue_admission_required' } });
+    assert.deepEqual(writes(), []);
+  });
+
+  it('lets an upcoming published event through to the normal stock check', async () => {
+    scriptEvent();
+    on(ADMITTED_ENTRY, [{ queue_entry_id: 3 }]);
+    on(/FROM event_inventory\.inventory_items/, []);
+
+    const response = await placeOrder({ eventId: 5, quantity: 1, admissionToken: 'admitted' });
 
     assert.deepEqual(response, { status: 409, body: { error: 'inventory_unavailable' } });
   });
@@ -122,10 +134,11 @@ describe('POST /orders sale window', () => {
     for (const token of ['organiser', 'helper']) {
       db.clearRules();
       scriptEvent();
+      on(ADMITTED_ENTRY, [{ queue_entry_id: 3 }]);
       on(/FROM event_inventory\.inventory_items/, []);
       on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 9 }]);
 
-      assert.deepEqual(await placeOrder({ eventId: 5, quantity: 1 }, token), {
+      assert.deepEqual(await placeOrder({ eventId: 5, quantity: 1, admissionToken: 'admitted' }, token), {
         status: 409,
         body: { error: 'inventory_unavailable' },
       });

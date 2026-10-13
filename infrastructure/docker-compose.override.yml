@@ -22,6 +22,8 @@ services:
       - ../database/14-add-grid-customization.sql:/docker-entrypoint-initdb.d/12-add-grid-customization.sql:ro
       - ../database/16-add-event-cancellation-notification-type.sql:/docker-entrypoint-initdb.d/13-add-event-cancellation-notification-type.sql:ro
       - ../database/17-add-event-team-soft-revoke.sql:/docker-entrypoint-initdb.d/14-add-event-team-soft-revoke.sql:ro
+      - ../database/18-add-ga-section-seat-numbers.sql:/docker-entrypoint-initdb.d/15-add-ga-section-seat-numbers.sql:ro
+      - ../database/19-backfill-ga-section-seat-numbers.sql:/docker-entrypoint-initdb.d/16-backfill-ga-section-seat-numbers.sql:ro
     networks:
       - backend
     healthcheck:

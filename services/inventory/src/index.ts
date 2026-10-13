@@ -55,6 +55,14 @@ const database = mysql.createPool({
 // A single PUT can define at most this many priced zones; seat count is
 // naturally bounded by the grid dimensions below (one seat per cell).
 const MAX_ZONES = 50;
+/** Reserved seating creates one database seat per occupied cell. */
+export const MAX_RESERVED_SEATS = 400;
+
+// Stage pieces are stored as inventory_items rows with this sentinel name.
+// They are non-sellable (price_cents=0, total_qty=0) and kept separate from
+// real zones in API responses. Organisers may not use this as a zone name.
+const STAGE_SENTINEL = '__STAGE__';
+const MAX_STAGE_PIECES = 5;
 
 // Virtual venue-map grid the organiser paints seats onto directly. Size is
 // customizable per event (stored in event_grid_settings) between these
@@ -62,7 +70,10 @@ const MAX_ZONES = 50;
 const DEFAULT_GRID_ROWS = 6;
 const DEFAULT_GRID_COLS = 8;
 const MIN_GRID_DIM = 1;
-const MAX_GRID_DIM = 20;
+export const MAX_RESERVED_GRID_DIM = 20;
+/** General admission has no seats per cell, so its map has no practical size limit;
+ * this only guards against nonsense (the columns are SMALLINT UNSIGNED). */
+const MAX_GA_GRID_DIM = 10_000;
 
 // A Hold reserves inventory ahead of payment (see CONTEXT.md). It expires on
 // its own if the customer never checks out, so nothing gets stuck reserved.
@@ -91,12 +102,13 @@ interface ZoneInput {
   readonly gridCol?: unknown;
   readonly gridRowSpan?: unknown;
   readonly gridColSpan?: unknown;
+  readonly quantity?: unknown;
 }
 
 /** A zone is a rectangular block of grid cells (one drag gesture creates it).
  * TIER2_SEATED events get one auto-labelled seat per cell in the rectangle;
- * TIER1_GA events treat the rectangle's area as a plain capacity number and
- * never create seat rows at all — see `putZoneInventory`. */
+ * TIER1_GA events use an organiser-supplied `gaQuantity` as capacity (when
+ * present) or fall back to the rectangle area — see `putZoneInventory`. */
 interface ParsedZone {
   readonly inventoryItemId: number | null;
   readonly name: string;
@@ -107,11 +119,18 @@ interface ParsedZone {
   readonly gridCol: number;
   readonly gridRowSpan: number;
   readonly gridColSpan: number;
+  readonly gaQuantity: number | null;
 }
 
 interface GridDims {
   readonly gridRows: number;
   readonly gridCols: number;
+}
+
+export function reservedSeatCount(
+  zones: readonly Pick<ParsedZone, 'gridRowSpan' | 'gridColSpan'>[],
+): number {
+  return zones.reduce((total, zone) => total + zone.gridRowSpan * zone.gridColSpan, 0);
 }
 
 const HEX_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/;
@@ -123,11 +142,15 @@ function parseRequiredColor(raw: unknown): string | null {
   return raw.toUpperCase();
 }
 
-function parseGridDims(raw: { gridRows?: unknown; gridCols?: unknown }, fallback: GridDims): GridDims | null {
+export function parseGridDims(
+  raw: { gridRows?: unknown; gridCols?: unknown },
+  fallback: GridDims,
+  maxDim = MAX_RESERVED_GRID_DIM,
+): GridDims | null {
   const gridRows = raw.gridRows === undefined ? fallback.gridRows : raw.gridRows;
   const gridCols = raw.gridCols === undefined ? fallback.gridCols : raw.gridCols;
-  if (typeof gridRows !== 'number' || !Number.isInteger(gridRows) || gridRows < MIN_GRID_DIM || gridRows > MAX_GRID_DIM) return null;
-  if (typeof gridCols !== 'number' || !Number.isInteger(gridCols) || gridCols < MIN_GRID_DIM || gridCols > MAX_GRID_DIM) return null;
+  if (typeof gridRows !== 'number' || !Number.isInteger(gridRows) || gridRows < MIN_GRID_DIM || gridRows > maxDim) return null;
+  if (typeof gridCols !== 'number' || !Number.isInteger(gridCols) || gridCols < MIN_GRID_DIM || gridCols > maxDim) return null;
   return { gridRows, gridCols };
 }
 
@@ -262,14 +285,21 @@ function parseZoneEntry(entry: ZoneInput, gridDims: GridDims): ZoneFields | null
   const color = parseRequiredColor(entry.color);
   const { gridRow, gridCol, gridRowSpan, gridColSpan } = entry;
 
-  if (!name || name.length > 255 || !code || priceCents === null || !color) return null;
+  if (!name || name.length > 255 || name === STAGE_SENTINEL || !code || priceCents === null || !color) return null;
   if (typeof gridRow !== 'number' || !Number.isInteger(gridRow) || gridRow < 0) return null;
   if (typeof gridCol !== 'number' || !Number.isInteger(gridCol) || gridCol < 0) return null;
   if (typeof gridRowSpan !== 'number' || !Number.isInteger(gridRowSpan) || gridRowSpan < 1) return null;
   if (typeof gridColSpan !== 'number' || !Number.isInteger(gridColSpan) || gridColSpan < 1) return null;
   if (gridRow + gridRowSpan > gridDims.gridRows || gridCol + gridColSpan > gridDims.gridCols) return null;
 
-  return { inventoryItemId, name, code, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan };
+  let gaQuantity: number | null = null;
+  if (entry.quantity !== undefined) {
+    const q = entry.quantity;
+    if (typeof q !== 'number' || !Number.isInteger(q) || q < 1) return null;
+    gaQuantity = q;
+  }
+
+  return { inventoryItemId, name, code, priceCents, color, gridRow, gridCol, gridRowSpan, gridColSpan, gaQuantity };
 }
 
 /** Claims a zone's rectangle on the shared occupancy grid. Returns false
@@ -362,6 +392,45 @@ app.get('/events/:eventId/seats', async (req, res) => {
   });
 });
 
+/** Most seats one request can switch on or off: a whole 100 x 100 map. */
+const MAX_SEAT_SWITCH = 10_000;
+
+/**
+ * Switches many seats on or off at once, for the organiser's seat selection.
+ * Off is BLOCKED (never sold, tagged MAINTENANCE); on is AVAILABLE with no tag.
+ * Sold and held seats are left alone, so a sale is never undone.
+ */
+app.patch('/events/:eventId/seats', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_request' });
+  const event = await fetchEvent(eventId);
+  if (!event) return res.status(404).json({ error: 'event_not_found' });
+  if (!(await requireEventOrganiser(req, res, eventId))) return;
+  if (event.status === 'CANCELLED') return res.status(409).json({ error: 'event_cancelled' });
+  if (event.status === 'PUBLISHED' && Number(event.has_started) === 1) {
+    return res.status(409).json({ error: 'event_completed' });
+  }
+
+  const body = (req.body ?? {}) as { seatIds?: unknown; available?: unknown };
+  const seatIds: unknown[] = Array.isArray(body.seatIds) ? body.seatIds : [];
+  if (typeof body.available !== 'boolean' || seatIds.length === 0 || seatIds.length > MAX_SEAT_SWITCH ||
+      !seatIds.every((id) => typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) {
+    return res.status(400).json({ error: 'invalid_seat_switch' });
+  }
+  const [status, tag, from] = body.available ? ['AVAILABLE', 'NONE', 'BLOCKED'] : ['BLOCKED', 'MAINTENANCE', 'AVAILABLE'];
+  try {
+    const [result] = await database.query<mysql.ResultSetHeader>(
+      'UPDATE seats SET status = ?, tag = ? WHERE event_id = ? AND status = ? AND seat_id IN (?)',
+      [status, tag, eventId, from, seatIds],
+    );
+    return res.json({ updated: result.affectedRows });
+  } catch (error) {
+    console.error('failed to switch seats', error);
+    return res.status(502).json({ error: 'seat_switch_failed' });
+  }
+});
+
 /**
  * Per-seat tagging for the seat map. MAINTENANCE actually blocks the seat
  * from being booked (status -> BLOCKED); ACCESSIBLE is informational only
@@ -428,7 +497,7 @@ app.get('/events/:eventId/inventory', async (req, res) => {
 
   const gridDims = await fetchGridSettings(eventId);
 
-  const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
+  const [allItemRows] = await database.query<mysql.RowDataPacket[]>(
     'SELECT ii.inventory_item_id, ii.name, ii.section_code, ii.price_cents, ii.color, ' +
       'ii.grid_row, ii.grid_col, ii.grid_row_span, ii.grid_col_span, ii.total_qty, ii.sold_qty, ii.reserved_qty, ' +
       "COUNT(s.seat_id) AS seat_count, COALESCE(SUM(s.status = 'SOLD'), 0) AS sold_count, COALESCE(SUM(s.status = 'HELD'), 0) AS held_count " +
@@ -436,6 +505,9 @@ app.get('/events/:eventId/inventory', async (req, res) => {
       'WHERE ii.event_id = ? GROUP BY ii.inventory_item_id ORDER BY ii.inventory_item_id',
     [eventId],
   );
+  const zoneRows = allItemRows.filter((r) => r.name !== STAGE_SENTINEL);
+  const stagePieceRows = allItemRows.filter((r) => r.name === STAGE_SENTINEL);
+
   const [seatRows] = await database.query<mysql.RowDataPacket[]>(
     'SELECT seat_id, pos_x, pos_y, seat_label, inventory_item_id, status, tag FROM seats WHERE event_id = ? ORDER BY seat_id',
     [eventId],
@@ -461,6 +533,12 @@ app.get('/events/:eventId/inventory', async (req, res) => {
       soldCount: event.tier === 'TIER1_GA' ? zone.sold_qty : zone.sold_count,
       heldCount: event.tier === 'TIER1_GA' ? zone.reserved_qty : zone.held_count,
     })),
+    stagePieces: stagePieceRows.map((p) => ({
+      gridRow: p.grid_row,
+      gridCol: p.grid_col,
+      gridRowSpan: p.grid_row_span,
+      gridColSpan: p.grid_col_span,
+    })),
     seats: seatRows.map((seat) => ({
       seatId: seat.seat_id,
       gridRow: seat.pos_y,
@@ -474,10 +552,13 @@ app.get('/events/:eventId/inventory', async (req, res) => {
 });
 
 /**
- * Customer-facing ticket tiers: every zone's price/colour and remaining
- * capacity, without the organiser-only seat/grid detail `GET .../inventory`
- * exposes. Any authenticated caller may see this — organiser status isn't
- * required to browse what's for sale.
+ * Customer-facing ticket tiers: every zone's price/colour, remaining
+ * capacity, and grid position, without the organiser-only seat detail
+ * `GET .../inventory` exposes. Any authenticated caller may see this —
+ * organiser status isn't required to browse what's for sale. The grid
+ * fields mirror the organiser endpoint so a GA buyer can see the same
+ * zone layout the organiser painted (read-only — GA has no individual
+ * seats to pick, unlike TIER2_SEATED).
  */
 app.get('/events/:eventId/zones', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
@@ -487,19 +568,36 @@ app.get('/events/:eventId/zones', async (req, res) => {
   const event = await fetchEvent(eventId);
   if (!event) return res.status(404).json({ error: 'event_not_found' });
 
-  const [zoneRows] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT inventory_item_id, name, price_cents, color, total_qty, reserved_qty, sold_qty ' +
+  const gridDims = await fetchGridSettings(eventId);
+
+  const [allItemRows] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT inventory_item_id, name, price_cents, color, total_qty, reserved_qty, sold_qty, ' +
+      'grid_row, grid_col, grid_row_span, grid_col_span ' +
       'FROM inventory_items WHERE event_id = ? ORDER BY inventory_item_id',
     [eventId],
   );
+  const zoneRows = allItemRows.filter((r) => r.name !== STAGE_SENTINEL);
+  const stagePieceRows = allItemRows.filter((r) => r.name === STAGE_SENTINEL);
 
   res.json({
+    gridRows: gridDims.gridRows,
+    gridCols: gridDims.gridCols,
     zones: zoneRows.map((zone) => ({
       inventoryItemId: zone.inventory_item_id,
       name: zone.name,
       priceCents: zone.price_cents,
       color: zone.color,
       remaining: zone.total_qty - zone.reserved_qty - zone.sold_qty,
+      gridRow: zone.grid_row,
+      gridCol: zone.grid_col,
+      gridRowSpan: zone.grid_row_span,
+      gridColSpan: zone.grid_col_span,
+    })),
+    stagePieces: stagePieceRows.map((p) => ({
+      gridRow: p.grid_row,
+      gridCol: p.grid_col,
+      gridRowSpan: p.grid_row_span,
+      gridColSpan: p.grid_col_span,
     })),
   });
 });
@@ -519,11 +617,18 @@ app.put('/events/:eventId/inventory', async (req, res) => {
     return res.status(409).json({ error: 'event_completed' });
   }
 
-  const gridDims = parseGridDims(req.body as { gridRows?: unknown; gridCols?: unknown }, await fetchGridSettings(eventId));
+  const gridDims = parseGridDims(
+    req.body as { gridRows?: unknown; gridCols?: unknown },
+    await fetchGridSettings(eventId),
+    event.tier === 'TIER1_GA' ? MAX_GA_GRID_DIM : MAX_RESERVED_GRID_DIM,
+  );
   if (!gridDims) return res.status(400).json({ error: 'invalid_inventory_payload' });
 
   const zones = parseZones((req.body as { zones?: unknown }).zones, gridDims);
   if (!zones) return res.status(400).json({ error: 'invalid_inventory_payload' });
+  if (event.tier === 'TIER2_SEATED' && reservedSeatCount(zones) > MAX_RESERVED_SEATS) {
+    return res.status(400).json({ error: 'reserved_seat_limit_exceeded', maxSeats: MAX_RESERVED_SEATS });
+  }
 
   await putZoneInventory(eventId, event.tier, zones, gridDims, res);
 });
@@ -601,7 +706,7 @@ function checkCommittedZonesUnchanged(
   return { ok: true };
 }
 
-/** TIER1_GA only: a zone's capacity is its rectangle's area, and it cannot
+/** TIER1_GA only: a zone's capacity (explicit quantity or fallback area) cannot
  * shrink below the tickets already sold or currently held in it. */
 function checkGaZonesCoverAllocated(
   tier: EventTier,
@@ -613,7 +718,8 @@ function checkGaZonesCoverAllocated(
     if (zone.inventoryItemId === null) continue;
     const existing = existingZoneById.get(zone.inventoryItemId)!;
     const allocated = Number(existing.reserved_qty) + Number(existing.sold_qty);
-    if (zone.gridRowSpan * zone.gridColSpan < allocated) {
+    const capacity = zone.gaQuantity ?? zone.gridRowSpan * zone.gridColSpan;
+    if (capacity < allocated) {
       return { ok: false, status: 409, error: 'zone_below_allocated' };
     }
   }
@@ -630,7 +736,7 @@ async function upsertZoneRows(
 ): Promise<number[]> {
   const zoneUpsertIds: number[] = [];
   for (const zone of zones) {
-    const totalQty = tier === 'TIER1_GA' ? zone.gridRowSpan * zone.gridColSpan : 0;
+    const totalQty = tier === 'TIER1_GA' ? (zone.gaQuantity ?? zone.gridRowSpan * zone.gridColSpan) : 0;
     if (zone.inventoryItemId !== null) {
       await connection.execute(
         'UPDATE inventory_items SET name = ?, section_code = ?, price_cents = ?, color = ?, ' +
@@ -669,6 +775,9 @@ async function deleteDroppedZones(
   }
 }
 
+/** Seats written per INSERT when regenerating a zone (7 values each). */
+const SEAT_INSERT_BATCH = 500;
+
 /** TIER2_SEATED only: regenerates the AVAILABLE seats for each zone's
  * rectangle (one per cell); any committed seats already occupy their cells
  * and are left alone. */
@@ -687,15 +796,20 @@ async function regenerateSeatedZoneSeats(
       [zoneId],
     );
     const occupied = new Set(remainingRows.map((row) => `${row.pos_y},${row.pos_x}`));
+    const seats: (string | number)[][] = [];
     for (let r = zone.gridRow; r < zone.gridRow + zone.gridRowSpan; r += 1) {
       for (let c = zone.gridCol; c < zone.gridCol + zone.gridColSpan; c += 1) {
         if (occupied.has(`${r},${c}`)) continue;
-        const seatLabel = `${rowLabel(r)}${c + 1}`;
-        await connection.execute(
-          'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [eventId, zoneId, seatLabel, rowLabel(r), c + 1, c, r],
-        );
+        seats.push([eventId, zoneId, `${rowLabel(r)}${c + 1}`, rowLabel(r), c + 1, c, r]);
       }
+    }
+    // Many rows per statement: a 100 x 100 map is 10,000 seats, and one round trip
+    // each made saving a large map take minutes against a remote database.
+    for (let start = 0; start < seats.length; start += SEAT_INSERT_BATCH) {
+      await connection.query(
+        'INSERT INTO seats (event_id, inventory_item_id, seat_label, row_label, seat_number, pos_x, pos_y) VALUES ?',
+        [seats.slice(start, start + SEAT_INSERT_BATCH)],
+      );
     }
   }
   await connection.execute(
@@ -728,8 +842,8 @@ async function putZoneInventory(
     await connection.beginTransaction();
 
     const [existingZoneRows] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT inventory_item_id, grid_row, grid_col, grid_row_span, grid_col_span, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? FOR UPDATE',
-      [eventId],
+      'SELECT inventory_item_id, grid_row, grid_col, grid_row_span, grid_col_span, reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name != ? FOR UPDATE',
+      [eventId, STAGE_SENTINEL],
     );
     const existingZoneById = new Map(existingZoneRows.map((row) => [row.inventory_item_id as number, row]));
 
@@ -811,6 +925,106 @@ async function putZoneInventory(
     connection.release();
   }
 }
+
+interface StagePieceInput {
+  readonly gridRow?: unknown;
+  readonly gridCol?: unknown;
+  readonly gridRowSpan?: unknown;
+  readonly gridColSpan?: unknown;
+}
+
+interface ParsedStagePiece {
+  readonly gridRow: number;
+  readonly gridCol: number;
+  readonly gridRowSpan: number;
+  readonly gridColSpan: number;
+}
+
+function parseStagePieces(raw: unknown, gridDims: GridDims): ParsedStagePiece[] | null {
+  if (!Array.isArray(raw) || raw.length > MAX_STAGE_PIECES) return null;
+  const pieces: ParsedStagePiece[] = [];
+  const occupied: boolean[][] = Array.from({ length: gridDims.gridRows }, () => new Array(gridDims.gridCols).fill(false));
+
+  for (const entry of raw as StagePieceInput[]) {
+    const { gridRow, gridCol, gridRowSpan, gridColSpan } = entry;
+    if (typeof gridRow !== 'number' || !Number.isInteger(gridRow) || gridRow < 0) return null;
+    if (typeof gridCol !== 'number' || !Number.isInteger(gridCol) || gridCol < 0) return null;
+    if (typeof gridRowSpan !== 'number' || !Number.isInteger(gridRowSpan) || gridRowSpan < 1) return null;
+    if (typeof gridColSpan !== 'number' || !Number.isInteger(gridColSpan) || gridColSpan < 1) return null;
+    if (gridRow + gridRowSpan > gridDims.gridRows || gridCol + gridColSpan > gridDims.gridCols) return null;
+    if (!claimZoneCells(occupied, { gridRow, gridCol, gridRowSpan, gridColSpan })) return null;
+    pieces.push({ gridRow, gridCol, gridRowSpan, gridColSpan });
+  }
+  return pieces;
+}
+
+/**
+ * Replaces all stage pieces for an event. Stage pieces are stored as
+ * inventory_items rows with name='__STAGE__', price_cents=0, total_qty=0 —
+ * a sentinel that lets them coexist with real zones without a schema change.
+ * Pieces may not overlap each other or existing priced zones.
+ */
+app.put('/events/:eventId/stage', async (req, res) => {
+  if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
+  const eventId = validEventId(req.params.eventId);
+  if (!eventId) return res.status(400).json({ error: 'invalid_event' });
+  const event = await fetchEvent(eventId);
+  if (!event) return res.status(404).json({ error: 'event_not_found' });
+  if (!(await requireEventOrganiser(req, res, eventId))) return;
+
+  const gridDims = await fetchGridSettings(eventId);
+  const pieces = parseStagePieces((req.body as { pieces?: unknown }).pieces, gridDims);
+  if (!pieces) return res.status(400).json({ error: 'invalid_stage_payload' });
+
+  const connection = await database.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [existingZoneRows] = await connection.query<mysql.RowDataPacket[]>(
+      'SELECT grid_row, grid_col, grid_row_span, grid_col_span FROM inventory_items WHERE event_id = ? AND name != ? FOR UPDATE',
+      [eventId, STAGE_SENTINEL],
+    );
+
+    const zoneOccupied: boolean[][] = Array.from({ length: gridDims.gridRows }, () => new Array(gridDims.gridCols).fill(false));
+    for (const zone of existingZoneRows) {
+      if (zone.grid_row == null) continue;
+      for (let r = zone.grid_row; r < zone.grid_row + zone.grid_row_span; r += 1) {
+        for (let c = zone.grid_col; c < zone.grid_col + zone.grid_col_span; c += 1) {
+          if (r < gridDims.gridRows && c < gridDims.gridCols) zoneOccupied[r]![c] = true;
+        }
+      }
+    }
+
+    for (const piece of pieces) {
+      for (let r = piece.gridRow; r < piece.gridRow + piece.gridRowSpan; r += 1) {
+        for (let c = piece.gridCol; c < piece.gridCol + piece.gridColSpan; c += 1) {
+          if (zoneOccupied[r]?.[c]) {
+            await connection.rollback();
+            res.status(409).json({ error: 'stage_overlaps_zone' });
+            return;
+          }
+        }
+      }
+    }
+
+    await connection.execute('DELETE FROM inventory_items WHERE event_id = ? AND name = ?', [eventId, STAGE_SENTINEL]);
+    for (const piece of pieces) {
+      await connection.execute(
+        'INSERT INTO inventory_items (event_id, name, section_code, total_qty, price_cents, color, grid_row, grid_col, grid_row_span, grid_col_span) VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?)',
+        [eventId, STAGE_SENTINEL, 'STGE', '#374151', piece.gridRow, piece.gridCol, piece.gridRowSpan, piece.gridColSpan],
+      );
+    }
+
+    await connection.commit();
+    res.status(204).end();
+  } catch (error) {
+    await connection.rollback();
+    console.error('failed to update stage pieces', error);
+    res.status(502).json({ error: 'stage_update_failed' });
+  } finally {
+    connection.release();
+  }
+});
 
 interface HoldInput {
   readonly inventoryItemId?: unknown;

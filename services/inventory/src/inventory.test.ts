@@ -86,6 +86,43 @@ test('organiser drags a rectangle to create a seated zone; seats are generated a
   }
 });
 
+test('GA zone capacity is set by an explicit quantity field, independent of the drawn rectangle area', async () => {
+  const fixture = await createEventFixture('TIER1_GA');
+  try {
+    // Rectangle area = 2 * 3 = 6, but organiser sets quantity to 500.
+    const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3, quantity: 500 },
+        ],
+      }),
+    });
+    assert.equal(putRes.status, 204);
+
+    const getRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const { zones } = await getRes.json();
+    assert.equal(zones[0].seatCount, 500);
+
+    // A negative or non-integer quantity must be rejected.
+    const badQty = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3, quantity: -1 },
+        ],
+      }),
+    });
+    assert.equal(badQty.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
 test('organiser drags a rectangle to create a GA zone; capacity is the rectangle area and no seats are created', async () => {
   const fixture = await createEventFixture('TIER1_GA');
   try {
@@ -453,15 +490,28 @@ test('a customer can list a GA event\'s ticket tiers with remaining capacity, wi
     assert.equal(customerRes.status, 200);
     const body = await customerRes.json();
     assert.equal(body.zones.length, 2);
+    // So the customer can render the same zone layout the organiser painted
+    // (just read-only, with no individual seats to pick) instead of a flat
+    // list with no sense of where each zone sits relative to the others.
+    assert.equal(body.gridRows, 6);
+    assert.equal(body.gridCols, 8);
 
     const ga = body.zones.find((z: { name: string }) => z.name === 'General Admission');
     assert.equal(ga.priceCents, 2000);
     assert.equal(ga.color, '#2563EB');
     assert.equal(ga.remaining, 17); // 20 capacity - 3 sold
+    assert.equal(ga.gridRow, 0);
+    assert.equal(ga.gridCol, 0);
+    assert.equal(ga.gridRowSpan, 4);
+    assert.equal(ga.gridColSpan, 5);
 
     const vip = body.zones.find((z: { name: string }) => z.name === 'VIP');
     assert.equal(vip.priceCents, 5000);
     assert.equal(vip.remaining, 8);
+    assert.equal(vip.gridRow, 4);
+    assert.equal(vip.gridCol, 0);
+    assert.equal(vip.gridRowSpan, 2);
+    assert.equal(vip.gridColSpan, 4);
   } finally {
     await destroyFixture(fixture.eventId);
   }
@@ -472,6 +522,167 @@ test('listing ticket tiers requires authentication', async () => {
   try {
     const res = await fetch(`${baseUrl}/events/${fixture.eventId}/zones`);
     assert.equal(res.status, 401);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('stage pieces are stored under __STAGE__ sentinel and returned separately from zones', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Set up a zone first so we can verify stage pieces don't interfere with it.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 2, gridCol: 0, gridRowSpan: 4, gridColSpan: 6 }] }),
+    });
+
+    const stageRes = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 6 }] }),
+    });
+    assert.equal(stageRes.status, 204);
+
+    const invRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    });
+    const inv = await invRes.json();
+    // Stage pieces must NOT appear in the zones array.
+    assert.equal(inv.zones.length, 1);
+    assert.equal(inv.zones[0].name, 'Stalls');
+    // Stage pieces appear in a separate stagePieces array.
+    assert.equal(inv.stagePieces.length, 1);
+    assert.equal(inv.stagePieces[0].gridRow, 0);
+    assert.equal(inv.stagePieces[0].gridRowSpan, 2);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('__STAGE__ is reserved and cannot be used as a zone name', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const res = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: '__STAGE__', price: 0, color: '#000000', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('more than 5 stage pieces are rejected; stage pieces overlapping zones are rejected', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Draw a zone at row 2.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 2, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+
+    // 6 pieces is over the cap of 5.
+    const tooMany = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        pieces: [
+          { gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 1, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 2, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 3, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 4, gridRowSpan: 1, gridColSpan: 1 },
+          { gridRow: 0, gridCol: 5, gridRowSpan: 1, gridColSpan: 1 },
+        ],
+      }),
+    });
+    assert.equal(tooMany.status, 400);
+
+    // A stage piece overlapping an existing zone is rejected.
+    const overlaps = await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 2, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(overlaps.status, 409);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('inventory PUT leaves existing stage pieces untouched', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    // Place a stage piece first.
+    await fetch(`${baseUrl}/events/${fixture.eventId}/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ pieces: [{ gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+
+    // Now do a zone PUT — it must not wipe out the stage piece.
+    const zoneRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ zones: [{ name: 'Stalls', price: 50, color: '#FF0000', gridRow: 1, gridCol: 0, gridRowSpan: 1, gridColSpan: 1 }] }),
+    });
+    assert.equal(zoneRes.status, 204);
+
+    const inv = await (await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      headers: authHeader(fixture.organiserSub),
+    })).json();
+    assert.equal(inv.stagePieces.length, 1);
+    assert.equal(inv.zones.length, 1);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('reserved grid dimensions up to 20x20 are accepted; 21 in either axis is rejected', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const ok = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 20, gridCols: 20, zones: [] }),
+    });
+    assert.equal(ok.status, 204);
+
+    const tooWide = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 20, gridCols: 21, zones: [] }),
+    });
+    assert.equal(tooWide.status, 400);
+
+    const tooTall = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 21, gridCols: 20, zones: [] }),
+    });
+    assert.equal(tooTall.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});
+
+test('reserved seating accepts exactly 400 seats', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const request = (zones: object[]) => fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 20, gridCols: 20, zones }),
+    });
+    const mainZone = {
+      name: 'Reserved', price: 50, color: '#2563EB',
+      gridRow: 0, gridCol: 0, gridRowSpan: 20, gridColSpan: 20,
+    };
+
+    assert.equal((await request([mainZone])).status, 204);
   } finally {
     await destroyFixture(fixture.eventId);
   }

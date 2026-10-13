@@ -149,6 +149,78 @@ test('does not prepare a confirmation for an unpaid order or one with no live ti
   }
 });
 
+test('general-admission tickets are numbered 1, 2, 3... within their own section, across orders', async () => {
+  const fixture = await createEventFixture();
+  const sections: number[] = [];
+  try {
+    for (const name of ['Standing Floor', 'Balcony']) {
+      const [section] = await eventInventoryPool.execute<mysql.ResultSetHeader>(
+        'INSERT INTO inventory_items (event_id, name, total_qty, price_cents) VALUES (?, ?, 100, 5000)',
+        [fixture.eventId, name],
+      );
+      sections.push(section.insertId);
+    }
+    const [floor, balcony] = sections as [number, number];
+    const paidOrder = async (customerSub: string, items: [number, number][]) => {
+      const orderId = await createOrderFixture({ eventId: fixture.eventId, customerSub });
+      await checkoutPool.execute(
+        'UPDATE orders SET paid_at = DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 MINUTE) WHERE order_id = ?',
+        [orderId],
+      );
+      for (const [section, quantity] of items) {
+        await checkoutPool.execute(
+          'INSERT INTO order_items (order_id, inventory_item_id, description, quantity, unit_price_cents) VALUES (?, ?, ?, ?, 5000)',
+          [orderId, section, 'General admission', quantity],
+        );
+      }
+      return orderId;
+    };
+    const numbers = async (orderId: number) => {
+      const [rows] = await ticketingPool.query<mysql.RowDataPacket[]>(
+        'SELECT section_item_id, section_seat_number FROM tickets WHERE order_id = ? ORDER BY ticket_id',
+        [orderId],
+      );
+      return rows.map((row) => [Number(row.section_item_id), Number(row.section_seat_number)]);
+    };
+
+    const first = await paidOrder(`ga-numbers-a-${fixture.eventId}`, [[floor, 2], [balcony, 1]]);
+    assert.deepEqual(await issueTicketsForOrder(first), { issued: 3, alreadyIssued: false });
+    assert.deepEqual(await numbers(first), [[floor, 1], [floor, 2], [balcony, 1]]);
+
+    // The next buyer in the same section carries on where the last one stopped.
+    const second = await paidOrder(`ga-numbers-b-${fixture.eventId}`, [[floor, 2]]);
+    await issueTicketsForOrder(second);
+    assert.deepEqual(await numbers(second), [[floor, 3], [floor, 4]]);
+
+    // A replay issues nothing new and uses up no numbers.
+    assert.deepEqual(await issueTicketsForOrder(first), { issued: 0, alreadyIssued: true });
+    const third = await paidOrder(`ga-numbers-c-${fixture.eventId}`, [[floor, 1]]);
+    await issueTicketsForOrder(third);
+    assert.deepEqual(await numbers(third), [[floor, 5]]);
+
+    // Two orders issued at the same moment take turns on the section's counter.
+    const racing = await Promise.all([
+      paidOrder(`ga-numbers-d-${fixture.eventId}`, [[floor, 2]]),
+      paidOrder(`ga-numbers-e-${fixture.eventId}`, [[floor, 2]]),
+    ]);
+    await Promise.all(racing.map((orderId) => issueTicketsForOrder(orderId)));
+    const raced = [...(await numbers(racing[0])), ...(await numbers(racing[1]))].map(([, n]) => n);
+    assert.deepEqual(raced.sort((a, b) => a - b), [6, 7, 8, 9]);
+
+    // Everywhere a ticket is shown, its seat uses the reserved-seat-style section letter and number.
+    const confirmation = await loadOrderConfirmation(first);
+    assert.deepEqual(
+      confirmation?.tickets.map((ticket) => ticket.seatLabel),
+      ['A1', 'A2', 'B1'],
+    );
+  } finally {
+    await destroyFixture(fixture.eventId);
+    for (const section of sections) {
+      await ticketingPool.execute('DELETE FROM ga_section_counters WHERE inventory_item_id = ?', [section]);
+    }
+  }
+});
+
 test('real ticket issuance fills only missing quantities and leaves tickets unchanged on replay', async () => {
   const fixture = await createEventFixture();
   try {
