@@ -489,3 +489,31 @@ test('listing ticket tiers requires authentication', async () => {
     await destroyFixture(fixture.eventId);
   }
 });
+
+test('grid dimensions up to 100x100 are accepted; 101 in either axis is rejected', async () => {
+  const fixture = await createEventFixture('TIER2_SEATED');
+  try {
+    const ok = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 100, gridCols: 100, zones: [] }),
+    });
+    assert.equal(ok.status, 204);
+
+    const tooWide = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 100, gridCols: 101, zones: [] }),
+    });
+    assert.equal(tooWide.status, 400);
+
+    const tooTall = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({ gridRows: 101, gridCols: 100, zones: [] }),
+    });
+    assert.equal(tooTall.status, 400);
+  } finally {
+    await destroyFixture(fixture.eventId);
+  }
+});

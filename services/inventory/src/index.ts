@@ -62,7 +62,7 @@ const MAX_ZONES = 50;
 const DEFAULT_GRID_ROWS = 6;
 const DEFAULT_GRID_COLS = 8;
 const MIN_GRID_DIM = 1;
-const MAX_GRID_DIM = 20;
+const MAX_GRID_DIM = 100;
 
 // A Hold reserves inventory ahead of payment (see CONTEXT.md). It expires on
 // its own if the customer never checks out, so nothing gets stuck reserved.
