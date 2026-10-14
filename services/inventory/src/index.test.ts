@@ -8,6 +8,7 @@ import {
   parseGridDims,
   positiveId,
   reservedSeatCount,
+  zoneCapacity,
 } from './index.js';
 
 describe('inventory input validation', () => {
@@ -31,6 +32,16 @@ describe('inventory input validation', () => {
         { gridRowSpan: 1, gridColSpan: 1 },
       ]),
       MAX_RESERVED_SEATS + 1,
+    );
+  });
+
+  it('counts explicit GA quantities without applying the reserved-seat limit', () => {
+    assert.equal(
+      zoneCapacity('TIER1_GA', [
+        { gaQuantity: 40_000, gridRowSpan: 1, gridColSpan: 1 },
+        { gaQuantity: 20_000, gridRowSpan: 1, gridColSpan: 1 },
+      ]),
+      60_000,
     );
   });
 

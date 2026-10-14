@@ -389,8 +389,8 @@ describe('organiser endpoints', () => {
       assert.equal(sqlMatching(/UPDATE events/).length, 0);
     });
 
-    const stored = (status: string, totalSeats = 10) =>
-      on(/SELECT status, total_seats FROM events/, [{ status, total_seats: totalSeats }]);
+    const stored = (status: string, totalSeats = 10, tier = 'TIER1_GA') =>
+      on(/SELECT status, total_seats, tier FROM events/, [{ status, total_seats: totalSeats, tier }]);
 
     it("updates a draft's details but never its capacity, zones or price, which the inventory owns", async () => {
       isOrganiser();
@@ -405,6 +405,68 @@ describe('organiser endpoints', () => {
       assert.doesNotMatch(update!.sql, /total_seats/);
       assert.deepEqual(update!.params, ['Event NUS', 'A night', 'NUS ISS', '2027-09-16 16:23:00', 2, 'TIER1_GA', 5], 'starts_at is stored in UTC');
       assert.equal(sqlMatching(/inventory_items/).length, 0);
+    });
+
+    it('clears legacy GA inventory when switching to reserved seating', async () => {
+      isOrganiser();
+      stored('DRAFT', 60_000, 'TIER1_GA');
+      on(/SELECT reserved_qty, sold_qty FROM inventory_items/, [{ reserved_qty: 0, sold_qty: 0 }]);
+      on(/SELECT 1 FROM inventory_holds/, []);
+      on(/DELETE FROM seats/, {});
+      on(/DELETE FROM inventory_items/, {});
+      on(/DELETE FROM event_grid_settings/, {});
+      on(/UPDATE events SET title/, {});
+
+      const response = await request('PUT', '/events/5', {
+        token: 'alice',
+        body: { ...newEvent, availableBuyers: 60_000, tier: 'TIER2_SEATED' },
+      });
+
+      assert.equal(response.status, 204);
+      const eventUpdate = sqlMatching(/UPDATE events SET title/)[0];
+      assert.ok(eventUpdate);
+      assert.match(eventUpdate.sql, /total_seats = \?/);
+      assert.equal(eventUpdate.params[4], null, 'buyer concurrency resets with inventory');
+      assert.deepEqual(eventUpdate.params.slice(-2), [0, 5]);
+      assert.equal(sqlMatching(/DELETE FROM seats/).length, 1);
+      assert.equal(sqlMatching(/DELETE FROM inventory_items/).length, 1);
+      assert.equal(sqlMatching(/DELETE FROM event_grid_settings/).length, 1);
+      assert.equal(sqlMatching(/INSERT INTO seats/).length, 0);
+    });
+
+    it('clears reserved inventory when switching to GA', async () => {
+      isOrganiser();
+      stored('DRAFT', 380, 'TIER2_SEATED');
+      on(/SELECT reserved_qty, sold_qty FROM inventory_items/, [{ reserved_qty: 0, sold_qty: 0 }]);
+      on(/SELECT 1 FROM inventory_holds/, []);
+      on(/DELETE FROM seats/, {});
+      on(/DELETE FROM inventory_items/, {});
+      on(/DELETE FROM event_grid_settings/, {});
+      on(/UPDATE events SET title/, {});
+
+      const response = await request('PUT', '/events/5', { token: 'alice', body: { ...newEvent, tier: 'TIER1_GA' } });
+
+      assert.equal(response.status, 204);
+      assert.deepEqual(sqlMatching(/UPDATE events SET title/)[0]?.params.slice(-2), [0, 5]);
+      assert.equal(sqlMatching(/DELETE FROM seats/).length, 1);
+      assert.equal(sqlMatching(/DELETE FROM inventory_items/).length, 1);
+    });
+
+    it('keeps inventory when a tier change has existing allocations', async () => {
+      isOrganiser();
+      stored('DRAFT', 10, 'TIER1_GA');
+      on(/SELECT reserved_qty, sold_qty FROM inventory_items/, [{ reserved_qty: 0, sold_qty: 1 }]);
+      on(/SELECT 1 FROM inventory_holds/, []);
+
+      const response = await request('PUT', '/events/5', {
+        token: 'alice',
+        body: { ...newEvent, tier: 'TIER2_SEATED' },
+      });
+
+      assert.deepEqual(response, { status: 409, body: { error: 'tier_change_has_allocations' } });
+      assert.deepEqual(ranTransaction(), ['BEGIN', 'ROLLBACK']);
+      assert.equal(sqlMatching(/^DELETE/).length, 0);
+      assert.equal(sqlMatching(/UPDATE events/).length, 0);
     });
 
     it('will not allow more available buyers than the stored total seats', async () => {

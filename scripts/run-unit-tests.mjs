@@ -49,6 +49,7 @@ const coverageArgs =
   process.env.COVERAGE === '1'
     ? [
         '--experimental-test-coverage',
+        '--enable-source-maps',
         '--test-coverage-exclude=services/**/*.test.ts',
         '--test-coverage-exclude=services/**/test-helpers.ts',
         '--test-coverage-exclude=services/test-support/**',

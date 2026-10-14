@@ -16,6 +16,7 @@ const DATABASE_TIMEZONE = 'Z';
 // which is UTC+8 all year, so such a time is read as Singapore time.
 const VENUE_UTC_OFFSET = '+08:00';
 const STARTS_AT_PATTERN = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d(?::\d\d)?)(?:\.\d{1,3})?(Z|[+-]\d\d:\d\d)?$/;
+const STAGE_SENTINEL = '__STAGE__';
 const configured = USER_POOL_ID.length > 0 && CLIENT_ID.length > 0;
 let verifier = configured
   ? CognitoJwtVerifier.create({ userPoolId: USER_POOL_ID, clientId: CLIENT_ID, tokenUse: 'access' })
@@ -76,6 +77,8 @@ const database = mysql.createPool({
 interface Caller {
   readonly sub: string;
 }
+
+type EventTier = 'TIER1_GA' | 'TIER2_SEATED';
 
 interface EventInput {
   readonly title?: unknown;
@@ -140,7 +143,7 @@ function parseStartsAt(value: unknown): string | null {
 }
 
 /** Total seats is never read from the body: it comes from the zones in Configure inventory. */
-function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; availableBuyers: number | null; tier: string; priceCents: number | null } | null {
+function parseEventInput(input: EventInput): { title: string; description: string | null; venue: string; startsAt: string; availableBuyers: number | null; tier: EventTier; priceCents: number | null } | null {
   const title = typeof input.title === 'string' ? input.title.trim() : '';
   const description = typeof input.description === 'string' ? input.description.trim() || null : null;
   const venue = typeof input.venue === 'string' ? input.venue.trim() : '';
@@ -148,7 +151,7 @@ function parseEventInput(input: EventInput): { title: string; description: strin
   const availableBuyers = input.availableBuyers === undefined || input.availableBuyers === null || input.availableBuyers === ''
     ? null
     : typeof input.availableBuyers === 'number' ? input.availableBuyers : Number.NaN;
-  const tier = input.tier === 'TIER1_GA' || input.tier === 'TIER2_SEATED' ? input.tier : '';
+  const tier: EventTier | null = input.tier === 'TIER1_GA' || input.tier === 'TIER2_SEATED' ? input.tier : null;
   const priceCents = input.price === undefined ? (input.priceCents === undefined ? null : typeof input.priceCents === 'number' ? input.priceCents : Number.NaN) : parsePriceCents(input.price);
   if (!title || title.length > 255 || !venue || venue.length > 255 || !tier || !startsAt) return null;
   if (availableBuyers !== null && (!Number.isSafeInteger(availableBuyers) || availableBuyers < 1 || availableBuyers > 1_000_000)) return null;
@@ -156,6 +159,45 @@ function parseEventInput(input: EventInput): { title: string; description: strin
   // parsePriceCents answers null for both "no price" and "invalid price"; a price that was given but does not parse is invalid.
   if (input.price !== undefined && input.price !== null && priceCents === null) return null;
   return { title, description, venue, startsAt, availableBuyers, tier, priceCents };
+}
+
+interface TierChangeAllocation extends mysql.RowDataPacket {
+  readonly reserved_qty: number;
+  readonly sold_qty: number;
+}
+
+/**
+ * Inventory has different meaning in each ticketing mode, so a draft tier
+ * change deliberately starts from a blank inventory. Existing allocations
+ * block the destructive reset; otherwise seats, zones, stage pieces and the
+ * old map dimensions are removed in the same transaction as the event update.
+ */
+async function resetInventoryForTierChange(
+  connection: mysql.PoolConnection,
+  eventId: number,
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly error: string }> {
+  const [allocations] = await connection.query<TierChangeAllocation[]>(
+    'SELECT reserved_qty, sold_qty FROM inventory_items WHERE event_id = ? AND name != ? FOR UPDATE',
+    [eventId, STAGE_SENTINEL],
+  );
+  const [holds] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT 1 FROM inventory_holds WHERE event_id = ? LIMIT 1 FOR UPDATE',
+    [eventId],
+  );
+  if (
+    holds.length > 0 ||
+    allocations.some(
+      (allocation) =>
+        Number(allocation.reserved_qty) > 0 || Number(allocation.sold_qty) > 0,
+    )
+  ) {
+    return { ok: false, error: 'tier_change_has_allocations' };
+  }
+
+  await connection.execute('DELETE FROM seats WHERE event_id = ?', [eventId]);
+  await connection.execute('DELETE FROM inventory_items WHERE event_id = ?', [eventId]);
+  await connection.execute('DELETE FROM event_grid_settings WHERE event_id = ?', [eventId]);
+  return { ok: true };
 }
 
 async function ownsEvent(eventId: number, sub: string): Promise<boolean> {
@@ -378,8 +420,8 @@ app.post('/events', async (req, res) => {
 });
 
 // Capacity and prices belong to the inventory (Configure inventory keeps
-// events.total_seats in step with the zones), so editing an event never
-// writes total_seats, zone capacity or price.
+// events.total_seats in step with the zones). A tier change is the exception:
+// its old inventory is cleared atomically so the new mode is configured afresh.
 app.put('/events/:eventId', async (req, res) => {
   if (!databaseConfigured) return res.status(503).json({ error: 'database_not_configured' });
   const caller = await requireAuthenticated(req, res);
@@ -392,7 +434,7 @@ app.put('/events/:eventId', async (req, res) => {
   try {
     await connection.beginTransaction();
     const [events] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT status, total_seats FROM events WHERE event_id = ? FOR UPDATE',
+      'SELECT status, total_seats, tier FROM events WHERE event_id = ? FOR UPDATE',
       [eventId],
     );
     const event = events[0];
@@ -402,14 +444,33 @@ app.put('/events/:eventId', async (req, res) => {
       await connection.rollback();
       return res.status(409).json({ error: 'event_not_editable' });
     }
-    if (input.availableBuyers !== null && input.availableBuyers > Number(event.total_seats)) {
+    let totalSeats = Number(event.total_seats);
+    let availableBuyers = input.availableBuyers;
+    const tierChanged = event.tier !== input.tier;
+    if (tierChanged) {
+      const reset = await resetInventoryForTierChange(connection, eventId);
+      if (!reset.ok) {
+        await connection.rollback();
+        return res.status(409).json({ error: reset.error });
+      }
+      totalSeats = 0;
+      availableBuyers = null;
+    }
+    if (availableBuyers !== null && availableBuyers > totalSeats) {
       await connection.rollback();
       return res.status(409).json({ error: 'available_buyers_above_total_seats' });
     }
-    await connection.execute(
-      'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
-      [input.title, input.description, input.venue, input.startsAt, input.availableBuyers, input.tier, eventId],
-    );
+    if (tierChanged) {
+      await connection.execute(
+        'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, available_buyers = ?, tier = ?, total_seats = ? WHERE event_id = ?',
+        [input.title, input.description, input.venue, input.startsAt, availableBuyers, input.tier, totalSeats, eventId],
+      );
+    } else {
+      await connection.execute(
+        'UPDATE events SET title = ?, description = ?, venue = ?, starts_at = ?, available_buyers = ?, tier = ? WHERE event_id = ?',
+        [input.title, input.description, input.venue, input.startsAt, availableBuyers, input.tier, eventId],
+      );
+    }
     await connection.commit();
   } catch (error) {
     await connection.rollback();
