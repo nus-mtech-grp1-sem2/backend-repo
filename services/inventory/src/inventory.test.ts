@@ -119,6 +119,21 @@ test('GA zone capacity is set by an explicit quantity field, independent of the 
     });
     assert.equal(badQty.status, 400);
 
+    // Each zone fits the integer capacity columns, but together they overflow the event total.
+    const overflow = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
+      body: JSON.stringify({
+        zones: [
+          { name: 'North', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 1, gridColSpan: 1, quantity: 0x7fff_ffff },
+          { name: 'South', price: 25, color: '#2563EB', gridRow: 1, gridCol: 0, gridRowSpan: 1, gridColSpan: 1, quantity: 1 },
+        ],
+      }),
+    });
+    assert.deepEqual({ status: overflow.status, body: await overflow.json() }, {
+      status: 400,
+      body: { error: 'invalid_inventory_payload' },
+    });
   } finally {
     await destroyFixture(fixture.eventId);
   }
