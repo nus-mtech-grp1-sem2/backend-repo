@@ -21,6 +21,8 @@ const QUEUE_REFILL_TIMEOUT_MS = Math.min(
   5_000,
 );
 export const RESERVATION_TIMEOUT_MINUTES = 3;
+/** Most tickets one order can buy. */
+export const MAX_TICKETS_PER_ORDER = 50;
 export const DATABASE_TIMEZONE = 'Z';
 const RESERVATION_SWEEP_INTERVAL_MS = Math.min(
   Math.max(Number(process.env.RESERVATION_SWEEP_INTERVAL_MS) || 1_000, 250),
@@ -143,14 +145,14 @@ function parseCreateOrder(input: CreateOrderInput): {
   const admissionToken = typeof input.admissionToken === 'string' && input.admissionToken.length <= 255
     ? input.admissionToken.trim() || null : null;
   const customerEmail = typeof input.customerEmail === 'string' ? input.customerEmail.trim().toLowerCase() : '';
-  if (seatIds.some((id) => id === null) || new Set(seatIds).size !== seatIds.length || seatIds.length > 50) return null;
+  if (seatIds.some((id) => id === null) || new Set(seatIds).size !== seatIds.length || seatIds.length > MAX_TICKETS_PER_ORDER) return null;
   if (input.customerName !== undefined && input.customerName !== null && typeof input.customerName !== 'string') return null;
   const customerName = typeof input.customerName === 'string' ? cleanCustomerName(input.customerName) : '';
   if (customerEmail && (customerEmail.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) return null;
   if (holdId && !eventId && !quantity && seatIds.length === 0) {
     return { holdId, eventId: null, inventoryItemId, quantity: null, seatIds: [], admissionToken, customerEmail, customerName };
   }
-  if (!eventId || !quantity || quantity > 50 || (seatIds.length > 0 && seatIds.length !== quantity)) return null;
+  if (!eventId || !quantity || quantity > MAX_TICKETS_PER_ORDER || (seatIds.length > 0 && seatIds.length !== quantity)) return null;
   return { holdId: null, eventId, inventoryItemId, quantity, seatIds: seatIds as number[], admissionToken, customerEmail, customerName };
 }
 
@@ -352,7 +354,14 @@ app.post('/orders', async (req, res) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
   if (!requireDatabase(res)) return;
-  const input = parseCreateOrder((req.body ?? {}) as CreateOrderInput);
+  const body = (req.body ?? {}) as CreateOrderInput;
+  // Say why, so the buyer can split a big purchase instead of guessing.
+  const requested = positiveInteger(body.quantity);
+  if ((requested !== null && requested > MAX_TICKETS_PER_ORDER) ||
+      (Array.isArray(body.seatIds) && body.seatIds.length > MAX_TICKETS_PER_ORDER)) {
+    return res.status(400).json({ error: 'too_many_tickets', maxQuantity: MAX_TICKETS_PER_ORDER });
+  }
+  const input = parseCreateOrder(body);
   if (!input) return res.status(400).json({ error: 'invalid_order' });
   const customerEmail = caller.email || input.customerEmail;
   if (!customerEmail) return res.status(400).json({ error: 'customer_email_required' });

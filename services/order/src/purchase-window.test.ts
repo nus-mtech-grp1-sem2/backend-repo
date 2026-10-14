@@ -45,6 +45,17 @@ describe('POST /orders sale window', () => {
   const writes = () => calls.filter((call) => /^(INSERT|UPDATE|DELETE)/.test(call.sql));
   const rolledBack = () => calls.some((call) => call.sql === 'ROLLBACK');
 
+  it('says how many tickets one order may hold when a buyer asks for more', async () => {
+    for (const body of [{ eventId: 5, quantity: 60 }, { eventId: 5, quantity: 51, admissionToken: 'admitted' }]) {
+      db.reset();
+      assert.deepEqual(await placeOrder(body), {
+        status: 400,
+        body: { error: 'too_many_tickets', maxQuantity: 50 },
+      });
+      assert.equal(calls.length, 0, 'refused before touching the database');
+    }
+  });
+
   it('asks MySQL whether the event has started, against UTC time', async () => {
     scriptEvent();
     on(/FROM event_inventory\.inventory_items/, []);

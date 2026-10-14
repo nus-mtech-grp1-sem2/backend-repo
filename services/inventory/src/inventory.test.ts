@@ -89,13 +89,13 @@ test('organiser drags a rectangle to create a seated zone; seats are generated a
 test('GA zone capacity is set by an explicit quantity field, independent of the drawn rectangle area', async () => {
   const fixture = await createEventFixture('TIER1_GA');
   try {
-    // Rectangle area = 2 * 3 = 6, but organiser sets quantity to 500.
+    // Rectangle area = 2 * 3 = 6, but organiser sets an independent quantity.
     const putRes = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', ...authHeader(fixture.organiserSub) },
       body: JSON.stringify({
         zones: [
-          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3, quantity: 500 },
+          { name: 'General Admission', price: 25, color: '#2563EB', gridRow: 0, gridCol: 0, gridRowSpan: 2, gridColSpan: 3, quantity: 60_000 },
         ],
       }),
     });
@@ -105,7 +105,7 @@ test('GA zone capacity is set by an explicit quantity field, independent of the 
       headers: authHeader(fixture.organiserSub),
     });
     const { zones } = await getRes.json();
-    assert.equal(zones[0].seatCount, 500);
+    assert.equal(zones[0].seatCount, 60_000);
 
     // A negative or non-integer quantity must be rejected.
     const badQty = await fetch(`${baseUrl}/events/${fixture.eventId}/inventory`, {
@@ -118,6 +118,7 @@ test('GA zone capacity is set by an explicit quantity field, independent of the 
       }),
     });
     assert.equal(badQty.status, 400);
+
   } finally {
     await destroyFixture(fixture.eventId);
   }

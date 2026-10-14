@@ -85,7 +85,7 @@ describe('keepsQueuePlace', () => {
   });
 });
 
-describe('waiting room for a completed event', () => {
+describe('queue for a completed event', () => {
   let server: TestServer;
   let base = '';
 
@@ -112,7 +112,7 @@ describe('waiting room for a completed event', () => {
     };
 
     it('asks MySQL whether the event has started, against UTC time', async () => {
-      on(EVENT_QUERY, [{ has_started: 1 }]);
+      on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 1 }]);
 
       await join();
 
@@ -120,7 +120,7 @@ describe('waiting room for a completed event', () => {
     });
 
     it('refuses to let anyone join once the event has started, without touching the queue', async () => {
-      on(EVENT_QUERY, [{ has_started: 1 }]);
+      on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 1 }]);
 
       const response = await join();
 
@@ -130,8 +130,8 @@ describe('waiting room for a completed event', () => {
       assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 0);
     });
 
-    it('still lets someone join the waiting room of an upcoming event', async () => {
-      on(EVENT_QUERY, [{ has_started: 0 }]);
+    it('still lets someone join the queue of an upcoming event', async () => {
+      on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
         { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN' },
       ]);
@@ -145,8 +145,32 @@ describe('waiting room for a completed event', () => {
       assert.equal(writes().length, 1);
     });
 
+    it('creates the queue automatically when the first customer joins a published event', async () => {
+      on(EVENT_QUERY, [{
+        status: 'PUBLISHED',
+        has_started: 0,
+        total_seats: 200,
+        available_buyers: 25,
+      }]);
+      on(/FROM queue_sessions WHERE event_id = \?/, []);
+      on(/INSERT INTO queue_sessions/, { insertId: 17 });
+      on(/FROM queue_sessions WHERE queue_session_id = \?/, [
+        { queue_session_id: 17, opens_at: new Date(), status: 'OPEN' },
+      ]);
+      on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, []);
+      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 1 }]);
+      on(/INSERT INTO queue_entries/, { insertId: 9 });
+
+      const response = await join();
+
+      assert.equal(response.status, 201);
+      const create = calls.find((call) => /INSERT INTO queue_sessions/.test(call.sql));
+      assert.deepEqual(create?.params, [5, 25]);
+      assert.match(create?.sql ?? '', /VALUES \(\?, CURRENT_TIMESTAMP, \?, 60, 'OPEN'\)/);
+    });
+
     const openUpcomingQueue = (entries: unknown[]) => {
-      on(EVENT_QUERY, [{ has_started: 0 }]);
+      on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
         { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN' },
       ]);
@@ -154,7 +178,7 @@ describe('waiting room for a completed event', () => {
     };
 
     const scriptSession = (status: string, opensInMs: number) => {
-      on(EVENT_QUERY, [{ has_started: 0 }]);
+      on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
         { queue_session_id: 1, opens_at: new Date(Date.now() + opensInMs), status },
       ]);
@@ -164,17 +188,17 @@ describe('waiting room for a completed event', () => {
       on(/UPDATE queue_sessions SET status = 'OPEN'/, {});
     };
 
-    it('refuses to join a waiting room that is closed and not yet due to open', async () => {
+    it('opens a legacy closed queue immediately for a published event', async () => {
       scriptSession('CLOSED', 60_000);
 
       const response = await join();
 
-      assert.deepEqual(response, { status: 409, body: { error: 'queue_not_open' } });
-      assert.ok(rolledBack());
-      assert.deepEqual(writes(), []);
+      assert.equal(response.status, 201);
+      assert.match(writes()[0]?.sql ?? '', /UPDATE queue_sessions SET status = 'OPEN'/);
+      assert.equal(writes().length, 2, 'the legacy session is opened, then the customer is queued');
     });
 
-    it('opens a closed waiting room whose scheduled time has come, then lets the customer join', async () => {
+    it('opens a legacy closed queue and lets the customer join', async () => {
       scriptSession('CLOSED', -1_000);
 
       const response = await join();
@@ -184,7 +208,18 @@ describe('waiting room for a completed event', () => {
       assert.equal(writes().length, 2, 'the session is opened, then the customer is queued');
     });
 
-    it('reports a drained waiting room as sold out, and any other state as not open', async () => {
+    it('refuses to create or join the queue before the event is published', async () => {
+      on(EVENT_QUERY, [{ status: 'DRAFT', has_started: 0 }]);
+
+      const response = await join();
+
+      assert.deepEqual(response, { status: 409, body: { error: 'event_not_on_sale' } });
+      assert.ok(rolledBack());
+      assert.deepEqual(writes(), [], 'no queue session or entry may be changed');
+      assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 0);
+    });
+
+    it('reports a drained queue as sold out, and any other state as not open', async () => {
       scriptSession('DRAINED', -60_000);
       assert.deepEqual(await join(), { status: 409, body: { error: 'queue_drained' } });
 
@@ -228,6 +263,30 @@ describe('waiting room for a completed event', () => {
       const response = await join('bad');
       assert.equal(response.status, 401);
       assert.equal(calls.length, 0);
+    });
+  });
+
+  describe('GET /events/:eventId/queue', () => {
+    it('automatically opens an upcoming published queue and closes stale open drafts', async () => {
+      on(/UPDATE queue_sessions s/, {});
+      on(/SELECT s\.queue_session_id/, [{
+        queue_session_id: 1,
+        event_id: 5,
+        opens_at: new Date(Date.now() - 60_000),
+        total_seats: 10,
+        available_buyers: 2,
+        admission_interval_sec: 60,
+        status: 'CLOSED',
+        waiting_count: 0,
+      }]);
+
+      const response = await fetch(`${base}/events/5/queue`);
+
+      assert.equal(response.status, 200);
+      const update = calls.find((call) => /UPDATE queue_sessions s/.test(call.sql));
+      assert.match(update?.sql ?? '', /ev\.status = 'PUBLISHED'/);
+      assert.match(update?.sql ?? '', /ev\.starts_at > UTC_TIMESTAMP\(\)/);
+      assert.match(update?.sql ?? '', /ELSE 'CLOSED'/);
     });
   });
 
@@ -286,8 +345,8 @@ describe('PUT /events/:eventId/queue/config', () => {
 
   it('sets up a queue for a general-admission event, sized to its tickets, like a seated one', async () => {
     on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 1 }]);
-    on(/SELECT tier, total_seats, available_buyers FROM event_inventory\.events/, [
-      { tier: 'TIER1_GA', total_seats: 200, available_buyers: 40 },
+    on(/SELECT tier, status, total_seats, available_buyers FROM event_inventory\.events/, [
+      { tier: 'TIER1_GA', status: 'PUBLISHED', total_seats: 200, available_buyers: 40 },
     ]);
     on(/INSERT INTO queue_sessions/, { affectedRows: 1 });
     on(/FROM queue_sessions WHERE event_id = \?/, [{ queue_session_id: 9, event_id: 5 }]);
@@ -305,8 +364,8 @@ describe('PUT /events/:eventId/queue/config', () => {
 
   it('opens a high-capacity general-admission queue without rejecting its derived batch size', async () => {
     on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 1 }]);
-    on(/SELECT tier, total_seats, available_buyers FROM event_inventory\.events/, [
-      { tier: 'TIER1_GA', total_seats: 1_000_000, available_buyers: null },
+    on(/SELECT tier, status, total_seats, available_buyers FROM event_inventory\.events/, [
+      { tier: 'TIER1_GA', status: 'PUBLISHED', total_seats: 1_000_000, available_buyers: null },
     ]);
     on(/INSERT INTO queue_sessions/, { affectedRows: 1 });
     on(/FROM queue_sessions WHERE event_id = \?/, [{ queue_session_id: 10, event_id: 5 }]);
@@ -324,5 +383,30 @@ describe('PUT /events/:eventId/queue/config', () => {
     assert.equal(response.status, 200);
     const insert = calls.find((call) => /INSERT INTO queue_sessions/.test(call.sql));
     assert.equal(insert?.params[2], 100_000, 'uses the server-derived 10% buyer capacity');
+  });
+
+  it('keeps a configured queue closed while the event is still a draft', async () => {
+    on(/FROM event_inventory\.event_team_memberships/, [{ membership_id: 1 }]);
+    on(/SELECT tier, status, total_seats, available_buyers FROM event_inventory\.events/, [
+      { tier: 'TIER1_GA', status: 'DRAFT', total_seats: 100, available_buyers: 10 },
+    ]);
+    on(/INSERT INTO queue_sessions/, { affectedRows: 1 });
+    on(/FROM queue_sessions WHERE event_id = \?/, [
+      { queue_session_id: 11, event_id: 5, status: 'CLOSED' },
+    ]);
+
+    const response = await fetch(`${server.base}/events/5/queue/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer organiser' },
+      body: JSON.stringify({
+        opensAt: '2000-01-01T00:00:00Z',
+        admissionBatchSize: 10,
+        admissionIntervalSec: 60,
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    const insert = calls.find((call) => /INSERT INTO queue_sessions/.test(call.sql));
+    assert.equal(insert?.params[4], 'CLOSED');
   });
 });

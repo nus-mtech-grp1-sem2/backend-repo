@@ -55,8 +55,10 @@ const database = mysql.createPool({
 // A single PUT can define at most this many priced zones; seat count is
 // naturally bounded by the grid dimensions below (one seat per cell).
 const MAX_ZONES = 50;
-/** Reserved seating creates one database seat per occupied cell. */
+/** Reserved seating creates one row per seat in a maximum 20 by 20 map. */
 export const MAX_RESERVED_SEATS = 400;
+/** Storage limit shared safely by the SQL integer capacity columns; not a product cap. */
+const MAX_GA_CAPACITY = 0x7fff_ffff;
 
 // Stage pieces are stored as inventory_items rows with this sentinel name.
 // They are non-sellable (price_cents=0, total_qty=0) and kept separate from
@@ -295,7 +297,7 @@ function parseZoneEntry(entry: ZoneInput, gridDims: GridDims): ZoneFields | null
   let gaQuantity: number | null = null;
   if (entry.quantity !== undefined) {
     const q = entry.quantity;
-    if (typeof q !== 'number' || !Number.isInteger(q) || q < 1) return null;
+    if (typeof q !== 'number' || !Number.isSafeInteger(q) || q < 1 || q > MAX_GA_CAPACITY) return null;
     gaQuantity = q;
   }
 
@@ -350,6 +352,14 @@ function parseZones(raw: unknown, gridDims: GridDims): ParsedZone[] | null {
     zones.push({ ...fields, code });
   }
   return zones;
+}
+
+/** Capacity is explicit for GA and derived from occupied cells for reserved seating. */
+export function zoneCapacity(tier: EventTier, zones: readonly Pick<ParsedZone, 'gaQuantity' | 'gridRowSpan' | 'gridColSpan'>[]): number {
+  return zones.reduce(
+    (total, zone) => total + (tier === 'TIER1_GA' ? (zone.gaQuantity ?? zone.gridRowSpan * zone.gridColSpan) : zone.gridRowSpan * zone.gridColSpan),
+    0,
+  );
 }
 
 /**
@@ -626,8 +636,15 @@ app.put('/events/:eventId/inventory', async (req, res) => {
 
   const zones = parseZones((req.body as { zones?: unknown }).zones, gridDims);
   if (!zones) return res.status(400).json({ error: 'invalid_inventory_payload' });
-  if (event.tier === 'TIER2_SEATED' && reservedSeatCount(zones) > MAX_RESERVED_SEATS) {
-    return res.status(400).json({ error: 'reserved_seat_limit_exceeded', maxSeats: MAX_RESERVED_SEATS });
+  const capacity = zoneCapacity(event.tier, zones);
+  if (event.tier === 'TIER2_SEATED' && capacity > MAX_RESERVED_SEATS) {
+    return res.status(400).json({
+      error: 'reserved_seat_limit_exceeded',
+      maxSeats: MAX_RESERVED_SEATS,
+    });
+  }
+  if (event.tier === 'TIER1_GA' && capacity > MAX_GA_CAPACITY) {
+    return res.status(400).json({ error: 'invalid_inventory_payload' });
   }
 
   await putZoneInventory(eventId, event.tier, zones, gridDims, res);

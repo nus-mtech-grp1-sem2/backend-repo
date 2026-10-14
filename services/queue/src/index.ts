@@ -101,26 +101,23 @@ function positiveInteger(value: unknown): number | null {
  * start time that the event API and the web app use.
  */
 function eventHasStarted(event: Readonly<Record<string, unknown>> | undefined): boolean {
-  return Number(event?.['has_started']) === 1;
+  return Number(event?.has_started) === 1;
 }
 
 /** Admission is only possible while an event is published and has not started. */
 function assertEventOnSale<T extends Readonly<Record<string, unknown>>>(
   event: T | undefined,
 ): asserts event is T {
-  if (!event || event['status'] !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
+  if (event?.status !== 'PUBLISHED') throw new QueueApiError(409, 'event_not_on_sale');
   if (eventHasStarted(event)) throw new QueueApiError(409, 'event_completed');
 }
 
-/**
- * Opens a waiting room whose scheduled time has come, then says why it still
- * cannot be joined, or null when it is open.
- */
+/** A published event's queue is open automatically; only a drained queue stays closed. */
 async function joinBlockReason(
   connection: mysql.PoolConnection,
   session: mysql.RowDataPacket,
 ): Promise<'queue_drained' | 'queue_not_open' | null> {
-  if (session.status === 'CLOSED' && new Date(session.opens_at).getTime() <= Date.now()) {
+  if (session.status === 'CLOSED') {
     await connection.execute("UPDATE queue_sessions SET status = 'OPEN' WHERE queue_session_id = ?", [session.queue_session_id]);
     session.status = 'OPEN';
   }
@@ -301,7 +298,13 @@ app.get('/events/:eventId/queue', async (req, res) => {
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!requireDatabase(res)) return;
   await database.execute(
-    "UPDATE queue_sessions SET status = 'OPEN' WHERE event_id = ? AND status = 'CLOSED' AND opens_at <= CURRENT_TIMESTAMP",
+    `UPDATE queue_sessions s
+     INNER JOIN event_inventory.events ev ON ev.event_id = s.event_id
+     SET s.status = CASE
+       WHEN ev.status = 'PUBLISHED' AND ev.starts_at > UTC_TIMESTAMP() THEN 'OPEN'
+       ELSE 'CLOSED'
+     END
+     WHERE s.event_id = ? AND s.status IN ('OPEN', 'CLOSED')`,
     [eventId],
   );
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
@@ -346,12 +349,14 @@ app.put('/events/:eventId/queue/config', async (req, res) => {
     return res.status(403).json({ error: 'event_organiser_required' });
   }
   const [events] = await database.query<mysql.RowDataPacket[]>(
-    'SELECT tier, total_seats, available_buyers FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+    'SELECT tier, status, total_seats, available_buyers FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
   );
   if (!events[0])
     return res.status(404).json({ error: 'event_not_found' });
 
-  const status = input.opensAt.getTime() <= Date.now() ? 'OPEN' : 'CLOSED';
+  const status = events[0].status === 'PUBLISHED' && input.opensAt.getTime() <= Date.now()
+    ? 'OPEN'
+    : 'CLOSED';
   await database.execute(
     `INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
      VALUES (?, ?, ?, ?, ?)
@@ -380,14 +385,39 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
   try {
     await connection.beginTransaction();
     const [events] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+      'SELECT status, total_seats, available_buyers, starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
     );
-    if (eventHasStarted(events[0])) { await connection.rollback(); return res.status(409).json({ error: 'event_completed' }); }
+    try {
+      assertEventOnSale(events[0]);
+    } catch (error) {
+      await connection.rollback();
+      if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
+      throw error;
+    }
     const [sessions] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
-    const session = sessions[0];
-    if (!session) { await connection.rollback(); return res.status(404).json({ error: 'queue_not_configured' }); }
+    let session = sessions[0];
+    if (!session) {
+      const [created] = await connection.execute<mysql.ResultSetHeader>(
+        `INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
+         VALUES (?, CURRENT_TIMESTAMP, ?, 60, 'OPEN')
+         ON DUPLICATE KEY UPDATE queue_session_id = LAST_INSERT_ID(queue_session_id)`,
+        [
+          eventId,
+          buyerCapacity(
+            Number(events[0].total_seats),
+            events[0].available_buyers === null ? null : Number(events[0].available_buyers),
+          ),
+        ],
+      );
+      const [createdSessions] = await connection.query<mysql.RowDataPacket[]>(
+        'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE queue_session_id = ? LIMIT 1 FOR UPDATE',
+        [created.insertId],
+      );
+      session = createdSessions[0];
+      if (!session) throw new Error('queue_session_create_failed');
+    }
     const notJoinable = await joinBlockReason(connection, session);
     if (notJoinable) {
       await connection.rollback();
