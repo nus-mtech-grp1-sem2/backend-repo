@@ -432,8 +432,12 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
       await connection.commit();
       return res.json(queueEntryResponse(entry));
     }
+    // This must be a locking (current) read: under REPEATABLE READ, a plain
+    // aggregate would reuse the snapshot taken before this joiner waited for
+    // the session lock and could assign a position that just committed.
     const [positions] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT COALESCE(MAX(position), 0) + 1 AS next_position FROM queue_entries WHERE queue_session_id = ?',
+      `SELECT COALESCE(MAX(position), 0) + 1 AS next_position
+       FROM queue_entries WHERE queue_session_id = ? FOR UPDATE`,
       [session.queue_session_id],
     );
     const position = Number(positions[0]?.next_position ?? 1);

@@ -137,4 +137,36 @@ describe('reservation cancellation and expiry', () => {
     assert.match(listing?.sql ?? '', /WHERE o\.customer_sub = \? AND e\.status <> 'CANCELLED'/);
     assert.deepEqual(listing?.params, ['alice']);
   });
+
+  for (const settled of ['paid', 'hold extended', 'expired']) {
+    it(`rechecks an expiry candidate under locks when it has ${settled}`, async () => {
+      const row = reservation({ expires_at: new Date(Date.now() - 1_000) });
+      on(/WHERE o\.status = 'PENDING' AND h\.status = 'ACTIVE'/, [row]);
+      on(/FROM orders WHERE order_id = \? LIMIT 1 FOR UPDATE/, [{
+        order_id: 42, event_id: 7, customer_sub: 'alice', hold_id: 81,
+        status: settled === 'paid' ? 'PAID' : 'PENDING',
+      }]);
+      on(/FROM event_inventory\.inventory_holds WHERE hold_id = \?/, settled === 'expired' ? [{
+        hold_id: 81, inventory_item_id: 9, quantity: 2, status: 'ACTIVE', expires_at: row.expires_at,
+      }] : []);
+      on(/FROM orders o INNER JOIN event_inventory\.events e/, []);
+      on(/UPDATE event_inventory\.inventory_items/, { affectedRows: 1 });
+      on(/UPDATE event_inventory\.inventory_holds/, { affectedRows: 1 });
+      on(/UPDATE orders SET status = 'CANCELLED'/, { affectedRows: 1 });
+      on(/UPDATE `queue`\.queue_entries/, { affectedRows: 0 });
+
+      const response = await fetch(`${base}/customers/me/orders`, {
+        headers: { authorization: 'Bearer alice' },
+      });
+
+      assert.equal(response.status, 200);
+      const updates = calls.filter((call) => /^UPDATE/.test(call.sql));
+      if (settled === 'expired') {
+        assert.ok(updates.some((call) => /SET status = 'CANCELLED'/.test(call.sql)));
+        assert.ok(updates.some((call) => call.params[0] === 'EXPIRED'));
+      } else {
+        assert.deepEqual(updates, [], 'a settled or extended reservation must not be released');
+      }
+    });
+  }
 });

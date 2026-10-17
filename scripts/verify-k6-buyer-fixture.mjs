@@ -32,9 +32,18 @@ try {
       `SELECT COUNT(*) AS orders, SUM(status = 'PAID') AS paid,
         (SELECT COUNT(*) FROM checkout.payments p
          INNER JOIN checkout.orders po ON po.order_id = p.order_id
-         WHERE po.event_id = ?) AS payments
+         WHERE po.event_id = ?) AS payments,
+        (SELECT COUNT(DISTINCT p.order_id) FROM checkout.payments p
+         INNER JOIN checkout.orders po ON po.order_id = p.order_id
+         WHERE po.event_id = ? AND p.status = 'CAPTURED') AS captured_orders,
+        (SELECT COUNT(*) FROM event_inventory.inventory_holds h
+         INNER JOIN checkout.orders ho ON ho.hold_id = h.hold_id
+         WHERE ho.event_id = ? AND h.status = 'CONFIRMED') AS confirmed_holds,
+        (SELECT COUNT(*) FROM \`queue\`.queue_entries e
+         INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+         WHERE s.event_id = ? AND e.status = 'LEFT') AS released_buyers
        FROM checkout.orders WHERE event_id = ?`,
-      [eventId, eventId],
+      [eventId, eventId, eventId, eventId, eventId],
     );
     const [inventory] = await connection.query(
       `SELECT sold_qty, reserved_qty FROM event_inventory.inventory_items
@@ -49,9 +58,11 @@ try {
     const soldCount = Number(item.sold_qty);
     const reservedCount = Number(item.reserved_qty);
     const checkoutValid = mode === 'checkout' &&
-      orderCount >= 50 && orderCount <= 80 && paidCount >= 50 && paidCount <= orderCount &&
+      orderCount === 80 && paidCount === 80 &&
       paymentCount === paidCount && soldCount === paidCount &&
-      reservedCount === orderCount - paidCount && soldCount + reservedCount <= 100;
+      Number(row.captured_orders) === 80 && Number(row.confirmed_holds) === 80 &&
+      Number(row.released_buyers) === 80 &&
+      reservedCount === 0 && soldCount + reservedCount <= 100;
     const journeyValid = mode === 'journey' && orderCount === expected && paidCount === expected &&
       paymentCount === expected && reservedCount === 0;
     if (!checkoutValid && !journeyValid) {

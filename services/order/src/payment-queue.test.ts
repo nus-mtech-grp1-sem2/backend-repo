@@ -15,7 +15,7 @@ const send = mock.method(SQSClient.prototype, 'send', async (command: unknown) =
   if (sendFails) throw new Error('offline SQS failure');
   return {};
 });
-const { app, processPayment } = await import('./index.js');
+const { app, processPayment, database } = await import('./index.js');
 
 describe('asynchronous mock payments', () => {
   let server: TestServer;
@@ -106,6 +106,40 @@ describe('asynchronous mock payments', () => {
     assert.equal(db.calls.some((call) => call.sql === 'ROLLBACK'), false);
     order.status = 'PAID'; sendFails = false;
     assert.equal((await processPayment(42, 'alice', 'simulated')).status, 200);
+    assert.equal(db.calls.filter((call) => /INSERT INTO payments/.test(call.sql)).length, 1);
+  });
+
+  it('retries a payment deadlock before commit and publishes once after success', async (context) => {
+    scriptOrder();
+    const connection = await database.getConnection();
+    const execute = connection.execute.bind(connection);
+    let attempts = 0;
+    context.mock.method(connection, 'execute', async (sql: string, params: unknown[]) => {
+      if (/UPDATE event_inventory\.inventory_items/.test(sql) && attempts++ === 0) {
+        throw Object.assign(new Error('deadlock'), { errno: 1213 });
+      }
+      return execute(sql, params);
+    });
+
+    assert.equal((await processPayment(42, 'alice', 'simulated')).status, 200);
+
+    assert.equal(db.calls.filter((call) => call.sql === 'ROLLBACK').length, 1);
+    assert.equal(db.calls.filter((call) => call.sql === 'COMMIT').length, 1);
+    assert.equal(db.calls.filter((call) => /INSERT INTO payments/.test(call.sql)).length, 1);
+    assert.equal(sends.length, 1);
+  });
+
+  it('does not retry a committed payment when publication throws a lock-shaped error', async () => {
+    scriptOrder();
+    send.mock.mockImplementation(async () => {
+      throw Object.assign(new Error('publication failed'), { errno: 1213 });
+    });
+
+    assert.equal((await processPayment(42, 'alice', 'simulated')).status, 502);
+
+    assert.equal(db.calls.filter((call) => call.sql === 'BEGIN').length, 1);
+    assert.equal(db.calls.filter((call) => call.sql === 'COMMIT').length, 1);
+    assert.equal(db.calls.filter((call) => call.sql === 'ROLLBACK').length, 0);
     assert.equal(db.calls.filter((call) => /INSERT INTO payments/.test(call.sql)).length, 1);
   });
 
