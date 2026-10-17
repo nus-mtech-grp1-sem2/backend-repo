@@ -10,7 +10,7 @@ const db = installOfflineServices(mock, {
 });
 const { calls, on } = db;
 
-const { app } = await import('./index.js');
+const { app, database } = await import('./index.js');
 
 describe('POST /orders sale window', () => {
   let server: TestServer;
@@ -158,6 +158,61 @@ describe('POST /orders sale window', () => {
         false,
       );
     }
+  });
+
+  it('rechecks admission after acquiring the buyer lock before reserving stock', async () => {
+    scriptEvent();
+    on(/WHERE e\.queue_entry_id = \?/, []);
+    on(ADMITTED_ENTRY, [{ queue_entry_id: 3 }]);
+
+    const response = await placeOrder({ eventId: 5, quantity: 1, admissionToken: 'expired-while-waiting' });
+
+    assert.deepEqual(response, { status: 403, body: { error: 'queue_admission_required' } });
+    assert.deepEqual(writes(), []);
+    assert.equal(calls.some((call) => /FROM event_inventory\.inventory_items/.test(call.sql)), false);
+  });
+
+  it('keeps expiry discovery failures inside the order-create error boundary', async () => {
+    on(/h\.expires_at <= CURRENT_TIMESTAMP/, new Error('database unavailable'));
+
+    const response = await placeOrder({ eventId: 5, quantity: 1, admissionToken: 'admitted' });
+
+    assert.deepEqual(response, { status: 502, body: { error: 'order_create_failed' } });
+    assert.deepEqual(writes(), []);
+  });
+
+  it('retries the whole create transaction after a deadlock and loads its response after commit', async (context) => {
+    scriptEvent();
+    on(ADMITTED_ENTRY, [{ queue_entry_id: 3 }]);
+    on(/SELECT inventory_item_id, price_cents/, [{
+      inventory_item_id: 9, price_cents: 2500, total_qty: 100, reserved_qty: 0, sold_qty: 0,
+    }]);
+    on(/SELECT inventory_item_id, name, price_cents/, [{ inventory_item_id: 9, name: 'Tickets', price_cents: 2500 }]);
+    on(/UPDATE event_inventory\.inventory_items/, { affectedRows: 1 });
+    on(/INSERT INTO event_inventory\.inventory_holds/, { insertId: 41 });
+    on(/INSERT INTO orders/, { insertId: 42 });
+    on(/INSERT INTO order_items/, { affectedRows: 1 });
+    on(/UPDATE event_inventory\.inventory_holds/, { affectedRows: 1 });
+    on(/UPDATE `queue`\.queue_entries/, { affectedRows: 1 });
+    on(/FROM orders o/, [{ order_id: 42, status: 'PENDING' }]);
+    on(/FROM order_items/, []);
+    on(/FROM payments/, []);
+    const connection = await database.getConnection();
+    const execute = connection.execute.bind(connection);
+    let inserts = 0;
+    context.mock.method(connection, 'execute', async (sql: string, params: unknown[]) => {
+      if (/INSERT INTO orders/.test(sql) && inserts++ === 0) {
+        throw Object.assign(new Error('deadlock'), { errno: 1213 });
+      }
+      return execute(sql, params);
+    });
+
+    const response = await placeOrder({ eventId: 5, inventoryItemId: 9, quantity: 1, admissionToken: 'admitted' });
+
+    assert.deepEqual(response, { status: 201, body: { order: { order_id: 42, status: 'PENDING', items: [], payments: [] } } });
+    assert.equal(calls.filter((call) => call.sql === 'ROLLBACK').length, 1);
+    assert.equal(calls.filter((call) => call.sql === 'COMMIT').length, 1);
+    assert.ok(calls.findIndex((call) => /h\.expires_at AS reservation_expires_at/.test(call.sql)) > calls.findIndex((call) => call.sql === 'COMMIT'));
   });
 
   it('rejects an unauthenticated order before looking at the event', async () => {

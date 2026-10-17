@@ -36,6 +36,7 @@ const nodeTestFiles = [
   source('order', 'src', 'purchase-window.test.ts'),
   source('order', 'src', 'reservation.test.ts'),
   source('order', 'src', 'payment-queue.test.ts'),
+  source('order', 'src', 'transaction.test.ts'),
   source('ticket', 'src', 'index.test.ts'),
   source('ticket', 'src', 'confirmation-status.test.ts'),
   source('ticket', 'src', 'issuance-delay.test.ts'),

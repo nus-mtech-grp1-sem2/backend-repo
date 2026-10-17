@@ -71,3 +71,7 @@ coverage/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local k6 fixture and result artifacts
+.k6-*.env
+k6-results/

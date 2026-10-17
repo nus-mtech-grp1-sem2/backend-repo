@@ -31,6 +31,8 @@ export const options = {
     http_req_duration: ['p(95)<2000'],
     baseline_paid_orders: ['count==50'],
     contention_probe_attempts: ['count==30'],
+    contention_probe_paid_orders: ['count==30'],
+    contention_probe_failures: ['count==0'],
     unexpected_checkout_responses: ['count==0'],
   },
 };
@@ -42,14 +44,12 @@ const inventoryItemId = Number(__ENV.K6_INVENTORY_ITEM_ID);
 export default function checkoutCapacity() {
   const probe = exec.scenario.name === 'contention_probe';
   const customer = `${probe ? 'probe' : 'base'}-${exec.scenario.iterationInTest}`;
-  const expected = probe ? http.expectedStatuses(200, 201, 409, 500, 502, 503, 504) : undefined;
   const params = {
     headers: {
       Authorization: `Bearer test-token:${customer}`,
       'Content-Type': 'application/json',
     },
     timeout: '8s',
-    ...(expected ? { responseCallback: expected } : {}),
   };
   const create = http.post(
     `${baseUrl}/orders`,
@@ -93,10 +93,8 @@ export default function checkoutCapacity() {
 
   probeAttempts.add(1);
   probePaid.add(valid ? 1 : 0);
-  const observedFailure =
-    create.status === 409 ||
-    create.status >= 500 ||
-    (create.status === 201 && (paid.status === 409 || paid.status >= 500));
-  probeFailures.add(observedFailure ? 1 : 0);
-  unexpected.add(valid || observedFailure ? 0 : 1);
+  // Stock exceeds every attempted purchase, so every buyer must succeed.
+  probeFailures.add(valid ? 0 : 1);
+  unexpected.add(valid ? 0 : 1);
+  check(paid, { 'concurrent order is created and paid': () => valid });
 }

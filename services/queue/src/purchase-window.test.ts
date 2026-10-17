@@ -143,6 +143,8 @@ describe('queue for a completed event', () => {
 
       assert.equal(response.status, 201);
       assert.equal(writes().length, 1);
+      const positionRead = calls.find((call) => /COALESCE\(MAX\(position\), 0\) \+ 1/.test(call.sql));
+      assert.match(positionRead?.sql ?? '', /WHERE queue_session_id = \? FOR UPDATE$/);
     });
 
     it('creates the queue automatically when the first customer joins a published event', async () => {
