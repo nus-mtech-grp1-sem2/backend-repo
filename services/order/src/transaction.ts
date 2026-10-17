@@ -1,3 +1,4 @@
+import { randomInt } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import type mysql from 'mysql2/promise';
@@ -32,6 +33,6 @@ export async function withTransaction<T>(
     } finally {
       connection.release();
     }
-    await delay(10 * 2 ** (attempt - 1) + Math.floor(Math.random() * 10));
+    await delay(10 * 2 ** (attempt - 1) + randomInt(10));
   }
 }

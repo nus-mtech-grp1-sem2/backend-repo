@@ -468,11 +468,19 @@ app.post('/orders', async (req, res) => {
         } else {
           // Lock a requested zone by primary key. Otherwise lock event zones
           // in a stable order and select the cheapest one with capacity.
-          const [inventory] = await connection.query<mysql.RowDataPacket[]>(
-            `SELECT inventory_item_id, price_cents, total_qty, reserved_qty, sold_qty FROM event_inventory.inventory_items
-             WHERE ${input.inventoryItemId ? 'inventory_item_id = ? AND ' : ''}event_id = ?
-             ORDER BY inventory_item_id FOR UPDATE`, input.inventoryItemId ? [input.inventoryItemId, eventId] : [eventId],
-          );
+          const [inventory] = input.inventoryItemId
+            ? await connection.query<mysql.RowDataPacket[]>(
+                `SELECT inventory_item_id, price_cents, total_qty, reserved_qty, sold_qty
+                 FROM event_inventory.inventory_items
+                 WHERE inventory_item_id = ? AND event_id = ? FOR UPDATE`,
+                [input.inventoryItemId, eventId],
+              )
+            : await connection.query<mysql.RowDataPacket[]>(
+                `SELECT inventory_item_id, price_cents, total_qty, reserved_qty, sold_qty
+                 FROM event_inventory.inventory_items
+                 WHERE event_id = ? ORDER BY inventory_item_id FOR UPDATE`,
+                [eventId],
+              );
           const item = selectAvailableZone(
             inventory.map((row) => ({
               inventoryItemId: Number(row.inventory_item_id),
