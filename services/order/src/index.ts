@@ -261,6 +261,46 @@ async function loadOrder(orderId: number): Promise<LoadedOrder | null> {
   return { ...orders[0], items, payments } as LoadedOrder;
 }
 
+/** Discover identifiers with consistent reads, never locking the session or
+ * scanning its secondary index inside a queue-entry UPDATE. */
+async function findQueueEntryId(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  customerSub: string,
+): Promise<number | null> {
+  const [sessions] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT queue_session_id FROM `queue`.queue_sessions WHERE event_id = ? LIMIT 1', [eventId],
+  );
+  if (!sessions[0]) return null;
+  const [entries] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT queue_entry_id FROM `queue`.queue_entries WHERE queue_session_id = ? AND customer_sub = ? LIMIT 1',
+    [sessions[0].queue_session_id, customerSub],
+  );
+  return entries[0] ? Number(entries[0].queue_entry_id) : null;
+}
+
+async function releaseQueueEntry(
+  connection: mysql.PoolConnection,
+  eventId: number,
+  customerSub: string,
+  holdId: number,
+): Promise<boolean> {
+  const queueEntryId = await findQueueEntryId(connection, eventId, customerSub);
+  if (queueEntryId === null) return false;
+  const [holds] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1', [holdId],
+  );
+  if (!holds[0]) return false;
+  const [released] = await connection.execute<mysql.ResultSetHeader>(
+    `UPDATE \`queue\`.queue_entries
+     SET status = 'LEFT', admission_token = NULL, token_expires_at = NULL
+     WHERE queue_entry_id = ? AND status = 'IN_CHECKOUT' AND token_expires_at = ?`,
+    [queueEntryId, holds[0].expires_at],
+  );
+  // The expiry guard prevents a replay/cancellation releasing a newer checkout.
+  return released.affectedRows > 0;
+}
+
 async function releaseReservation(
   connection: mysql.PoolConnection,
   reservation: ReservationRow,
@@ -289,15 +329,7 @@ async function releaseReservation(
     "UPDATE orders SET status = 'CANCELLED' WHERE order_id = ? AND status = 'PENDING'",
     [reservation.order_id],
   );
-  const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
-    `UPDATE \`queue\`.queue_entries e
-     SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-     WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-       AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
-       AND e.token_expires_at = ?`,
-    [reservation.event_id, reservation.customer_sub, reservation.expires_at],
-  );
-  return queueRelease.affectedRows > 0;
+  return releaseQueueEntry(connection, reservation.event_id, reservation.customer_sub, reservation.hold_id);
 }
 
 async function expireReservations(filters: {
@@ -394,6 +426,7 @@ app.post('/orders', async (req, res) => {
       let holdId = input.holdId;
       let eventId = input.eventId;
       let hold: HoldData | undefined;
+      let queueEntryId: number | null = null;
       if (holdId) {
         const [holds] = await connection.query<mysql.RowDataPacket[]>(
           `SELECT hold_id, event_id, inventory_item_id, customer_sub, quantity, status, expires_at, order_id
@@ -420,26 +453,22 @@ app.post('/orders', async (req, res) => {
          FROM event_inventory.events WHERE event_id = ? LIMIT 1`, [eventId],
       );
       const event = events[0];
-      if (!event) throw new OrderRequestError(404, 'event_not_found');
+      if (!event || eventId === null) throw new OrderRequestError(404, 'event_not_found');
       const saleBlock = saleBlockReason(event);
       if (saleBlock) throw new OrderRequestError(409, saleBlock);
 
       // Both tiers sell through the queue: a direct order needs a live admission token.
       if (!input.holdId) {
         if (!input.admissionToken) throw new OrderRequestError(403, 'queue_admission_required');
-        const [entries] = await connection.query<mysql.RowDataPacket[]>(
-          `SELECT e.queue_entry_id FROM \`queue\`.queue_entries e INNER JOIN \`queue\`.queue_sessions s ON s.queue_session_id = e.queue_session_id
-           WHERE s.event_id = ? AND e.customer_sub = ? AND e.status = 'ADMITTED' AND e.admission_token = ?
-             AND e.token_expires_at > CURRENT_TIMESTAMP LIMIT 1`, [eventId, caller.sub, input.admissionToken],
-        );
-        if (!entries[0]) throw new OrderRequestError(403, 'queue_admission_required');
+        queueEntryId = await findQueueEntryId(connection, eventId, caller.sub);
+        if (queueEntryId === null) throw new OrderRequestError(403, 'queue_admission_required');
         // Recheck under a primary-key lock on this buyer only. Locking the join
         // also locks the shared session, inverting payment's inventory -> queue order.
         const [admissions] = await connection.query<mysql.RowDataPacket[]>(
           `SELECT e.queue_entry_id FROM \`queue\`.queue_entries e
            WHERE e.queue_entry_id = ? AND e.customer_sub = ? AND e.status = 'ADMITTED'
              AND e.admission_token = ? AND e.token_expires_at > CURRENT_TIMESTAMP FOR UPDATE`,
-          [entries[0].queue_entry_id, caller.sub, input.admissionToken],
+          [queueEntryId, caller.sub, input.admissionToken],
         );
         if (!admissions[0]) throw new OrderRequestError(403, 'queue_admission_required');
       }
@@ -525,13 +554,15 @@ app.post('/orders', async (req, res) => {
       }
       await connection.execute('UPDATE event_inventory.inventory_holds SET order_id = ? WHERE hold_id = ?', [insert.insertId, holdId]);
       if (input.admissionToken) {
+        queueEntryId ??= await findQueueEntryId(connection, eventId, caller.sub);
+        const [holdExpiry] = await connection.query<mysql.RowDataPacket[]>(
+          'SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ? LIMIT 1', [holdId],
+        );
+        if (!holdExpiry[0]?.expires_at) throw new Error('hold_expiry_missing');
         await connection.execute(
-          `UPDATE \`queue\`.queue_entries e
-           SET e.status = 'IN_CHECKOUT',
-             e.token_expires_at = (SELECT h.expires_at FROM event_inventory.inventory_holds h WHERE h.hold_id = ?)
-           WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-             AND e.customer_sub = ? AND e.admission_token = ?`,
-          [holdId, eventId, caller.sub, input.admissionToken],
+          `UPDATE \`queue\`.queue_entries SET status = 'IN_CHECKOUT', token_expires_at = ?
+           WHERE queue_entry_id = ? AND customer_sub = ? AND admission_token = ?`,
+          [holdExpiry[0].expires_at, queueEntryId, caller.sub, input.admissionToken],
         );
       }
       return { status: 201, orderId: insert.insertId };
@@ -660,15 +691,8 @@ export async function processPayment(orderId: number, customerSub: string, token
       if (!order) throw new OrderRequestError(404, 'order_not_found');
       if (order.customer_sub !== customerSub) throw new OrderRequestError(403, 'order_owner_required');
       if (order.status === 'PAID') {
-        const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
-          `UPDATE \`queue\`.queue_entries e
-           SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-           WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-             AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
-             AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
-          [order.event_id, order.customer_sub, order.hold_id],
-        );
-        return { status: 200, body: null, refillEventId: queueRelease.affectedRows > 0 ? Number(order.event_id) : null };
+        const released = await releaseQueueEntry(connection, Number(order.event_id), order.customer_sub, Number(order.hold_id));
+        return { status: 200, body: null, refillEventId: released ? Number(order.event_id) : null };
       }
       if (order.status !== 'PENDING') throw new OrderRequestError(409, 'order_not_payable');
       if (/^(fail|declin)/i.test(token)) {
@@ -690,15 +714,7 @@ export async function processPayment(orderId: number, customerSub: string, token
         await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'RELEASED' WHERE hold_id = ?", [order.hold_id]);
         let releasedQueueSlot = false;
         if (failedHold) {
-          const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
-            `UPDATE \`queue\`.queue_entries e
-             SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-             WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-               AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
-               AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
-            [failedHold.event_id, failedHold.customer_sub, order.hold_id],
-          );
-          releasedQueueSlot = queueRelease.affectedRows > 0;
+          releasedQueueSlot = await releaseQueueEntry(connection, Number(order.event_id), order.customer_sub, Number(order.hold_id));
         }
         return { status: 402, body: { error: 'payment_failed' }, refillEventId: releasedQueueSlot && failedHold ? Number(failedHold.event_id) : null };
       }
@@ -720,16 +736,9 @@ export async function processPayment(orderId: number, customerSub: string, token
           }
           await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'RELEASED' WHERE hold_id = ?", [order.hold_id]);
         }
-        const [releasedQueue] = await connection.execute<mysql.ResultSetHeader>(
-          `UPDATE \`queue\`.queue_entries e
-           SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-           WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-             AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
-             AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
-          [order.event_id, order.customer_sub, order.hold_id],
-        );
+        const releasedQueue = await releaseQueueEntry(connection, Number(order.event_id), order.customer_sub, Number(order.hold_id));
         await connection.execute("UPDATE orders SET status = 'FAILED' WHERE order_id = ? AND status = 'PENDING'", [orderId]);
-        return { status: 409, body: { error: 'hold_not_active' }, refillEventId: releasedQueue.affectedRows > 0 ? Number(order.event_id) : null };
+        return { status: 409, body: { error: 'hold_not_active' }, refillEventId: releasedQueue ? Number(order.event_id) : null };
       }
       if (hold.inventory_item_id) {
         const [inventoryUpdate] = await connection.execute<mysql.ResultSetHeader>(
@@ -746,15 +755,8 @@ export async function processPayment(orderId: number, customerSub: string, token
       await connection.execute("UPDATE event_inventory.inventory_holds SET status = 'CONFIRMED' WHERE hold_id = ?", [hold.hold_id]);
       await connection.execute("INSERT INTO payments (order_id, payment_token, status, amount_cents) VALUES (?, ?, 'CAPTURED', ?)", [orderId, token, order.total_amount_cents]);
       await connection.execute("UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE order_id = ?", [orderId]);
-      const [queueRelease] = await connection.execute<mysql.ResultSetHeader>(
-        `UPDATE \`queue\`.queue_entries e
-         SET e.status = 'LEFT', e.admission_token = NULL, e.token_expires_at = NULL
-         WHERE e.queue_session_id = (SELECT queue_session_id FROM \`queue\`.queue_sessions WHERE event_id = ?)
-           AND e.customer_sub = ? AND e.status = 'IN_CHECKOUT'
-           AND e.token_expires_at = (SELECT expires_at FROM event_inventory.inventory_holds WHERE hold_id = ?)`,
-        [order.event_id, order.customer_sub, order.hold_id],
-      );
-      return { status: 200, body: null, refillEventId: queueRelease.affectedRows > 0 ? Number(order.event_id) : null };
+      const released = await releaseQueueEntry(connection, Number(order.event_id), order.customer_sub, Number(order.hold_id));
+      return { status: 200, body: null, refillEventId: released ? Number(order.event_id) : null };
     });
     if (result.refillEventId != null) await refillReleasedQueueSlot(result.refillEventId);
     if (result.status === 200) {

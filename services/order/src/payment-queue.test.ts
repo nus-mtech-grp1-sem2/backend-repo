@@ -30,6 +30,8 @@ describe('asynchronous mock payments', () => {
     });
   });
   function scriptOrder(status = 'PENDING', seated = false) {
+    db.on(/SELECT queue_session_id FROM `queue`\.queue_sessions/, [{ queue_session_id: 1 }]);
+    db.on(/SELECT queue_entry_id FROM `queue`\.queue_entries/, [{ queue_entry_id: 99 }]);
     const order = { order_id: 42, event_id: 5, customer_sub: 'alice', customer_email: 'alice@example.com', customer_name: 'Alice Tan', hold_id: 10, status, total_amount_cents: 4000, currency: 'SGD' };
     db.on(/FROM orders .*order_id = \?/, [order]);
     db.on(/FROM order_items/, []);
@@ -94,8 +96,10 @@ describe('asynchronous mock payments', () => {
       assert.equal((sends[0] as SendMessageCommand).input.DelaySeconds, 10);
       assert.equal(JSON.parse((sends[0] as SendMessageCommand).input.MessageBody!).customerName, 'Alice Tan');
       for (const call of db.calls.filter((call) => /UPDATE `queue`/.test(call.sql))) {
-        assert.match(call.sql, /e.token_expires_at = \(SELECT expires_at/);
-        assert.equal(call.params[2], 10, 'a replay may only release this order\'s checkout');
+        assert.match(call.sql, /WHERE queue_entry_id = \? AND status = 'IN_CHECKOUT' AND token_expires_at = \?/);
+        assert.doesNotMatch(call.sql, /SELECT|JOIN|queue_session_id/);
+        assert.equal(call.params[0], 99);
+        assert.ok(call.params[1] instanceof Date, 'a replay retains the checkout-expiry guard');
       }
     });
   }

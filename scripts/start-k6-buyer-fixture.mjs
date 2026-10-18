@@ -3,8 +3,8 @@ import { writeFile } from 'node:fs/promises';
 import mysql from 'mysql2/promise';
 
 const mode = process.argv[2];
-if (!['queue', 'checkout', 'journey'].includes(mode)) {
-  throw new Error('usage: start-k6-buyer-fixture.mjs <queue|checkout|journey>');
+if (!['queue', 'checkout', 'journey', 'mixed'].includes(mode)) {
+  throw new Error('usage: start-k6-buyer-fixture.mjs <queue|checkout|journey|mixed>');
 }
 
 process.env.NODE_ENV = 'test';
@@ -12,6 +12,7 @@ process.env.DB_SSL = 'false';
 process.env.INTERNAL_API_TOKEN = 'k6-fixture-internal';
 process.env.ORDER_EVENTS_QUEUE_URL = '';
 process.env.PAYMENT_REQUESTS_QUEUE_URL = '';
+process.env.CUSTOMER_ADMITTED_QUEUE_URL = '';
 process.env.TICKET_SERVICE_URL = '';
 process.env.QUEUE_SERVICE_URL = '';
 
@@ -25,6 +26,8 @@ const connectionOptions = {
 const fixturePool = mysql.createPool(connectionOptions);
 const servers = [];
 const pools = [];
+const queuePort = Number(process.env.K6_FIXTURE_QUEUE_PORT ?? 3103);
+const orderPort = Number(process.env.K6_FIXTURE_ORDER_PORT ?? 3104);
 
 const fakeVerifier = {
   verify: async (token) => {
@@ -48,7 +51,7 @@ async function loadQueue() {
   const service = await import('../services/queue/src/index.ts');
   service.__setVerifierForTests(fakeVerifier);
   pools.push(service.database);
-  await listen(service.app, 3103);
+  await listen(service.app, queuePort);
 }
 
 async function loadOrder() {
@@ -56,11 +59,11 @@ async function loadOrder() {
   const service = await import('../services/order/src/index.ts');
   service.__setVerifierForTests(fakeVerifier);
   pools.push(service.database);
-  await listen(service.app, 3104);
+  await listen(service.app, orderPort);
 }
 
-const tier = mode === 'checkout' ? 'TIER1_GA' : 'TIER2_SEATED';
-const capacity = mode === 'queue' ? 200 : mode === 'checkout' ? 100 : 20;
+const tier = ['checkout', 'mixed'].includes(mode) ? 'TIER1_GA' : 'TIER2_SEATED';
+const capacity = mode === 'mixed' ? 300 : mode === 'queue' ? 200 : mode === 'checkout' ? 100 : 20;
 const [eventResult] = await fixturePool.execute(
   `INSERT INTO event_inventory.events
      (organiser_sub, title, venue, starts_at, total_seats, available_buyers, tier, status)
@@ -97,9 +100,9 @@ const [sessionResult] = await fixturePool.execute(
 // The production checkout contract requires every direct order to carry a
 // live admission token. Seed one for each deterministic checkout VU identity
 // so this isolated test measures order/payment contention rather than queueing.
-if (mode === 'checkout') {
+if (mode === 'checkout' || mode === 'mixed') {
   const queueSessionId = Number(sessionResult.insertId);
-  const customers = [
+  const customers = mode === 'mixed' ? Array.from({ length: 200 }, (_, index) => `mixed-${index}`) : [
     ...Array.from({ length: 50 }, (_, index) => `base-${index}`),
     ...Array.from({ length: 30 }, (_, index) => `probe-${index}`),
   ];
@@ -111,11 +114,15 @@ if (mode === 'checkout') {
       [queueSessionId, customer, index + 1, `k6-admission-${customer}`],
     );
   }
+  await fixturePool.execute(
+    'UPDATE `queue`.queue_sessions SET next_position = ?, serving_position = ? WHERE queue_session_id = ?',
+    [customers.length, customers.length, queueSessionId],
+  );
 }
 
 if (mode === 'queue') await loadQueue();
 if (mode === 'checkout') await loadOrder();
-if (mode === 'journey') {
+if (mode === 'journey' || mode === 'mixed') {
   await loadQueue();
   await loadOrder();
 }
@@ -123,9 +130,10 @@ if (mode === 'journey') {
 const environment = [
   `K6_EVENT_ID=${eventId}`,
   `K6_INVENTORY_ITEM_ID=${inventoryItemId}`,
-  'K6_QUEUE_URL=http://127.0.0.1:3103',
-  'K6_ORDER_URL=http://127.0.0.1:3104',
+  `K6_QUEUE_URL=http://127.0.0.1:${queuePort}`,
+  `K6_ORDER_URL=http://127.0.0.1:${orderPort}`,
   `K6_SEAT_IDS=${seatIds.join(',')}`,
+  `K6_EXPECTED_ORDERS=${mode === 'checkout' ? 80 : mode === 'mixed' ? 200 : mode === 'journey' ? 20 : 0}`,
   'K6_INTERNAL_TOKEN=k6-fixture-internal',
 ].join('\n') + '\n';
 if (!process.env.K6_FIXTURE_ENV_FILE) throw new Error('K6_FIXTURE_ENV_FILE is required');

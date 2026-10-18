@@ -112,6 +112,7 @@ describe('queue for a completed event', () => {
     };
 
     it('asks MySQL whether the event has started, against UTC time', async () => {
+      on(/FROM queue_sessions WHERE event_id = \?/, []);
       on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 1 }]);
 
       await join();
@@ -120,6 +121,7 @@ describe('queue for a completed event', () => {
     });
 
     it('refuses to let anyone join once the event has started, without touching the queue', async () => {
+      on(/FROM queue_sessions WHERE event_id = \?/, []);
       on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 1 }]);
 
       const response = await join();
@@ -127,24 +129,25 @@ describe('queue for a completed event', () => {
       assert.deepEqual(response, { status: 409, body: { error: 'event_completed' } });
       assert.ok(rolledBack());
       assert.deepEqual(writes(), [], 'no queue entry may be written');
-      assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 0);
+      assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 1, 'only the session mutex is read');
     });
 
     it('still lets someone join the queue of an upcoming event', async () => {
       on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
-        { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN' },
+        { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN', next_position: 0, serving_position: 0 },
       ]);
       on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, []);
-      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 1 }]);
+      on(/UPDATE queue_sessions SET next_position/, { affectedRows: 1 });
       on(/INSERT INTO queue_entries/, { insertId: 9 });
 
       const response = await join();
 
       assert.equal(response.status, 201);
-      assert.equal(writes().length, 1);
-      const positionRead = calls.find((call) => /COALESCE\(MAX\(position\), 0\) \+ 1/.test(call.sql));
-      assert.match(positionRead?.sql ?? '', /WHERE queue_session_id = \? FOR UPDATE$/);
+      assert.equal(writes().length, 2);
+      assert.equal(calls.some((call) => /MAX\(position\)/.test(call.sql)), false);
+      assert.ok(calls.findIndex((call) => /FROM queue_sessions/.test(call.sql)) < calls.findIndex((call) => EVENT_QUERY.test(call.sql)));
+      assert.ok(calls.some((call) => /SET next_position = next_position \+ 1/.test(call.sql)));
     });
 
     it('creates the queue automatically when the first customer joins a published event', async () => {
@@ -157,10 +160,10 @@ describe('queue for a completed event', () => {
       on(/FROM queue_sessions WHERE event_id = \?/, []);
       on(/INSERT INTO queue_sessions/, { insertId: 17 });
       on(/FROM queue_sessions WHERE queue_session_id = \?/, [
-        { queue_session_id: 17, opens_at: new Date(), status: 'OPEN' },
+        { queue_session_id: 17, opens_at: new Date(), status: 'OPEN', next_position: 0, serving_position: 0 },
       ]);
       on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, []);
-      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 1 }]);
+      on(/UPDATE queue_sessions SET next_position/, { affectedRows: 1 });
       on(/INSERT INTO queue_entries/, { insertId: 9 });
 
       const response = await join();
@@ -174,18 +177,20 @@ describe('queue for a completed event', () => {
     const openUpcomingQueue = (entries: unknown[]) => {
       on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
-        { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN' },
+        { queue_session_id: 1, opens_at: new Date(Date.now() - 60_000), status: 'OPEN', next_position: 6, serving_position: 0 },
       ]);
       on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, entries);
+      on(/FROM queue_entries WHERE queue_entry_id = \?/, entries);
+      on(/UPDATE queue_sessions SET next_position/, { affectedRows: 1 });
     };
 
     const scriptSession = (status: string, opensInMs: number) => {
       on(EVENT_QUERY, [{ status: 'PUBLISHED', has_started: 0 }]);
       on(/FROM queue_sessions WHERE event_id = \?/, [
-        { queue_session_id: 1, opens_at: new Date(Date.now() + opensInMs), status },
+        { queue_session_id: 1, opens_at: new Date(Date.now() + opensInMs), status, next_position: 0, serving_position: 0 },
       ]);
       on(/FROM queue_entries WHERE queue_session_id = \? AND customer_sub = \?/, []);
-      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 1 }]);
+      on(/UPDATE queue_sessions SET next_position/, { affectedRows: 1 });
       on(/INSERT INTO queue_entries/, { insertId: 9 });
       on(/UPDATE queue_sessions SET status = 'OPEN'/, {});
     };
@@ -197,7 +202,7 @@ describe('queue for a completed event', () => {
 
       assert.equal(response.status, 201);
       assert.match(writes()[0]?.sql ?? '', /UPDATE queue_sessions SET status = 'OPEN'/);
-      assert.equal(writes().length, 2, 'the legacy session is opened, then the customer is queued');
+      assert.equal(writes().length, 3, 'the session is opened, a ticket allocated, then the customer queued');
     });
 
     it('opens a legacy closed queue and lets the customer join', async () => {
@@ -207,10 +212,11 @@ describe('queue for a completed event', () => {
 
       assert.equal(response.status, 201);
       assert.match(writes()[0]?.sql ?? '', /UPDATE queue_sessions SET status = 'OPEN'/);
-      assert.equal(writes().length, 2, 'the session is opened, then the customer is queued');
+      assert.equal(writes().length, 3, 'the session is opened, a ticket allocated, then the customer queued');
     });
 
     it('refuses to create or join the queue before the event is published', async () => {
+      on(/FROM queue_sessions WHERE event_id = \?/, []);
       on(EVENT_QUERY, [{ status: 'DRAFT', has_started: 0 }]);
 
       const response = await join();
@@ -218,7 +224,7 @@ describe('queue for a completed event', () => {
       assert.deepEqual(response, { status: 409, body: { error: 'event_not_on_sale' } });
       assert.ok(rolledBack());
       assert.deepEqual(writes(), [], 'no queue session or entry may be changed');
-      assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 0);
+      assert.equal(calls.filter((call) => /queue_sessions/.test(call.sql)).length, 1, 'only the session mutex is read');
     });
 
     it('reports a drained queue as sold out, and any other state as not open', async () => {
@@ -252,13 +258,12 @@ describe('queue for a completed event', () => {
           token_expires_at: new Date(Date.now() - 1_000),
         },
       ]);
-      on(/COALESCE\(MAX\(position\), 0\) \+ 1/, [{ next_position: 7 }]);
       on(/UPDATE queue_entries SET position = \?/, {});
 
       const response = await join();
 
       assert.equal(response.status, 201);
-      assert.deepEqual(writes().map((call) => call.params), [[7, 9]]);
+      assert.deepEqual(writes().map((call) => call.params), [[1], [7, 9]]);
     });
 
     it('rejects an unauthenticated join before looking at the event', async () => {
