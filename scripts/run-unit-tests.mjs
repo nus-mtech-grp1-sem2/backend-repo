@@ -23,6 +23,7 @@ function run(command, args, options = {}) {
 }
 
 const nodeTestFiles = [
+  path.join(scriptsDirectory, 'backfill-queue-counters.test.mjs'),
   source('event', 'src', 'index.test.ts'),
   source('event', 'src', 'team-membership-access.test.ts'),
   source('inventory', 'src', 'index.test.ts'),
@@ -31,6 +32,8 @@ const nodeTestFiles = [
   source('inventory', 'src', 'seat-switch.test.ts'),
   source('queue', 'src', 'index.test.ts'),
   source('queue', 'src', 'purchase-window.test.ts'),
+  source('queue', 'src', 'concurrency.test.ts'),
+  source('queue', 'src', 'admission-capacity.test.ts'),
   source('order', 'src', 'index.test.ts'),
   source('order', 'src', 'inventory-selection.test.ts'),
   source('order', 'src', 'purchase-window.test.ts'),

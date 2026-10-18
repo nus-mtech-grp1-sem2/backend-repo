@@ -18,6 +18,7 @@ const migrations = [
   '17-add-event-team-soft-revoke.sql',
   '18-add-ga-section-seat-numbers.sql',
   '19-backfill-ga-section-seat-numbers.sql',
+  '20-add-queue-position-counters.sql',
 ];
 
 const host = process.env.DB_HOST;

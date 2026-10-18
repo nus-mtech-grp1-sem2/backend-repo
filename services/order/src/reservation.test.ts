@@ -19,7 +19,12 @@ describe('reservation cancellation and expiry', () => {
     base = server.base;
   });
   after(() => server.close());
-  beforeEach(() => db.reset());
+  beforeEach(() => {
+    db.reset();
+    on(/SELECT queue_session_id FROM `queue`\.queue_sessions/, [{ queue_session_id: 1 }]);
+    on(/SELECT queue_entry_id FROM `queue`\.queue_entries/, [{ queue_entry_id: 99 }]);
+    on(/SELECT expires_at FROM event_inventory\.inventory_holds/, [{ expires_at: new Date(Date.now() + 60_000) }]);
+  });
 
   const reservation = (overrides: Record<string, unknown> = {}) => ({
     order_id: 42,

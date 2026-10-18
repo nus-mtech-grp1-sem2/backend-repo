@@ -8,6 +8,7 @@ on:
       - 'k6/disposable-concurrency.js'
       - 'k6/queue-capacity.js'
       - 'k6/checkout-capacity.js'
+      - 'k6/mixed-buyer-capacity.js'
       - 'k6/buyer-journey.js'
       - 'k6/fixtures/inventory-schema.sql'
       - 'scripts/init-k6-database.mjs'
@@ -15,26 +16,46 @@ on:
       - 'scripts/verify-k6-inventory.mjs'
       - 'scripts/start-k6-buyer-fixture.mjs'
       - 'scripts/verify-k6-buyer-fixture.mjs'
+      - 'scripts/initialize-test-db.mjs'
+      - 'scripts/backfill-queue-counters.mjs'
+      - 'scripts/backfill-queue-counters.test.mjs'
+      - 'database/**'
       - 'scripts/run-payment-drain-capacity.mjs'
       - 'services/inventory/**'
       - 'services/queue/**'
       - 'services/order/**'
+      - 'services/shared/**'
 
 permissions:
   contents: read
 
 jobs:
   buyer-capacity:
-    name: ${{ matrix.mode }} capacity evidence
+    name: ${{ matrix.profile }} capacity evidence
     strategy:
       fail-fast: false
       matrix:
         include:
           - mode: queue
+            profile: queue
             script: queue-capacity.js
           - mode: checkout
+            profile: checkout
             script: checkout-capacity.js
+          - mode: mixed
+            profile: mixed
+            script: mixed-buyer-capacity.js
           - mode: journey
+            profile: journey-5
+            vus: 5
+            script: buyer-journey.js
+          - mode: journey
+            profile: journey-10
+            vus: 10
+            script: buyer-journey.js
+          - mode: journey
+            profile: journey-20
+            vus: 20
             script: buyer-journey.js
     runs-on: ubuntu-latest
     timeout-minutes: 12
@@ -56,6 +77,7 @@ jobs:
       DB_USER: root
       DB_PASSWORD: k6-ci-${{ github.run_id }}-${{ github.run_attempt }} # NOSONAR -- matches disposable service
       DB_SSL: 'false'
+      K6_JOURNEY_VUS: ${{ matrix.vus || 1 }}
       K6_FIXTURE_ENV_FILE: /tmp/onestage-k6-${{ matrix.mode }}.env
       K6_FIXTURE_PID_FILE: /tmp/onestage-k6-${{ matrix.mode }}.pid
 
@@ -71,7 +93,8 @@ jobs:
         run: node scripts/initialize-test-db.mjs
       - name: Start ${{ matrix.mode }} fixture
         run: |
-          node --import tsx scripts/start-k6-buyer-fixture.mjs "${{ matrix.mode }}" &
+          mkdir -p k6-results
+          node --import tsx scripts/start-k6-buyer-fixture.mjs "${{ matrix.mode }}" > "k6-results/${{ matrix.mode }}-server.log" 2>&1 &
           echo "$!" > "$K6_FIXTURE_PID_FILE"
           for attempt in {1..30}; do
             if [ -s "$K6_FIXTURE_ENV_FILE" ]; then
@@ -96,8 +119,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: k6-${{ matrix.mode }}-${{ github.run_id }}
-          path: k6-results/${{ matrix.mode }}.json
+          name: k6-${{ matrix.profile }}-${{ github.run_id }}
+          path: |
+            k6-results/${{ matrix.mode }}.json
+            k6-results/${{ matrix.mode }}-server.log
           if-no-files-found: warn
           retention-days: 14
       - name: Clean up fixture

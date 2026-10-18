@@ -29,6 +29,9 @@ describe('POST /orders sale window', () => {
   /** The caller's live admission, which both tiers need before ordering directly. */
   const ADMITTED_ENTRY = /e\.status = 'ADMITTED' AND e\.admission_token = \?/;
   const scriptEvent = (overrides: Record<string, unknown> = {}) => {
+    on(/SELECT queue_session_id FROM `queue`\.queue_sessions/, [{ queue_session_id: 1 }]);
+    on(/SELECT queue_entry_id FROM `queue`\.queue_entries/, [{ queue_entry_id: 17 }]);
+    on(/SELECT expires_at FROM event_inventory\.inventory_holds/, [{ expires_at: new Date(Date.now() + 60_000) }]);
     on(/h\.expires_at <= CURRENT_TIMESTAMP.*o\.event_id = \?/, []);
     on(EVENT_QUERY, [
       { event_id: 5, organiser_sub: 'organiser', tier: 'TIER1_GA', status: 'PUBLISHED', has_started: 0, ...overrides },
@@ -212,6 +215,11 @@ describe('POST /orders sale window', () => {
     assert.deepEqual(response, { status: 201, body: { order: { order_id: 42, status: 'PENDING', items: [], payments: [] } } });
     assert.equal(calls.filter((call) => call.sql === 'ROLLBACK').length, 1);
     assert.equal(calls.filter((call) => call.sql === 'COMMIT').length, 1);
+    for (const update of calls.filter((call) => /UPDATE `queue`\.queue_entries/.test(call.sql))) {
+      assert.doesNotMatch(update.sql, /SELECT|JOIN|queue_session_id/);
+      assert.match(update.sql, /WHERE queue_entry_id = \?/);
+      assert.equal(update.params[1], 17, 'carry the entry primary key from admission validation');
+    }
     assert.ok(calls.findIndex((call) => /h\.expires_at AS reservation_expires_at/.test(call.sql)) > calls.findIndex((call) => call.sql === 'COMMIT'));
   });
 

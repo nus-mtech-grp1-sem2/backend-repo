@@ -4,16 +4,18 @@ import { check } from 'k6';
 import { Counter } from 'k6/metrics';
 
 const completed = new Counter('completed_buyer_journeys');
+const buyers = 20;
+const vus = Number(__ENV.K6_JOURNEY_VUS || 5);
 
 export const options = {
   scenarios: {
-    small_end_to_end: { executor: 'shared-iterations', vus: 1, iterations: 10, maxDuration: '60s' },
+    small_end_to_end: { executor: 'shared-iterations', vus, iterations: buyers, maxDuration: '60s' },
   },
   thresholds: {
     checks: ['rate==1'],
     http_req_failed: ['rate==0'],
     http_req_duration: ['p(95)<2500'],
-    completed_buyer_journeys: ['count==10'],
+    completed_buyer_journeys: [`count==${buyers}`],
   },
 };
 

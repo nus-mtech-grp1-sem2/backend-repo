@@ -51,6 +51,7 @@ Get-Content ..\..\database\16-add-event-cancellation-notification-type.sql | mys
 Get-Content ..\..\database\17-add-event-team-soft-revoke.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_EVENT_INVENTORY
 Get-Content ..\..\database\18-add-ga-section-seat-numbers.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_TICKETING
 Get-Content ..\..\database\19-backfill-ga-section-seat-numbers.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_TICKETING
+Get-Content ..\..\database\20-add-queue-position-counters.sql | mysql -h $env:DB_HOST -P $env:DB_PORT -u $env:DB_USER -p $env:DB_NAME_QUEUE
 ```
 
 - `03-add-event-team-invitations.sql` adds invitation status and response tracking to `event_inventory.event_team_memberships`.
@@ -69,6 +70,34 @@ Get-Content ..\..\database\19-backfill-ga-section-seat-numbers.sql | mysql -h $e
 - `17-add-event-team-soft-revoke.sql` keeps removed team members as `REVOKED` rows with `revoked_at`/`revoked_by_sub`, instead of deleting them. Apply before deploying the event service that uses it.
 - `18-add-ga-section-seat-numbers.sql` adds persistent per-section numbers for newly issued general-admission tickets.
 - `19-backfill-ga-section-seat-numbers.sql` assigns deterministic section numbers to older general-admission tickets and advances each section counter.
+- `20-add-queue-position-counters.sql` adds queue ticket/serving counters without rewriting entries. It is also required on new databases before running the queue service. Unlike older upgrades, this expansion is safe to rerun. It requests `ALGORITHM=INSTANT` and bounds metadata-lock waiting to ten seconds; if unsupported or blocked, stop and schedule the DDL rather than falling back to a table copy.
+
+### Queue counter rollout (migration 20)
+
+1. Back up the database and record the current queue service revision. Apply migration 20 before deploying the new queue service. This expansion is compatible with the old application.
+2. Pause queue joins and admission writers, including the admission scheduler. Do not run old and new position-allocation code together. From the repository root, with the intended database environment explicitly selected, run:
+
+   ```powershell
+   node --import tsx scripts/backfill-queue-counters.mjs --apply
+   ```
+
+   The backfill commits one session at a time and pages by primary key. It is resumable and only raises counters: `next_position` to the highest stored ticket and `serving_position` to the highest ticket with an admission timestamp. It never rewrites positions. Large individual queues still require an aggregate scan; monitor duration/lock waits and stop between sessions if necessary. Existing duplicate positions are not repaired; investigate them separately before claiming historical ordering is correct.
+3. Verify counter bounds, deploy the new queue code, and resume traffic. Its `next_position` is the last allocated ticket, not the next free ticket. `GET queue/me` retains the one-based `position` field but calculates an upper-bound estimate from the serving counter; abandoned waiting tickets can inflate it.
+4. If deployment fails, roll back application code and retain the additive columns. Before deploying the counter-based version again, pause the old writers and rerun the backfill. Do not drop columns while the new code might still use them.
+
+Read-only verification (both values must be zero):
+
+```sql
+SELECT COUNT(*) AS invalid_counters
+FROM `queue`.queue_sessions
+WHERE serving_position > next_position;
+
+SELECT COUNT(*) AS counters_behind_entries
+FROM `queue`.queue_entries e
+JOIN `queue`.queue_sessions s ON s.queue_session_id = e.queue_session_id
+WHERE e.position > s.next_position
+   OR (e.admitted_at IS NOT NULL AND e.position > s.serving_position);
+```
 
 Do not rerun an upgrade after it has been applied: MySQL will reject a duplicate column or index.
 

@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import express from 'express';
 import mysql from 'mysql2/promise';
+import { withTransaction } from '../../shared/src/transaction.js';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import {
   SendMessageBatchCommand,
@@ -381,87 +382,100 @@ app.post('/events/:eventId/queue/join', async (req, res) => {
   const eventId = positiveInteger(req.params.eventId);
   if (!eventId) 
     return res.status(400).json({ error: 'invalid_event' });
-  const connection = await database.getConnection();
   try {
-    await connection.beginTransaction();
-    const [events] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT status, total_seats, available_buyers, starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
-    );
-    try {
+    const result = await withTransaction(database, async (connection) => {
+      // Acquire the mutex before the first consistent read. This keeps the
+      // buyer lookup fresh even after waiting under MySQL REPEATABLE READ.
+      const [sessions] = await connection.query<mysql.RowDataPacket[]>(
+        'SELECT queue_session_id, opens_at, status, next_position, serving_position FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
+      );
+      const [events] = await connection.query<mysql.RowDataPacket[]>(
+        'SELECT status, total_seats, available_buyers, starts_at < UTC_TIMESTAMP() AS has_started FROM event_inventory.events WHERE event_id = ? LIMIT 1', [eventId],
+      );
       assertEventOnSale(events[0]);
-    } catch (error) {
-      await connection.rollback();
-      if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
-      throw error;
-    }
-    const [sessions] = await connection.query<mysql.RowDataPacket[]>(
-      'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
-    );
-    let session = sessions[0];
-    if (!session) {
-      const [created] = await connection.execute<mysql.ResultSetHeader>(
-        `INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
-         VALUES (?, CURRENT_TIMESTAMP, ?, 60, 'OPEN')
-         ON DUPLICATE KEY UPDATE queue_session_id = LAST_INSERT_ID(queue_session_id)`,
-        [
-          eventId,
-          buyerCapacity(
-            Number(events[0].total_seats),
-            events[0].available_buyers === null ? null : Number(events[0].available_buyers),
-          ),
-        ],
+      let session = sessions[0];
+      if (!session) {
+        const [created] = await connection.execute<mysql.ResultSetHeader>(
+          `INSERT INTO queue_sessions (event_id, opens_at, admission_batch_size, admission_interval_sec, status)
+           VALUES (?, CURRENT_TIMESTAMP, ?, 60, 'OPEN')
+           ON DUPLICATE KEY UPDATE queue_session_id = LAST_INSERT_ID(queue_session_id)`,
+          [
+            eventId,
+            buyerCapacity(
+              Number(events[0].total_seats),
+              events[0].available_buyers === null ? null : Number(events[0].available_buyers),
+            ),
+          ],
+        );
+        const [createdSessions] = await connection.query<mysql.RowDataPacket[]>(
+          'SELECT queue_session_id, opens_at, status, next_position, serving_position FROM queue_sessions WHERE queue_session_id = ? LIMIT 1 FOR UPDATE',
+          [created.insertId],
+        );
+        session = createdSessions[0];
+        if (!session) throw new Error('queue_session_create_failed');
+      }
+      const notJoinable = await joinBlockReason(connection, session);
+      if (notJoinable) throw new QueueApiError(409, notJoinable);
+      const [existingRows] = await connection.query<QueueEntryRow[]>(
+        'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_session_id = ? AND customer_sub = ? LIMIT 1',
+        [session.queue_session_id, caller.sub],
       );
-      const [createdSessions] = await connection.query<mysql.RowDataPacket[]>(
-        'SELECT queue_session_id, opens_at, status FROM queue_sessions WHERE queue_session_id = ? LIMIT 1 FOR UPDATE',
-        [created.insertId],
-      );
-      session = createdSessions[0];
-      if (!session) throw new Error('queue_session_create_failed');
-    }
-    const notJoinable = await joinBlockReason(connection, session);
-    if (notJoinable) {
-      await connection.rollback();
-      return res.status(409).json({ error: notJoinable });
-    }
-    const [existingRows] = await connection.query<QueueEntryRow[]>(
-      'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_session_id = ? AND customer_sub = ? LIMIT 1 FOR UPDATE',
-      [session.queue_session_id, caller.sub],
-    );
-    let entry = existingRows[0];
-    if (entry && keepsQueuePlace(entry)) {
-      await connection.commit();
-      return res.json(queueEntryResponse(entry));
-    }
-    // This must be a locking (current) read: under REPEATABLE READ, a plain
-    // aggregate would reuse the snapshot taken before this joiner waited for
-    // the session lock and could assign a position that just committed.
-    const [positions] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT COALESCE(MAX(position), 0) + 1 AS next_position
-       FROM queue_entries WHERE queue_session_id = ? FOR UPDATE`,
-      [session.queue_session_id],
-    );
-    const position = Number(positions[0]?.next_position ?? 1);
-    if (entry) {
+      let entry = existingRows[0];
+      if (entry) {
+        // Never lock a secondary-index scan and then wait for its primary row:
+        // checkout updates acquire the primary row first.
+        const [current] = await connection.query<QueueEntryRow[]>(
+          'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_entry_id = ? LIMIT 1 FOR UPDATE',
+          [entry.queue_entry_id],
+        );
+        entry = current[0];
+      }
+      if (entry && keepsQueuePlace(entry)) {
+        return { status: 200, body: queueEntryResponse(entry, Math.max(1, Number(entry.position) - Number(session.serving_position))) };
+      }
+      // next_position is the last allocated ticket. The session lock serializes
+      // allocation without reading or locking anybody else's queue entry.
+      const position = Number(session.next_position) + 1;
+      if (!Number.isSafeInteger(position) || position <= 0) throw new Error('invalid_queue_counter');
       await connection.execute(
-        "UPDATE queue_entries SET position = ?, status = 'WAITING', joined_at = CURRENT_TIMESTAMP, admitted_at = NULL, admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
-        [position, entry.queue_entry_id],
+        'UPDATE queue_sessions SET next_position = next_position + 1 WHERE queue_session_id = ?',
+        [session.queue_session_id],
       );
-      entry = { ...entry, position, status: 'WAITING', admission_token: null, token_expires_at: null };
-    } else {
-      const [insert] = await connection.execute<mysql.ResultSetHeader>(
-        'INSERT INTO queue_entries (queue_session_id, customer_sub, position) VALUES (?, ?, ?)',
-        [session.queue_session_id, caller.sub, position],
-      );
-      entry = { queue_entry_id: insert.insertId, position, status: 'WAITING', admission_token: null, token_expires_at: null } as QueueEntryRow;
-    }
-    await connection.commit();
-    return res.status(201).json(queueEntryResponse(entry));
+      if (entry) {
+        await connection.execute(
+          "UPDATE queue_entries SET position = ?, status = 'WAITING', joined_at = CURRENT_TIMESTAMP, admitted_at = NULL, admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
+          [position, entry.queue_entry_id],
+        );
+        entry = { ...entry, position, status: 'WAITING', admission_token: null, token_expires_at: null };
+      } else {
+        const [insert] = await connection.execute<mysql.ResultSetHeader>(
+          'INSERT INTO queue_entries (queue_session_id, customer_sub, position) VALUES (?, ?, ?)',
+          [session.queue_session_id, caller.sub, position],
+        );
+        entry = { queue_entry_id: insert.insertId, position, status: 'WAITING', admission_token: null, token_expires_at: null } as QueueEntryRow;
+      }
+      return { status: 201, body: queueEntryResponse(entry, Math.max(1, position - Number(session.serving_position))) };
+    });
+    return res.status(result.status).json(result.body);
   } catch (error) {
-    await connection.rollback();
+    if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
     console.error('queue join failed', error);
     return res.status(502).json({ error: 'queue_join_failed' });
-  } finally { connection.release(); }
+  }
 });
+
+async function findBuyerEntry(eventId: number, customerSub: string) {
+  const [sessions] = await database.query<mysql.RowDataPacket[]>(
+    'SELECT queue_session_id, serving_position FROM queue_sessions WHERE event_id = ? LIMIT 1', [eventId],
+  );
+  const session = sessions[0];
+  if (!session) return null;
+  const [entries] = await database.query<QueueEntryRow[]>(
+    'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_session_id = ? AND customer_sub = ? LIMIT 1',
+    [session.queue_session_id, customerSub],
+  );
+  return entries[0] ? { entry: entries[0], servingPosition: Number(session.serving_position) } : null;
+}
 
 app.get('/events/:eventId/queue/me', async (req, res) => {
   const caller = await requireCaller(req, res);
@@ -469,28 +483,24 @@ app.get('/events/:eventId/queue/me', async (req, res) => {
   if (!requireDatabase(res)) return;
   const eventId = positiveInteger(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
-  await database.execute(
-    `UPDATE queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
-     SET e.status = 'EXPIRED', e.admission_token = NULL
-     WHERE s.event_id = ? AND e.customer_sub = ? AND e.status IN ('ADMITTED', 'IN_CHECKOUT')
-       AND e.token_expires_at <= CURRENT_TIMESTAMP`,
-    [eventId, caller.sub],
-  );
-  const [rows] = await database.query<QueueEntryRow[]>(
-    `SELECT e.queue_entry_id, e.position, e.status, e.admission_token, e.token_expires_at
-     FROM queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
-     WHERE s.event_id = ? AND e.customer_sub = ? LIMIT 1`, [eventId, caller.sub],
-  );
-  const entry = rows[0];
-  if (!entry) return res.status(404).json({ error: 'queue_entry_not_found' });
-  let livePosition: number | undefined;
-  if (entry.status === 'WAITING') {
-    const [counts] = await database.query<mysql.RowDataPacket[]>(
-      `SELECT COUNT(*) AS live_position FROM queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
-       WHERE s.event_id = ? AND e.status = 'WAITING' AND e.position <= ?`, [eventId, entry.position],
+  const buyer = await findBuyerEntry(eventId, caller.sub);
+  if (!buyer) return res.status(404).json({ error: 'queue_entry_not_found' });
+  const entry = await withTransaction(database, async (connection) => {
+    await connection.execute(
+      `UPDATE queue_entries SET status = 'EXPIRED', admission_token = NULL
+       WHERE queue_entry_id = ? AND status IN ('ADMITTED', 'IN_CHECKOUT')
+         AND token_expires_at <= CURRENT_TIMESTAMP`, [buyer.entry.queue_entry_id],
     );
-    livePosition = Number(counts[0]?.live_position ?? entry.position);
-  }
+    const [rows] = await connection.query<QueueEntryRow[]>(
+      'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_entry_id = ? LIMIT 1',
+      [buyer.entry.queue_entry_id],
+    );
+    return rows[0];
+  });
+  if (!entry) return res.status(404).json({ error: 'queue_entry_not_found' });
+  // Retain the one-based position contract. This is an upper-bound estimate:
+  // abandoned tickets ahead still count, without a per-poll COUNT(*) scan.
+  const livePosition = Math.max(1, Number(entry.position) - buyer.servingPosition);
   return res.json(queueEntryResponse(entry, livePosition));
 });
 
@@ -500,32 +510,29 @@ app.delete('/events/:eventId/queue/me', async (req, res) => {
   const eventId = positiveInteger(req.params.eventId);
   if (!eventId) return res.status(400).json({ error: 'invalid_event' });
   if (!requireDatabase(res)) return;
-  const connection = await database.getConnection();
   try {
-    await connection.beginTransaction();
-    const [rows] = await connection.query<QueueEntryRow[]>(
-      `SELECT e.queue_entry_id, e.position, e.status, e.admission_token, e.token_expires_at
-       FROM queue_entries e INNER JOIN queue_sessions s ON s.queue_session_id = e.queue_session_id
-       WHERE s.event_id = ? AND e.customer_sub = ? LIMIT 1 FOR UPDATE`,
-      [eventId, caller.sub],
-    );
-    const entry = rows[0];
-    if (!entry) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'queue_entry_not_found' });
-    }
-    if (entry.status === 'IN_CHECKOUT') {
-      await connection.rollback();
-      return res.status(409).json({ error: 'queue_checkout_started' });
-    }
-    const releasedBuyerSlot = entry.status === 'ADMITTED';
-    if (entry.status !== 'LEFT' && entry.status !== 'EXPIRED') {
-      await connection.execute(
-        "UPDATE queue_entries SET status = 'LEFT', admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
-        [entry.queue_entry_id],
+    const buyer = await findBuyerEntry(eventId, caller.sub);
+    if (!buyer) return res.status(404).json({ error: 'queue_entry_not_found' });
+    const releasedBuyerSlot = await withTransaction(database, async (connection) => {
+      const [rows] = await connection.query<QueueEntryRow[]>(
+        'SELECT queue_entry_id, position, status, admission_token, token_expires_at FROM queue_entries WHERE queue_entry_id = ? LIMIT 1 FOR UPDATE',
+        [buyer.entry.queue_entry_id],
       );
-    }
-    await connection.commit();
+      const entry = rows[0];
+      if (!entry) {
+        throw new QueueApiError(404, 'queue_entry_not_found');
+      }
+      if (entry.status === 'IN_CHECKOUT') {
+        throw new QueueApiError(409, 'queue_checkout_started');
+      }
+      if (entry.status !== 'LEFT' && entry.status !== 'EXPIRED') {
+        await connection.execute(
+          "UPDATE queue_entries SET status = 'LEFT', admission_token = NULL, token_expires_at = NULL WHERE queue_entry_id = ?",
+          [entry.queue_entry_id],
+        );
+      }
+      return entry.status === 'ADMITTED';
+    });
     if (releasedBuyerSlot) {
       try {
         await admitNextBatch(eventId, true);
@@ -537,18 +544,37 @@ app.delete('/events/:eventId/queue/me', async (req, res) => {
     }
     return res.status(204).end();
   } catch (error) {
-    await connection.rollback();
+    if (error instanceof QueueApiError) return res.status(error.status).json({ error: error.code });
     console.error('leave queue failed', error);
     return res.status(502).json({ error: 'queue_leave_failed' });
-  } finally {
-    connection.release();
   }
 });
 
+/** Discover without range locks, then recheck each candidate through its PK.
+ * Bounded batches keep sweep transactions small even after a long outage. */
+async function expireAdmissions(connection: mysql.PoolConnection, sessionId?: number): Promise<void> {
+  const [entries] = sessionId === undefined
+    ? await connection.query<mysql.RowDataPacket[]>(
+        `SELECT queue_entry_id FROM queue_entries
+         WHERE status IN ('ADMITTED', 'IN_CHECKOUT') AND token_expires_at <= CURRENT_TIMESTAMP
+         ORDER BY queue_entry_id LIMIT 200`,
+      )
+    : await connection.query<mysql.RowDataPacket[]>(
+        `SELECT queue_entry_id FROM queue_entries WHERE queue_session_id = ?
+         AND status IN ('ADMITTED', 'IN_CHECKOUT') AND token_expires_at <= CURRENT_TIMESTAMP
+         ORDER BY queue_entry_id LIMIT 200`, [sessionId],
+      );
+  for (const entry of entries) {
+    await connection.execute(
+      `UPDATE queue_entries SET status = 'EXPIRED', admission_token = NULL
+       WHERE queue_entry_id = ? AND status IN ('ADMITTED', 'IN_CHECKOUT')
+         AND token_expires_at <= CURRENT_TIMESTAMP`, [entry.queue_entry_id],
+    );
+  }
+}
+
 async function admitNextBatch(eventId: number, bypassInterval = false): Promise<AdmissionResult> {
-  const connection = await database.getConnection();
-  try {
-    await connection.beginTransaction();
+  const result = await withTransaction(database, async (connection): Promise<AdmissionResult & { events: CustomerAdmittedEvent[] }> => {
     const [sessions] = await connection.query<mysql.RowDataPacket[]>(
       'SELECT queue_session_id, admission_interval_sec, status FROM queue_sessions WHERE event_id = ? LIMIT 1 FOR UPDATE', [eventId],
     );
@@ -580,17 +606,13 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
     const availableTickets = Number(event.available_qty ?? 0);
     if (availableTickets <= 0) {
       await connection.execute("UPDATE queue_sessions SET status = 'DRAINED' WHERE queue_session_id = ?", [session.queue_session_id]);
-      await connection.commit();
-      return { admitted: 0, remaining: null, reason: 'sold_out' };
+      return { admitted: 0, remaining: null, reason: 'sold_out', events: [] };
     }
-    await connection.execute(
-      `UPDATE queue_entries SET status = 'EXPIRED', admission_token = NULL
-       WHERE queue_session_id = ? AND status IN ('ADMITTED', 'IN_CHECKOUT')
-         AND token_expires_at <= CURRENT_TIMESTAMP`,
-      [session.queue_session_id],
-    );
+    await expireAdmissions(connection, Number(session.queue_session_id));
+    // Cleanup is bounded, but admission capacity must ignore every expired
+    // token, including rows that have not reached the cleanup batch yet.
     const [counts] = await connection.query<mysql.RowDataPacket[]>(
-      `SELECT SUM(status IN ('ADMITTED', 'IN_CHECKOUT')) AS active_buyers,
+      `SELECT SUM(status IN ('ADMITTED', 'IN_CHECKOUT') AND token_expires_at > CURRENT_TIMESTAMP) AS active_buyers,
         SUM(status = 'WAITING') AS remaining
        FROM queue_entries WHERE queue_session_id = ?`,
       [session.queue_session_id],
@@ -604,57 +626,64 @@ async function admitNextBatch(eventId: number, bypassInterval = false): Promise<
       availableTickets,
     );
     if (limit <= 0) {
-      await connection.commit();
-      return { admitted: 0, remaining: remainingBeforeAdmission, reason: 'capacity_reached' };
+      return { admitted: 0, remaining: remainingBeforeAdmission, reason: 'capacity_reached', events: [] };
     }
     const [waiting] = await connection.query<WaitingEntryRow[]>(
       `SELECT queue_entry_id, customer_sub, position, status, admission_token, token_expires_at FROM queue_entries
-       WHERE queue_session_id = ? AND status = 'WAITING' ORDER BY position LIMIT ? FOR UPDATE`,
+       WHERE queue_session_id = ? AND status = 'WAITING' ORDER BY position, queue_entry_id LIMIT ?`,
       [session.queue_session_id, limit],
     );
     const admittedEvents: CustomerAdmittedEvent[] = [];
-    for (const entry of waiting) {
+    let servingPosition = 0;
+    // Acquire primary rows in a stable order; the session mutex already
+    // serializes admission and joins, so no locking secondary scan is needed.
+    for (const entry of [...waiting].sort((a, b) => Number(a.queue_entry_id) - Number(b.queue_entry_id))) {
       const admittedAt = new Date();
       const tokenExpiresAt = new Date(admittedAt.getTime() + TOKEN_TTL_SEC * 1_000);
-      await connection.execute(
+      const [updated] = await connection.execute<mysql.ResultSetHeader>(
         `UPDATE queue_entries SET status = 'ADMITTED', admitted_at = ?, admission_token = ?,
-          token_expires_at = ? WHERE queue_entry_id = ?`,
+          token_expires_at = ? WHERE queue_entry_id = ? AND status = 'WAITING'`,
         [admittedAt, randomBytes(32).toString('base64url'), tokenExpiresAt, entry.queue_entry_id],
       );
+      if (updated.affectedRows !== 1) continue; // A concurrent leave won the row.
+      servingPosition = Math.max(servingPosition, Number(entry.position));
       admittedEvents.push(customerAdmittedEvent({
         queueEntryId: Number(entry.queue_entry_id), eventId, customerSub: entry.customer_sub,
         occurredAt: admittedAt, tokenExpiresAt,
       }));
     }
+    if (servingPosition > 0) {
+      await connection.execute(
+        'UPDATE queue_sessions SET serving_position = GREATEST(serving_position, ?) WHERE queue_session_id = ?',
+        [servingPosition, session.queue_session_id],
+      );
+    }
     const [remainingRows] = await connection.query<mysql.RowDataPacket[]>(
       "SELECT COUNT(*) AS remaining FROM queue_entries WHERE queue_session_id = ? AND status = 'WAITING'", [session.queue_session_id],
     );
     const remaining = Number(remainingRows[0]?.remaining ?? 0);
-    await connection.commit();
-    let eventPublication: 'published' | 'disabled' | 'failed' | 'not_required' = admittedEvents.length === 0
-      ? 'not_required'
-      : CUSTOMER_ADMITTED_QUEUE_URL ? 'published' : 'disabled';
-    let eventsPublished = 0;
-    try {
-      eventsPublished = await publishCustomerAdmitted(admittedEvents);
-    } catch (error) {
-      eventPublication = 'failed';
-      console.error('customer admitted event publication failed', error);
-    }
-    return { admitted: waiting.length, remaining, eventsPublished, eventPublication };
+    return { admitted: admittedEvents.length, remaining, events: admittedEvents };
+  });
+  // Do not hold a pooled connection while talking to SQS. A publication error
+  // cannot roll back or replay an already committed admission batch.
+  const { events: admittedEvents, ...summary } = result;
+  if (admittedEvents.length === 0) {
+    return summary.reason ? summary : { ...summary, eventsPublished: 0, eventPublication: 'not_required' };
+  }
+  let eventPublication: 'published' | 'disabled' | 'failed' = CUSTOMER_ADMITTED_QUEUE_URL ? 'published' : 'disabled';
+  let eventsPublished = 0;
+  try {
+    eventsPublished = await publishCustomerAdmitted(admittedEvents);
   } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally { connection.release(); }
+    eventPublication = 'failed';
+    console.error('customer admitted event publication failed', error);
+  }
+  return { ...summary, eventsPublished, eventPublication };
 }
 
 async function runAdmissionSweep(now = Date.now()): Promise<number> {
   if (!databaseConfigured || !AUTO_ADMISSION_ENABLED) return 0;
-  await database.execute(
-    `UPDATE queue_entries
-     SET status = 'EXPIRED', admission_token = NULL
-     WHERE status IN ('ADMITTED', 'IN_CHECKOUT') AND token_expires_at <= CURRENT_TIMESTAMP`,
-  );
+  await withTransaction(database, (connection) => expireAdmissions(connection));
   const [sessions] = await database.query<mysql.RowDataPacket[]>(
     `SELECT s.event_id, s.admission_interval_sec, MAX(e.admitted_at) AS last_admitted_at
      FROM queue_sessions s
