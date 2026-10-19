@@ -24,6 +24,7 @@ services:
       - ../database/17-add-event-team-soft-revoke.sql:/docker-entrypoint-initdb.d/14-add-event-team-soft-revoke.sql:ro
       - ../database/18-add-ga-section-seat-numbers.sql:/docker-entrypoint-initdb.d/15-add-ga-section-seat-numbers.sql:ro
       - ../database/19-backfill-ga-section-seat-numbers.sql:/docker-entrypoint-initdb.d/16-backfill-ga-section-seat-numbers.sql:ro
+      - ../database/20-add-queue-position-counters.sql:/docker-entrypoint-initdb.d/17-add-queue-position-counters.sql:ro
     networks:
       - backend
     healthcheck:
