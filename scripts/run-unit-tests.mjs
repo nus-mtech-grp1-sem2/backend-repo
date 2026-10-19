@@ -24,6 +24,7 @@ function run(command, args, options = {}) {
 
 const nodeTestFiles = [
   path.join(scriptsDirectory, 'backfill-queue-counters.test.mjs'),
+  path.join(scriptsDirectory, 'local-migrations.test.mjs'),
   source('event', 'src', 'index.test.ts'),
   source('event', 'src', 'team-membership-access.test.ts'),
   source('inventory', 'src', 'index.test.ts'),
