@@ -32,7 +32,7 @@ locals {
         cpu                   = 256
         memory                = 512
         min_count             = 1
-        max_count             = 4
+        max_count             = 8
         service_connect_alias = "kong"
         attach_to_alb         = true
         # Kong's peer is always an ALB node, so without these the per-IP
