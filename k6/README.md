@@ -14,6 +14,7 @@ This suite exercises the deployed public and customer read paths without creatin
 | B3 payment drain | Pull request or manual GitHub Action | 40 messages through the production serial consumer with 25 ms synthetic processing | In-memory SQS contract; no AWS |
 | Mixed queue/checkout | Pull request or manual GitHub Action | 300 joins at 100 VUs, 200 checkouts at 20 VUs, and concurrent admission calls against one event | Disposable full-schema MySQL; all buyers must succeed |
 | A concurrent end-to-end | Pull request or manual GitHub Action | 20 queue → admission → seat → order → simulated-payment journeys at 5, 10 and 20 VUs | Separate disposable MySQL per concurrency level; no external side effects |
+| Live stateful buyer journey | Explicit CLI opt-in only | Default 10 retained synthetic buyers × 3 queue → admission → GA order → simulated-payment journeys | **Writes to the live AWS-backed application and intentionally retains test data**; hard-capped at 21 buyers × 20 journeys |
 
 The Grafana project quota remains the hard monthly control and should stay at 200 VUh. The script does not modify Grafana billing or quota configuration.
 
@@ -40,6 +41,8 @@ The Grafana project quota remains the hard monthly control and should stay at 20
 | Traceability | Every Kong response includes `X-Request-Id` | None |
 
 Notification is intentionally absent because Kong does not expose it publicly. Authenticated queue status/position and order list/detail are excluded because those nominal `GET` handlers can open queue sessions, expire admissions or reservations, and release queue capacity. Successful queue joins, inventory holds, order/payment creation, ticket issuance/check-in, event management, and notifications remain excluded from the cloud suite. Its non-GET requests are deliberately unauthenticated contract checks: `401` proves application auth rejection, while `429` proves Kong rejected the request before the application mutation path. These probes run in a separate, fixed-rate scenario so they do not dominate the read-load profile.
+
+The separate `live-stateful-buyer-journey.js` profile is the explicit exception. It is not part of deployment CI and cannot run without both a unique run ID and `K6_ALLOW_LIVE_WRITES=CONFIRMED`. It creates a new published event named `[K6 TEST DATA - RETAIN] <run-id>`, writes queue entries, holds, paid orders, simulated payment records, tickets, and notification records through the deployed APIs, and does not call any delete endpoint. It uses synthetic `example.invalid` customer addresses and the fixed `simulated` payment token; it never submits card data or calls a real payment provider. The records and event remain visible after the run by design.
 
 ## Thresholds
 
@@ -170,3 +173,30 @@ k6 inspect -e K6_EVENT_ID=1 -e K6_INVENTORY_ITEM_ID=1 k6/disposable-concurrency.
 ```
 
 Do not use `k6 run` for this suite without an explicit secret source and explicit authorization to send load to the selected target.
+
+## Live stateful AWS test
+
+This profile is intentionally manual. It is not wired into the deployment
+workflow because it creates persistent application data and triggers the real
+OrderPaid/ticket/notification path. It reuses the existing Grafana secret and
+does not create, edit, or delete Cognito users.
+
+Choose a unique run ID and review the bounded data volume before starting:
+
+```bash
+k6 cloud run \
+  -e K6_ALLOW_LIVE_WRITES=CONFIRMED \
+  -e K6_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)" \
+  -e K6_LIVE_BUYER_VUS=10 \
+  -e K6_LIVE_ITERATIONS_PER_BUYER=3 \
+  k6/live-stateful-buyer-journey.js
+```
+
+The default run retains one synthetic event, 10 reusable queue entries, 30
+holds, orders, simulated payments and tickets, plus associated notification
+records. `K6_LIVE_BUYER_VUS` is hard-capped at 21 (one retained Cognito
+credential is reserved as organiser),
+and `K6_LIVE_ITERATIONS_PER_BUYER` is hard-capped at 20. The run passes only if
+every journey reaches `PAID`, ticket issuance reconciles for every buyer,
+there are no dropped iterations or backend 5xx responses, HTTP failures stay
+below 1%, and p95 request latency remains below five seconds.
