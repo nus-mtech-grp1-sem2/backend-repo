@@ -200,3 +200,38 @@ and `K6_LIVE_ITERATIONS_PER_BUYER` is hard-capped at 20. The run passes only if
 every journey reaches `PAID`, ticket issuance reconciles for every buyer,
 there are no dropped iterations or backend 5xx responses, HTTP failures stay
 below 1%, and p95 request latency remains below five seconds.
+
+## Combined read scale and live writes
+
+`combined-live-load.js` runs all six high-rate service streams and the live
+stateful buyer journeys in one Grafana Cloud execution. Its read ceilings use
+579 VUs and its 21 one-buyer scenarios use the remaining 21 VUs, preserving
+the project's established 600-VU aggregate ceiling. The default rates total
+1,025 requests/second, while the stateful side attempts 420 retained paid
+journeys. Write-side Kong `429` responses are retried with bounded backoff;
+they remain visible through the `rate_limited_write_retries` metric rather
+than being misclassified as successful database writes.
+
+The combined run is intentionally expensive and stateful. Review the Grafana
+VUh estimate before starting it. At the documented settings, the upper-bound
+consumption is approximately 94 VUh: 579 read VUs for nine minutes plus 21
+stateful VUs for about twenty minutes. Actual Grafana billing and scheduling
+remain authoritative. It requires the same explicit live-write confirmation
+and unique run ID as the standalone stateful test:
+
+```bash
+k6 cloud run \
+  -e K6_ALLOW_LIVE_WRITES=CONFIRMED \
+  -e K6_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)" \
+  -e K6_EVENT_RATE=100 \
+  -e K6_INVENTORY_RATE=125 \
+  -e K6_QUEUE_RATE=225 \
+  -e K6_ORDER_RATE=200 \
+  -e K6_TICKET_RATE=125 \
+  -e K6_AUTH_RATE=250 \
+  -e K6_LIVE_BUYER_VUS=21 \
+  -e K6_LIVE_ITERATIONS_PER_BUYER=20 \
+  -e K6_LIVE_PACING_SECONDS=60 \
+  -e K6_LIVE_RATE_LIMIT_RETRIES=120 \
+  k6/combined-live-load.js
+```

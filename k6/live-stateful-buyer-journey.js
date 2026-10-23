@@ -18,6 +18,7 @@ const COGNITO_SECRET_NAME = "onestage-k6-users";
 const EXPECTED_USER_COUNT = 22;
 const MAX_BUYER_VUS = EXPECTED_USER_COUNT - 1;
 const MAX_ITERATIONS_PER_BUYER = 20;
+const MAX_RATE_LIMIT_RETRIES = 180;
 
 function boundedPositiveInteger(value, fallback, maximum, name) {
   if (value === undefined || value === "") return fallback;
@@ -36,6 +37,13 @@ const iterationsPerBuyer = boundedPositiveInteger(
   "K6_LIVE_ITERATIONS_PER_BUYER",
 );
 const expectedJourneys = buyerVUs * iterationsPerBuyer;
+const pacingSeconds = boundedPositiveInteger(__ENV.K6_LIVE_PACING_SECONDS, 1, 120, "K6_LIVE_PACING_SECONDS");
+const rateLimitRetries = boundedPositiveInteger(
+  __ENV.K6_LIVE_RATE_LIMIT_RETRIES,
+  90,
+  MAX_RATE_LIMIT_RETRIES,
+  "K6_LIVE_RATE_LIMIT_RETRIES",
+);
 
 const completedBuyerJourneys = new Counter("completed_live_buyer_journeys");
 const liveWriteSuccess = new Rate("live_write_success");
@@ -44,6 +52,7 @@ const unexpectedServerError = new Rate("unexpected_server_error");
 const requestIdSuccess = new Rate("request_id_success");
 const cognitoAuthSuccess = new Rate("cognito_auth_success");
 const cognitoAuthDuration = new Trend("cognito_auth_duration", true);
+const rateLimitedWriteRetries = new Counter("rate_limited_write_retries");
 
 export const options = {
   setupTimeout: "2m",
@@ -218,6 +227,20 @@ function postJson(path, body, token, stage, expectedStatuses = [200]) {
   return http.post(`${baseUrl()}${path}`, JSON.stringify(body), requestParams(stage, token, expectedStatuses, true));
 }
 
+function retryRateLimited(request, buyerIndex) {
+  let response;
+  for (let attempt = 0; attempt <= rateLimitRetries; attempt += 1) {
+    response = request();
+    if (response.status !== 429) return response;
+    rateLimitedWriteRetries.add(1);
+    if (attempt < rateLimitRetries) {
+      const backoffSeconds = Math.min(2, 0.5 + attempt * 0.1) + (buyerIndex % 7) * 0.05;
+      sleep(backoffSeconds);
+    }
+  }
+  return response;
+}
+
 function putJson(path, body, token, stage, expectedStatuses = [200]) {
   return http.put(`${baseUrl()}${path}`, JSON.stringify(body), requestParams(stage, token, expectedStatuses, true));
 }
@@ -347,32 +370,37 @@ function waitForAdmission(data, buyerToken) {
 }
 
 export default function liveBuyerJourney(data) {
-  const buyerIndex = exec.vu.idInTest - 1;
+  const iterationStartedAt = Date.now();
+  const suppliedBuyerIndex = Number(data.buyerIndex);
+  const buyerIndex = Number.isSafeInteger(suppliedBuyerIndex) && suppliedBuyerIndex >= 0
+    ? suppliedBuyerIndex
+    : exec.vu.idInTest - 1;
   const buyerToken = data.buyerTokens[buyerIndex];
   if (!buyerToken) throw new Error(`no synthetic buyer token allocated to VU ${exec.vu.idInTest}`);
 
-  const join = http.post(
-    `${baseUrl()}/api/queue/events/${data.eventId}/queue/join`,
-    null,
-    requestParams("queue_join", buyerToken, [200, 201]),
+  const join = retryRateLimited(
+    () => http.post(
+      `${baseUrl()}/api/queue/events/${data.eventId}/queue/join`,
+      null,
+      requestParams("queue_join", buyerToken, [200, 201, 429]),
+    ),
+    buyerIndex,
   );
   const joined = recordResponse(join, [200, 201], "queue join", true);
   const admissionToken = joined ? waitForAdmission(data, buyerToken) : "";
 
+  const orderBody = {
+    eventId: data.eventId,
+    inventoryItemId: data.inventoryItemId,
+    quantity: 1,
+    admissionToken,
+    customerEmail: `k6-${data.runId}-${buyerIndex + 1}@example.invalid`,
+    customerName: `K6 Synthetic Buyer ${buyerIndex + 1}`,
+  };
   const create = admissionToken
-    ? postJson(
-        "/api/order/orders",
-        {
-          eventId: data.eventId,
-          inventoryItemId: data.inventoryItemId,
-          quantity: 1,
-          admissionToken,
-          customerEmail: `k6-${data.runId}-${buyerIndex + 1}@example.invalid`,
-          customerName: `K6 Synthetic Buyer ${buyerIndex + 1}`,
-        },
-        buyerToken,
-        "order_create",
-        [201],
+    ? retryRateLimited(
+        () => postJson("/api/order/orders", orderBody, buyerToken, "order_create", [201, 429]),
+        buyerIndex,
       )
     : null;
   const createOk = create !== null && recordResponse(create, [201], "order create", true);
@@ -380,12 +408,15 @@ export default function liveBuyerJourney(data) {
   const validOrderId = Number.isSafeInteger(orderId) && orderId > 0;
 
   const payment = validOrderId
-    ? postJson(
-        `/api/order/orders/${orderId}/payment`,
-        { paymentToken: "simulated" },
-        buyerToken,
-        "payment",
-        [200],
+    ? retryRateLimited(
+        () => postJson(
+          `/api/order/orders/${orderId}/payment`,
+          { paymentToken: "simulated" },
+          buyerToken,
+          "payment",
+          [200, 429],
+        ),
+        buyerIndex,
       )
     : null;
   const paymentBody = payment ? parseJson(payment) : null;
@@ -395,6 +426,9 @@ export default function liveBuyerJourney(data) {
   check(payment, {
     "buyer completes queue-to-paid journey": () => joined && Boolean(admissionToken) && createOk && validOrderId && paid,
   });
+
+  const remainingPacingSeconds = pacingSeconds - (Date.now() - iterationStartedAt) / 1000;
+  if (remainingPacingSeconds > 0) sleep(remainingPacingSeconds);
 }
 
 function eventTicketCount(response, eventId) {
