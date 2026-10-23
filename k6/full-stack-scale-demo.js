@@ -49,7 +49,7 @@ function baseUrl() {
 
 function cloudOptions() {
   return {
-    name: "OneStage full-stack read-only scale demo",
+    name: __ENV.K6_TEST_NAME || "OneStage full-stack read-only scale demo",
     stackID: boundedPositiveInteger(__ENV.K6_CLOUD_STACK_ID, 1607186, 10_000_000, "K6_CLOUD_STACK_ID"),
     projectID: boundedPositiveInteger(__ENV.K6_CLOUD_PROJECT_ID, 8484325, 100_000_000, "K6_CLOUD_PROJECT_ID"),
     distribution: {
@@ -65,14 +65,22 @@ function rate(name, fallback) {
   return boundedPositiveInteger(__ENV[`K6_${name.toUpperCase()}_RATE`], fallback, 250, `K6_${name.toUpperCase()}_RATE`);
 }
 
-function scenario(service, fallbackRate) {
+function scenario(service, fallbackRate, maxVUs) {
   return {
     executor: "ramping-arrival-rate",
     exec: `${service}Read`,
     startRate: 1,
     timeUnit: "1s",
-    preAllocatedVUs: 10,
-    maxVUs: 50,
+    // Preallocate the existing ceiling so ramp-up never waits for cloud VU
+    // initialization. Run 8870678 had no ceiling warnings but still dropped
+    // 17 iterations while growing from 10 preallocated VUs per scenario.
+    preAllocatedVUs: maxVUs,
+    // Run 8862756 exhausted the previous 50-VU ceiling in every stream and
+    // dropped 2,442 scheduled iterations. Run 8870600 reduced that to 25, but
+    // an even 100-VU split left no burst headroom for the three 100 req/s
+    // streams. Weighting the same approved 600-VU ceiling by arrival rate
+    // preserves capacity for the lower-rate streams without raising cost.
+    maxVUs,
     gracefulStop: "0s",
     stages: [
       { target: Math.ceil(rate(service, fallbackRate) / 2), duration: "1m" },
@@ -88,12 +96,15 @@ export const options = {
   cloud: cloudOptions(),
   discardResponseBodies: true,
   scenarios: {
-    event: scenario("event", 60),
-    inventory: scenario("inventory", 70),
-    queue: scenario("queue", 100),
-    order: scenario("order", 100),
-    ticket: scenario("ticket", 70),
-    auth: scenario("auth", 150),
+    event: scenario("event", 60, 90),
+    inventory: scenario("inventory", 70, 90),
+    queue: scenario("queue", 100, 110),
+    order: scenario("order", 100, 110),
+    ticket: scenario("ticket", 70, 90),
+    // Run 8870576 showed that 150 req/s exhausted auth's 100-VU allocation
+    // after Grafana split it across two generators. A 100 req/s target keeps
+    // the overall profile at 500 req/s while preserving the zero-drop gate.
+    auth: scenario("auth", 100, 110),
   },
   thresholds: {
     http_req_failed: [
